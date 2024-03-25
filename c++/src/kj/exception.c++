@@ -37,7 +37,6 @@
 #include "exception.h"
 #include "string.h"
 #include "debug.h"
-#include "threadlocal.h"
 #include "miniposix.h"
 #include "function.h"
 #include "main.h"
@@ -256,7 +255,7 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount) {
 
 #if (__GNUC__ && !_WIN32) || __clang__
 // Allow dependents to override the implementation of stack symbolication by making it a weak
-// symbol. We prefer weak symbols over some sort of callback registration mechanism becasue this
+// symbol. We prefer weak symbols over some sort of callback registration mechanism because this
 // allows an alternate symbolication library to be easily linked into tests without changing the
 // code of the test.
 __attribute__((weak))
@@ -885,10 +884,8 @@ void Exception::truncateCommonTrace() {
             // If we matched more than half of the reference trace, guess that this is in fact
             // the prefix we're looking for.
             if (j > refTrace.size() / 2) {
-              // Delete the matching suffix. Also delete one non-matched entry on the assumption
-              // that both traces contain that stack frame but are simply at different points in
-              // the function.
-              traceCount -= j + 1;
+              // Delete the matching suffix.
+              traceCount -= j;
               return;
             }
           }
@@ -921,7 +918,14 @@ void Exception::addTraceHere() {
 
 namespace {
 
-KJ_THREADLOCAL_PTR(ExceptionImpl) currentException = nullptr;
+thread_local ExceptionImpl* currentException = nullptr;
+
+void validateExceptionPointer(const ExceptionImpl* e) noexcept {
+  // Occasionally in production we are seeing `currentException` have the value 1. Try to figure
+  // this out...
+  KJ_ASSERT(e == nullptr || reinterpret_cast<uintptr_t>(e) >= 4096,
+      "detected bogus ExceptionImpl pointer", e);
+}
 
 }  // namespace
 
@@ -934,8 +938,9 @@ public:
     // No need to copy whatBuffer since it's just to hold the return value of what().
     insertIntoCurrentExceptions();
   }
-  ~ExceptionImpl() {
+  ~ExceptionImpl() noexcept {
     // Look for ourselves in the list.
+    validateExceptionPointer(nextCurrentException);
     for (auto* ptr = &currentException; *ptr != nullptr; ptr = &(*ptr)->nextCurrentException) {
       if (*ptr == this) {
         *ptr = nextCurrentException;
@@ -945,7 +950,7 @@ public:
 
     // Possibly the ExceptionImpl was destroyed on a different thread than created it? That's
     // pretty bad, we'd better abort.
-    abort();
+    KJ_FAIL_ASSERT("ExceptionImpl not found on currentException list?");
   }
 
   const char* what() const noexcept override;
@@ -956,7 +961,9 @@ private:
 
   void insertIntoCurrentExceptions() {
     nextCurrentException = currentException;
+    validateExceptionPointer(nextCurrentException);
     currentException = this;
+    validateExceptionPointer(currentException);
   }
 
   friend class InFlightExceptionIterator;
@@ -973,9 +980,10 @@ InFlightExceptionIterator::InFlightExceptionIterator()
 Maybe<const Exception&> InFlightExceptionIterator::next() {
   if (ptr == nullptr) return kj::none;
 
-  const ExceptionImpl& result = *static_cast<const ExceptionImpl*>(ptr);
-  ptr = result.nextCurrentException;
-  return result;
+  const ExceptionImpl* result = static_cast<const ExceptionImpl*>(ptr);
+  validateExceptionPointer(result);
+  ptr = result->nextCurrentException;
+  return *result;
 }
 
 kj::Exception getDestructionReason(void* traceSeparator, kj::Exception::Type defaultType,
@@ -1004,7 +1012,7 @@ kj::Exception getDestructionReason(void* traceSeparator, kj::Exception::Type def
 
 namespace {
 
-KJ_THREADLOCAL_PTR(ExceptionCallback) threadLocalCallback = nullptr;
+thread_local ExceptionCallback* threadLocalCallback = nullptr;
 
 }  // namespace
 

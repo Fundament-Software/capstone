@@ -150,7 +150,7 @@ class Event: private AsyncObject {
 public:
   Event(SourceLocation location);
   Event(kj::EventLoop& loop, SourceLocation location);
-  ~Event() noexcept(false);
+  ~Event() noexcept;
   KJ_DISALLOW_COPY_AND_MOVE(Event);
 
   void armDepthFirst();
@@ -187,7 +187,7 @@ public:
   // Returns false if the event loop is not currently running. This ensures that promise
   // continuations don't execute except under a call to .wait().
 
-  void disarm();
+  void disarm() noexcept;
   // If the event is armed but hasn't fired, cancel it. (Destroying the event does this
   // implicitly.)
 
@@ -783,12 +783,19 @@ private:
 
 template <typename T> T copyOrAddRef(T& t) { return t; }
 template <typename T> Own<T> copyOrAddRef(Own<T>& t) { return t->addRef(); }
+template <typename T> Rc<T> copyOrAddRef(Rc<T>& t) { return t.addRef(); }
+template <typename T> Arc<T> copyOrAddRef(Arc<T>& t) { return t.addRef(); }
 template <typename T> Maybe<Own<T>> copyOrAddRef(Maybe<Own<T>>& t) {
   return t.map([](Own<T>& ptr) {
     return ptr->addRef();
   });
 }
-
+template <typename T> Maybe<Rc<T>> copyOrAddRef(Maybe<Rc<T>>& t) {
+  return t.map([](Rc<T>& ptr) { return ptr.addRef(); });
+}
+template <typename T> Maybe<Arc<T>> copyOrAddRef(Maybe<Arc<T>>& t) {
+  return t.map([](Arc<T>& ptr) { return ptr.addRef(); });
+}
 
 // A PromiseNode that implements one branch of a fork -- i.e. one of the branches that receives
 // a const reference.
@@ -1762,7 +1769,7 @@ private:
   // Sets the state to `DONE` and notifies the originating thread that this event is done. Do NOT
   // call under lock.
 
-  void sendReply();
+  void sendReply() noexcept;
   // Notifies the originating thread that this event is done, but doesn't set the state to DONE
   // yet. Do NOT call under lock.
 
@@ -1960,7 +1967,7 @@ public:
   FulfillScope(XThreadPaf** pointer);
   // Atomically nulls out *pointer and takes ownership of the pointer.
 
-  ~FulfillScope() noexcept(false);
+  ~FulfillScope() noexcept;
 
   KJ_DISALLOW_COPY_AND_MOVE(FulfillScope);
 
@@ -2062,6 +2069,7 @@ template <typename T>
 concept NoWaitScope = !isSameType<Decay<T>, WaitScope>();
 // Define a Concept to use in our `coroutine_traits` specialization to validate allowable coroutine
 // parameter types.
+// TODO(cleanup): This can be removed by adding KJ_DISALLOW_AS_COROUTINE_PARAM to WaitScope.
 
 }  // namespace kj::_
 
@@ -2072,6 +2080,9 @@ namespace KJ_COROUTINE_STD_NAMESPACE {
 template <class T, class... Args>
 struct coroutine_traits<kj::Promise<T>, Args...> {
   // `Args...` are the coroutine's parameter types.
+
+  static_assert((!kj::_::isDisallowedInCoroutine<Args>() && ...),
+      "Disallowed type in coroutine");
 
   static_assert((::kj::_::NoWaitScope<Args> && ...),
       "Coroutines are not allowed to accept `WaitScope` parameters.");

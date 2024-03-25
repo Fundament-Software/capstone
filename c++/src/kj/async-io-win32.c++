@@ -919,10 +919,7 @@ public:
 
 class LowLevelAsyncIoProviderImpl final: public LowLevelAsyncIoProvider {
 public:
-  LowLevelAsyncIoProviderImpl()
-      : eventLoop(eventPort), waitScope(eventLoop) {}
-
-  inline WaitScope& getWaitScope() { return waitScope; }
+  LowLevelAsyncIoProviderImpl(Win32EventPort& eventPort): eventPort(eventPort) {}
 
   Own<AsyncInputStream> wrapInputFd(SOCKET fd, uint flags = 0) override {
     return heap<AsyncStreamFd>(eventPort, fd, flags);
@@ -952,12 +949,8 @@ public:
 
   Timer& getTimer() override { return eventPort.getTimer(); }
 
-  Win32EventPort& getEventPort() { return eventPort; }
-
 private:
-  Win32IocpEventPort eventPort;
-  EventLoop eventLoop;
-  WaitScope waitScope;
+  Win32EventPort& eventPort;
 };
 
 // =======================================================================================
@@ -976,30 +969,32 @@ public:
   }
 
   Own<ConnectionReceiver> listen() override {
-    if (addrs.size() > 1) {
-      KJ_LOG(WARNING, "Bind address resolved to multiple addresses.  Only the first address will "
-          "be used.  If this is incorrect, specify the address numerically.  This may be fixed "
-          "in the future.", addrs[0].toString());
+    auto makeReceiver = [&](SocketAddress& addr) {
+      int fd = addr.socket(SOCK_STREAM);
+
+      {
+        KJ_ON_SCOPE_FAILURE(closesocket(fd));
+
+        // We always enable SO_REUSEADDR because having to take your server down for five minutes
+        // before it can restart really sucks.
+        int optval = 1;
+        KJ_WINSOCK(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                              reinterpret_cast<char*>(&optval), sizeof(optval)));
+
+        addr.bind(fd);
+
+        // TODO(someday):  Let queue size be specified explicitly in string addresses.
+        KJ_WINSOCK(::listen(fd, SOMAXCONN));
+      }
+
+      return lowLevel.wrapListenSocketFd(fd, filter, NEW_FD_FLAGS);
+    };
+
+    if (addrs.size() == 1) {
+      return makeReceiver(addrs[0]);
+    } else {
+      return newAggregateConnectionReceiver(KJ_MAP(addr, addrs) { return makeReceiver(addr); });
     }
-
-    int fd = addrs[0].socket(SOCK_STREAM);
-
-    {
-      KJ_ON_SCOPE_FAILURE(closesocket(fd));
-
-      // We always enable SO_REUSEADDR because having to take your server down for five minutes
-      // before it can restart really sucks.
-      int optval = 1;
-      KJ_WINSOCK(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-                            reinterpret_cast<char*>(&optval), sizeof(optval)));
-
-      addrs[0].bind(fd);
-
-      // TODO(someday):  Let queue size be specified explicitly in string addresses.
-      KJ_WINSOCK(::listen(fd, SOMAXCONN));
-    }
-
-    return lowLevel.wrapListenSocketFd(fd, filter, NEW_FD_FLAGS);
   }
 
   Own<DatagramPort> bindDatagramPort() override {
@@ -1151,10 +1146,13 @@ public:
     auto pipe = lowLevel.wrapSocketFd(fds[0], NEW_FD_FLAGS);
 
     auto thread = heap<Thread>([threadFd,startFunc=kj::mv(startFunc)]() mutable {
-      LowLevelAsyncIoProviderImpl lowLevel;
+      Win32IocpEventPort eventPort;
+      EventLoop eventLoop(eventPort);
+      WaitScope waitScope(eventLoop);
+      LowLevelAsyncIoProviderImpl lowLevel(eventPort);
       auto stream = lowLevel.wrapSocketFd(threadFd, NEW_FD_FLAGS);
       AsyncIoProviderImpl ioProvider(lowLevel);
-      startFunc(ioProvider, *stream, lowLevel.getWaitScope());
+      startFunc(ioProvider, *stream, waitScope);
     });
 
     return { kj::mv(thread), kj::mv(pipe) };
@@ -1173,13 +1171,34 @@ Own<AsyncIoProvider> newAsyncIoProvider(LowLevelAsyncIoProvider& lowLevel) {
   return kj::heap<AsyncIoProviderImpl>(lowLevel);
 }
 
+Own<LowLevelAsyncIoProvider> newLowLevelAsyncIoProvider(Win32EventPort& eventPort) {
+  return kj::heap<LowLevelAsyncIoProviderImpl>(eventPort);
+}
+
 AsyncIoContext setupAsyncIo() {
   _::initWinsockOnce();
 
-  auto lowLevel = heap<LowLevelAsyncIoProviderImpl>();
+  struct BasicContext {
+    Win32IocpEventPort eventPort;
+    EventLoop eventLoop;
+    WaitScope waitScope;
+
+    BasicContext(): eventLoop(eventPort), waitScope(eventLoop) {}
+  };
+
+  auto basicContext = heap<BasicContext>();
+  auto lowLevel = heap<LowLevelAsyncIoProviderImpl>(basicContext->eventPort);
   auto ioProvider = kj::heap<AsyncIoProviderImpl>(*lowLevel);
-  auto& waitScope = lowLevel->getWaitScope();
-  auto& eventPort = lowLevel->getEventPort();
+  auto& waitScope = basicContext->waitScope;
+  auto& eventPort = basicContext->eventPort;
+
+  // Historically, `LowLevelAsyncIoProviderImpl` contained the stuff that `BasicContext` now
+  // contains. However, this made it impossible to create more elaborate EventLoop arrangements
+  // while still using the default LLAIOP implementation. For backwards-compatibility,
+  // `setupAsyncIo()` still attaches this context to the LLAIOP, but it's now possible to construct
+  // these objects directly and LLAIOP on top.
+  lowLevel = lowLevel.attach(kj::mv(basicContext));
+
   return { kj::mv(lowLevel), kj::mv(ioProvider), waitScope, eventPort };
 }
 

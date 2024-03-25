@@ -42,7 +42,6 @@
 #include "async.h"
 #include "debug.h"
 #include "vector.h"
-#include "threadlocal.h"
 #include "mutex.h"
 #include "one-of.h"
 #include "function.h"
@@ -116,7 +115,7 @@ namespace kj {
 
 namespace {
 
-KJ_THREADLOCAL_PTR(DisallowAsyncDestructorsScope) disallowAsyncDestructorsScope = nullptr;
+thread_local DisallowAsyncDestructorsScope* disallowAsyncDestructorsScope = nullptr;
 
 }  // namespace
 
@@ -161,7 +160,7 @@ AllowAsyncDestructorsScope::~AllowAsyncDestructorsScope() {
 
 namespace {
 
-KJ_THREADLOCAL_PTR(EventLoop) threadLocalEventLoop = nullptr;
+thread_local EventLoop* threadLocalEventLoop = nullptr;
 
 #define _kJ_ALREADY_READY reinterpret_cast< ::kj::_::Event*>(1)
 
@@ -484,8 +483,8 @@ public:
     main = {};
   }
 
-  void switchToFiber();
-  void switchToMain();
+  KJ_NOINLINE void switchToFiber();
+  KJ_NOINLINE void switchToMain();
 
   void trace(TraceBuilder& builder) {
     // TODO(someday): Trace through fiber stack? Can it be done???
@@ -511,6 +510,7 @@ private:
 #endif
 
   [[noreturn]] void run();
+  KJ_NOINLINE void runOne();
 
   bool isReset() { return main == nullptr; }
 };
@@ -1041,7 +1041,7 @@ void XThreadEvent::ensureDoneOrCanceled() {
   }
 }
 
-void XThreadEvent::sendReply() {
+void XThreadEvent::sendReply() noexcept {
   KJ_IF_SOME(e, replyExecutor) {
     // Queue the reply.
     const EventLoop* replyLoop;
@@ -1053,12 +1053,11 @@ void XThreadEvent::sendReply() {
       } else {
         // Calling thread exited without cancelling the promise. This is UB. In fact,
         // `replyExecutor` is probably already destroyed and we are in use-after-free territory
-        // already. Better abort.
-        KJ_LOG(FATAL,
+        // already. Better abort. (sendReply() is noexcept so that this aborts.)
+        KJ_FAIL_ASSERT(
             "the thread which called kj::Executor::executeAsync() apparently exited its own "
             "event loop without canceling the cross-thread promise first; this is undefined "
             "behavior so I will crash now");
-        abort();
       }
     }
 
@@ -1226,7 +1225,7 @@ XThreadPaf::FulfillScope::FulfillScope(XThreadPaf** pointer) {
     obj = nullptr;
   }
 }
-XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
+XThreadPaf::FulfillScope::~FulfillScope() noexcept {  // intentionally noexcept
   if (obj != nullptr) {
     auto lock = obj->executor.impl->state.lockExclusive();
     KJ_IF_SOME(l, lock->loop) {
@@ -1238,11 +1237,12 @@ XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
         p.wake();
       }
     } else {
-      KJ_LOG(FATAL,
+      // This will abort due to the method being `noexcept`, which is what we want because this
+      // is UB.
+      KJ_FAIL_REQUIRE(
           "the thread which called kj::newPromiseAndCrossThreadFulfiller<T>() apparently exited "
           "its own event loop without canceling the cross-thread promise first; this is "
           "undefined behavior so I will crash now");
-      abort();
     }
   }
 }
@@ -1498,21 +1498,34 @@ struct FiberStack::StartRoutine {
 void FiberStack::run() {
   // Loop forever so that the fiber can be reused.
   for (;;) {
-    KJ_SWITCH_ONEOF(main) {
-      KJ_CASE_ONEOF(event, FiberBase*) {
-        event->run();
-      }
-      KJ_CASE_ONEOF(func, SynchronousFunc*) {
-        KJ_IF_SOME(exception, kj::runCatchingExceptions(func->func)) {
-          func->exception.emplace(kj::mv(exception));
-        }
-      }
-    }
+    // Run one fiber assignment. Note that the fiber remains on a specific thread for the duration
+    // of this call.
+    runOne();
 
     // Wait for the fiber to be used again. Note the fiber might simply be destroyed without this
     // ever returning. That's OK because we don't have any nontrivial destructors on the stack
     // at this point.
     switchToMain();
+
+    // WARNING: We may have switched threads at this point. Clang is known to cache the location
+    // of thread_locals with the assumption that a particular stack frame cannot switch threads.
+    // Therefore, it's important that we do not access any thread_locals in this function nor
+    // anything that could be inlined into this function. Hence why `runOne()` is marked noinline.
+    // (Luckily, we do not need to worry about the caller since this function is marked
+    // [[noreturn]]).
+  }
+}
+
+void FiberStack::runOne() {
+  KJ_SWITCH_ONEOF(main) {
+    KJ_CASE_ONEOF(event, FiberBase*) {
+      event->run();
+    }
+    KJ_CASE_ONEOF(func, SynchronousFunc*) {
+      KJ_IF_SOME(exception, kj::runCatchingExceptions(func->func)) {
+        func->exception.emplace(kj::mv(exception));
+      }
+    }
   }
 }
 
@@ -1612,8 +1625,9 @@ void FiberBase::cancel() {
     case RUNNING:
     case CANCELED:
       // Bad news.
-      KJ_LOG(FATAL, "fiber tried to cancel itself");
-      ::abort();
+      []() noexcept {
+        KJ_FAIL_ASSERT("fiber tried to cancel itself");
+      }();
       break;
 
     case FINISHED:
@@ -2132,7 +2146,7 @@ Event::Event(SourceLocation location)
 Event::Event(kj::EventLoop& loop, SourceLocation location)
     : loop(loop), next(nullptr), prev(nullptr), location(location) {}
 
-Event::~Event() noexcept(false) {
+Event::~Event() noexcept {  // intentionally noexcept
   live = 0;
 
   // Prevent compiler from eliding this store above. This line probably isn't needed because there
@@ -2145,6 +2159,8 @@ Event::~Event() noexcept(false) {
 
   disarm();
 
+  // If this fails, we'll abort due to `noexcept`. That's good because otherwise we're likely to
+  // be in a use-after-free situation.
   KJ_REQUIRE(!firing, "Promise callback destroyed itself.");
 }
 
@@ -2240,12 +2256,12 @@ bool Event::isNext() {
   return loop.running && loop.head == this;
 }
 
-void Event::disarm() {
+void Event::disarm() noexcept {
   if (prev != nullptr) {
     if (threadLocalEventLoop != &loop && threadLocalEventLoop != nullptr) {
-      KJ_LOG(FATAL, "Promise destroyed from a different thread than it was created in.");
-      // There's no way out of this place without UB, so abort now.
-      abort();
+      // This will crash because the method is `noexcept`. That's good because otherwise we're
+      // likely going to segfault later.
+      KJ_FAIL_ASSERT("Promise destroyed from a different thread than it was created in.");
     }
 
     if (loop.tail == &next) {
@@ -3101,7 +3117,9 @@ void CoroutineBase::AwaiterBase::getImpl(ExceptionOrValue& result, void* awaited
 
   KJ_IF_SOME(exception, result.exception) {
     // Manually extend the stack trace with the instruction address where the co_await occurred.
-    exception.addTrace(awaitedAt);
+    // Subtract 1 from the address to be consistent with `getStackTrace()` in `exception.c++` (see
+    // comment there).
+    exception.addTrace(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(awaitedAt) - 1));
 
     // Pass kj::maxValue for ignoreCount here so that `throwFatalException()` dosen't try to
     // extend the stack trace. There's no point in extending the trace beyond the single frame we

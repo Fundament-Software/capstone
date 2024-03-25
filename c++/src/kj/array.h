@@ -237,6 +237,11 @@ public:
   Array<T> attach(Attachments&&... attachments) KJ_WARN_UNUSED_RESULT;
   // Like Own<T>::attach(), but attaches to an Array.
 
+  template <typename U>
+  inline auto as() { return U::from(this); }
+  // Syntax sugar for invoking U::from.
+  // Used to chain conversion calls rather than wrap with function.
+
 private:
   T* ptr;
   size_t size_;
@@ -777,7 +782,7 @@ struct CopyConstructArray_<T, Iterator, true, false> {
 
   static T* apply(T* __restrict__ pos, Iterator start, Iterator end) {
     // Verify that T can be *implicitly* constructed from the source values.
-    if (false) implicitCast<T>(kj::mv(*start));
+    if (false) (void)implicitCast<T>(kj::mv(*start));
 
     if (noexcept(T(kj::mv(*start)))) {
       while (start != end) {

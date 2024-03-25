@@ -133,7 +133,7 @@ public:
   //   to complete (and possibly other things, if that RPC itself returned a promise capability),
   //   but when using `sendPipelineOnly()`, `whenResolved()` may complete immediately, or never, or
   //   at an arbitrary time. Do not rely on it.
-  // - Normal path shortening may not work with these capabilities. For exmaple, if the caller
+  // - Normal path shortening may not work with these capabilities. For example, if the caller
   //   forwards a pipelined capability back to the callee's vat, calls made by the callee to that
   //   capability may continue to proxy through the caller. Conversely, if the callee ends up
   //   returning a capability that points back to the caller's vat, calls on the pipelined
@@ -202,6 +202,11 @@ public:
 
   template <typename T, typename = kj::EnableIf<kj::canConvert<T*, Capability::Server*>()>>
   Client(kj::Own<T>&& server);
+  // Make a client capability that wraps the given server capability.  The server's methods will
+  // only be executed in the given EventLoop, regardless of what thread calls the client's methods.
+
+  template <typename T, typename = kj::EnableIf<kj::canConvert<T*, Capability::Server*>()>>
+  Client(kj::Rc<T>&& server);
   // Make a client capability that wraps the given server capability.  The server's methods will
   // only be executed in the given EventLoop, regardless of what thread calls the client's methods.
 
@@ -520,7 +525,7 @@ public:
   //
   // `shortenPath()` can also be used as a hack to shut up the client. If shortenPath() returns
   // a promise that resolves to an exception, then the client will be notified that the capability
-  // is now broken. Assuming the client is using a correct RPC implemnetation, this should cause
+  // is now broken. Assuming the client is using a correct RPC implementation, this should cause
   // all further calls initiated by the client to this capability to immediately fail client-side,
   // sparing the server's bandwidth.
   //
@@ -530,17 +535,16 @@ public:
   //   a proxy.
 
 protected:
-  inline Capability::Client thisCap();
+  Capability::Client thisCap();
   // Get a capability pointing to this object, much like the `this` keyword.
   //
-  // The effect of this method is undefined if:
-  // - No capability client has been created pointing to this object. (This is always the case in
-  //   the server's constructor.)
-  // - The capability client pointing at this object has been destroyed. (This is always the case
-  //   in the server's destructor.)
-  // - The capability client pointing at this object has been revoked using RevocableServer.
-  // - Multiple capability clients have been created around the same server (possible if the server
-  //   is refcounted, which is not recommended since the client itself provides refcounting).
+  // This method can only be called when a Client currently exists pointing at this object. In
+  // general, you can safely assume this inside of an RPC method implementation. If the Server
+  // object is not itself refcounted and a Client is always created immediately after construction,
+  // then `thisCap()` should work in any method except for the constructor and destructor.
+  //
+  // Note that if RevocableServer is in use, `thisCap()` returns a copy of the revocable Client
+  // object; it does not attempt to create a non-revocable reference.
 
   template <typename Params, typename Results>
   CallContext<Params, Results> internalGetTypedContext(
@@ -556,8 +560,10 @@ protected:
                                           uint64_t typeId, uint16_t methodId);
 
 private:
-  ClientHook* thisHook = nullptr;
+  kj::Maybe<ClientHook&> thisHook;
   friend class LocalClient;
+  friend class Capability::Client;
+  friend class _::CapabilityServerSetBase;
 };
 
 template <typename T>
@@ -1091,6 +1097,9 @@ template <typename T, typename>
 inline Capability::Client::Client(kj::Own<T>&& server)
     : hook(makeLocalClient(kj::mv(server))) {}
 template <typename T, typename>
+inline Capability::Client::Client(kj::Rc<T>&& server)
+    : hook(makeLocalClient(server.toOwn())) {}
+template <typename T, typename>
 inline Capability::Client::Client(kj::Promise<T>&& promise)
     : hook(newLocalPromiseClient(promise.then([](T&& t) { return kj::mv(t.hook); }))) {}
 inline Capability::Client::Client(Client& other): hook(other.hook->addRef()) {}
@@ -1190,10 +1199,6 @@ template <typename Params>
 StreamingCallContext<Params> Capability::Server::internalGetTypedStreamingContext(
     CallContext<AnyPointer, AnyPointer> typeless) {
   return StreamingCallContext<Params>(*typeless.hook);
-}
-
-Capability::Client Capability::Server::thisCap() {
-  return Client(thisHook->addRef());
 }
 
 template <typename T>

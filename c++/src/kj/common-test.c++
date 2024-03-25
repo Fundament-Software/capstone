@@ -23,6 +23,7 @@
 #include "test.h"
 #include <inttypes.h>
 #include <kj/compat/gtest.h>
+#include <span>
 
 namespace kj {
 namespace {
@@ -573,7 +574,7 @@ TEST(Common, Downcast) {
 
   EXPECT_EQ(&bar, &downcast<Bar>(foo));
 #if defined(KJ_DEBUG) && !KJ_NO_RTTI
-  KJ_EXPECT_THROW_MESSAGE("Value cannot be downcast", downcast<Baz>(foo));
+  KJ_EXPECT_THROW_MESSAGE("Value cannot be downcast", (void)downcast<Baz>(foo));
 #endif
 
 #if KJ_NO_RTTI
@@ -924,6 +925,48 @@ KJ_TEST("kj::ArrayPtr startsWith / endsWith / findFirst / findLast") {
   KJ_EXPECT(arr.findLast(56).orDefault(100) == 2);
   KJ_EXPECT(arr.findLast(78).orDefault(100) == 100);
 }
+
+struct Std {
+  template<typename T>
+  static std::span<T> from(ArrayPtr<T>* arr) {
+    return std::span<T>(arr->begin(), arr->size());
+  }
+};
+
+KJ_TEST("ArrayPtr::as<Std>") {
+  int rawArray[] = {12, 34, 56, 34, 12};
+  ArrayPtr<int> arr(rawArray);
+  std::span<int> stdPtr = arr.as<Std>();
+  KJ_EXPECT(stdPtr.size() == 5);
+}
+
+// Verifies the expected values of kj::isDisallowedInCoroutine<T>
+
+struct DisallowedInCoroutineStruct {
+  KJ_DISALLOW_AS_COROUTINE_PARAM;
+};
+class DisallowedInCoroutinePublic {
+public:
+  KJ_DISALLOW_AS_COROUTINE_PARAM;
+};
+class DisallowedInCoroutinePrivate {
+private:
+  KJ_DISALLOW_AS_COROUTINE_PARAM;
+};
+struct AllowedInCoroutine {};
+
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutineStruct>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutineStruct&>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutineStruct*>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePublic>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePublic&>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePublic*>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePrivate>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePrivate&>());
+static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePrivate*>());
+static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine>());
+static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine&>());
+static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine*>());
 
 }  // namespace
 }  // namespace kj

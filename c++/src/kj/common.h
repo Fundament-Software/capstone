@@ -290,7 +290,7 @@ typedef unsigned char byte;
 #define KJ_DEPRECATED(reason) \
     __attribute__((deprecated))
 #define KJ_UNAVAILABLE(reason) = delete
-// If the `unavailable` attribute is not supproted, just mark the method deleted, which at least
+// If the `unavailable` attribute is not supported, just mark the method deleted, which at least
 // makes it a compile-time error to try to call it. Note that on Clang, marking a method deleted
 // *and* unavailable unfortunately defeats the purpose of the unavailable annotation, as the
 // generic "deleted" error is reported instead.
@@ -1771,7 +1771,7 @@ public:
 //     ArrayPtr<const int> ptr = { 1, 2, 3 };
 //     foo(ptr[1]); // undefined behavior!
 // Any KJ programmer should be able to recognize that this is UB, because an ArrayPtr does not own
-// its content. That's not what this constructor is for, tohugh. This constructor is meant to allow
+// its content. That's not what this constructor is for, though. This constructor is meant to allow
 // code like this:
 //     int foo(ArrayPtr<const int> p);
 //     // ... later ...
@@ -1854,6 +1854,14 @@ public:
     KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds ArrayPtr::slice().");
     return ArrayPtr(ptr + start, end - start);
   }
+  inline ArrayPtr<const T> slice(size_t start) const {
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    return ArrayPtr<const T>(ptr + start, size_ - start);
+  }
+  inline ArrayPtr slice(size_t start) {
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    return ArrayPtr(ptr + start, size_ - start);
+  }
   inline bool startsWith(const ArrayPtr<const T>& other) const {
     return other.size() <= size_ && slice(0, other.size()) == other;
   }
@@ -1918,6 +1926,11 @@ public:
   // should be an object that actually owns the array that the ArrayPtr is pointing at.
   //
   // You must include kj/array.h to call this.
+
+  template <typename U>
+  inline auto as() { return U::from(this); }
+  // Syntax sugar for invoking U::from.
+  // Used to chain conversion calls rather than wrap with function.
 
 private:
   T* ptr;
@@ -2084,6 +2097,49 @@ _::Deferred<Func> defer(Func&& func) {
 
 #define KJ_DEFER(code) auto KJ_UNIQUE_NAME(_kjDefer) = ::kj::defer([&](){code;})
 // Run the given code when the function exits, whether by return or exception.
+
+// =======================================================================================
+// IsDisallowedInCoroutine
+
+namespace _ {
+
+template <typename T, typename = void>
+struct IsDisallowedInCoroutine {
+  static constexpr bool value = false;
+};
+
+template <typename T>
+struct IsDisallowedInCoroutine<T, typename Decay<T>::_kj_DissalowedInCoroutine> {
+  static constexpr bool value = true;
+};
+
+template <typename T>
+struct IsDisallowedInCoroutine<T*, typename T::_kj_DissalowedInCoroutine> {
+  static constexpr bool value = true;
+};
+
+template <typename T>
+constexpr bool isDisallowedInCoroutine() {
+  return IsDisallowedInCoroutine<T>::value;
+}
+
+}  // namespace _
+
+#define KJ_DISALLOW_AS_COROUTINE_PARAM \
+  using _kj_DissalowedInCoroutine = void; \
+  template<typename T> friend constexpr bool kj::_::isDisallowedInCoroutine(); \
+  template<typename T, typename> friend struct kj::_::IsDisallowedInCoroutine
+// Place in the body of a class or struct to indicate that an instance of or reference to this
+// type cannot be passed as the parameter to a KJ coroutine. This makes sense, for example, for
+// mutex locks, or other types which should never be held across a co_await.
+//
+// (Types annotated with this likely also should not be used as local variables inside coroutines,
+// but there is no way for us to enforce that.)
+//
+// struct Foo {
+//    KJ_DISALLOW_AS_COROUTINE_PARAM;
+// }
+//
 
 }  // namespace kj
 

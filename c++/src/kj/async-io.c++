@@ -80,6 +80,28 @@ Maybe<Own<AsyncInputStream>> AsyncInputStream::tryTee(uint64_t) {
   return kj::none;
 }
 
+kj::Promise<size_t> NullStream::tryRead(void* buffer, size_t minBytes, size_t maxBytes) {
+  return kj::constPromise<size_t, 0>();
+}
+kj::Maybe<uint64_t> NullStream::tryGetLength() {
+  return uint64_t(0);
+}
+kj::Promise<uint64_t> NullStream::pumpTo(kj::AsyncOutputStream& output, uint64_t amount) {
+  return kj::constPromise<uint64_t, 0>();
+}
+
+kj::Promise<void> NullStream::write(const void* buffer, size_t size) {
+  return kj::READY_NOW;
+}
+kj::Promise<void> NullStream::write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) {
+  return kj::READY_NOW;
+}
+kj::Promise<void> NullStream::whenWriteDisconnected() {
+  return kj::NEVER_DONE;
+}
+
+void NullStream::shutdownWrite() {}
+
 namespace {
 
 class AsyncPump {
@@ -401,29 +423,53 @@ private:
   }
 
   template <typename F>
-  static auto teeExceptionVoid(F& fulfiller) {
+  static auto teeExceptionVoid(F& fulfiller, Canceler& canceler) {
     // Returns a functor that can be passed as the second parameter to .then() to propagate the
     // exception to a given fulfiller. The functor's return type is void.
-    return [&fulfiller](kj::Exception&& e) {
+    //
+    // All use cases of this helper below are also wrapped in `canceler.wrap()`, and fulfilling
+    // `fulfiller` may cause the canceler to be canceled. It's possible the canceler will be
+    // canceled before the exception even gets a chance to propagate out of the wrapped promise,
+    // which would have the effet of replacing the original exception with a non-useful
+    // "operation canceled" exception. To avoid this, we must release the canceler before
+    // fulfilling the fulfiller.
+    return [&fulfiller, &canceler](kj::Exception&& e) {
+      canceler.release();
       fulfiller.reject(kj::cp(e));
       kj::throwRecoverableException(kj::mv(e));
     };
   }
   template <typename F>
-  static auto teeExceptionSize(F& fulfiller) {
+  static auto teeExceptionSize(F& fulfiller, Canceler& canceler) {
     // Returns a functor that can be passed as the second parameter to .then() to propagate the
     // exception to a given fulfiller. The functor's return type is size_t.
-    return [&fulfiller](kj::Exception&& e) -> size_t {
+    //
+    // All use cases of this helper below are also wrapped in `canceler.wrap()`, and fulfilling
+    // `fulfiller` may cause the canceler to be canceled. It's possible the canceler will be
+    // canceled before the exception even gets a chance to propagate out of the wrapped promise,
+    // which would have the effet of replacing the original exception with a non-useful
+    // "operation canceled" exception. To avoid this, we must release the canceler before
+    // fulfilling the fulfiller.
+    return [&fulfiller, &canceler](kj::Exception&& e) -> size_t {
+      canceler.release();
       fulfiller.reject(kj::cp(e));
       kj::throwRecoverableException(kj::mv(e));
       return 0;
     };
   }
   template <typename T, typename F>
-  static auto teeExceptionPromise(F& fulfiller) {
+  static auto teeExceptionPromise(F& fulfiller, Canceler& canceler) {
     // Returns a functor that can be passed as the second parameter to .then() to propagate the
     // exception to a given fulfiller. The functor's return type is Promise<T>.
-    return [&fulfiller](kj::Exception&& e) -> kj::Promise<T> {
+    //
+    // All use cases of this helper below are also wrapped in `canceler.wrap()`, and fulfilling
+    // `fulfiller` may cause the canceler to be canceled. It's possible the canceler will be
+    // canceled before the exception even gets a chance to propagate out of the wrapped promise,
+    // which would have the effet of replacing the original exception with a non-useful
+    // "operation canceled" exception. To avoid this, we must release the canceler before
+    // fulfilling the fulfiller.
+    return [&fulfiller, &canceler](kj::Exception&& e) -> kj::Promise<T> {
+      canceler.release();
       fulfiller.reject(kj::cp(e));
       return kj::mv(e);
     };
@@ -568,7 +614,7 @@ private:
           writeBuffer = writeBuffer.slice(amount, writeBuffer.size());
           // We pumped the full amount, so we're done pumping.
           return amount;
-        }, teeExceptionSize(fulfiller)));
+        }, teeExceptionSize(fulfiller, canceler)));
       }
 
       // First piece doesn't cover the whole pump. Figure out how many more pieces to add.
@@ -602,7 +648,7 @@ private:
             return pipe.pumpTo(output, amount - actual)
                 .then([actual](uint64_t actual2) { return actual + actual2; });
           }
-        }, teeExceptionPromise<uint64_t>(fulfiller)));
+        }, teeExceptionPromise<uint64_t>(fulfiller, canceler)));
       } else {
         // Pump ends mid-piece. Write the last, partial piece.
         auto n = amount - actual;
@@ -622,7 +668,7 @@ private:
           morePieces = newMorePieces;
           canceler.release();
           return amount;
-        }, teeExceptionSize(fulfiller)));
+        }, teeExceptionSize(fulfiller, canceler)));
       }
     }
 
@@ -757,7 +803,9 @@ private:
                               minBytes - actual, maxBytes - actual)
               .then([actual](size_t actual2) { return actual + actual2; });
         }
-      }, teeExceptionPromise<size_t>(fulfiller)));
+        // This teeExceptionPromise can mask the original exception because it causes BlockedPumpFrom
+        // to be resolved and then destroyed which causes canceler to cancel.
+      }, teeExceptionPromise<size_t>(fulfiller, canceler)));
     }
 
     Promise<ReadResult> tryReadWithFds(void* readBuffer, size_t minBytes, size_t maxBytes,
@@ -797,7 +845,7 @@ private:
         // Completed entire pumpTo amount.
         KJ_ASSERT(actual == amount2);
         return amount2;
-      }, teeExceptionSize(fulfiller)));
+      }, teeExceptionSize(fulfiller, canceler)));
     }
 
     void abortRead() override {
@@ -1087,7 +1135,7 @@ private:
           // place waiting for more data.
           return actual;
         }
-      }, teeExceptionPromise<uint64_t>(fulfiller)));
+      }, teeExceptionPromise<uint64_t>(fulfiller, canceler)));
     }
 
     void shutdownWrite() override {
@@ -1218,7 +1266,7 @@ private:
           KJ_ASSERT(pumpedSoFar == amount);
           return pipe.write(reinterpret_cast<const byte*>(writeBuffer) + actual, size - actual);
         }
-      }, teeExceptionPromise<void>(fulfiller)));
+      }, teeExceptionPromise<void>(fulfiller, canceler)));
     }
 
     Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
@@ -1245,7 +1293,7 @@ private:
               fulfiller.fulfill(kj::cp(amount));
               pipe.endState(*this);
               return pipe.write(partial2.begin(), partial2.size());
-            }, teeExceptionPromise<void>(fulfiller)));
+            }, teeExceptionPromise<void>(fulfiller, canceler)));
             ++i;
           } else {
             // The pump ends exactly at the end of a piece, how nice.
@@ -1253,7 +1301,7 @@ private:
               canceler.release();
               fulfiller.fulfill(kj::cp(amount));
               pipe.endState(*this);
-            }, teeExceptionVoid(fulfiller)));
+            }, teeExceptionVoid(fulfiller, canceler)));
           }
 
           auto remainder = pieces.slice(i, pieces.size());
@@ -1282,7 +1330,7 @@ private:
           fulfiller.fulfill(kj::cp(amount));
           pipe.endState(*this);
         }
-      }, teeExceptionVoid(fulfiller)));
+      }, teeExceptionVoid(fulfiller, canceler)));
     }
 
     Promise<void> writeWithFds(ArrayPtr<const byte> data,
@@ -1347,7 +1395,7 @@ private:
             KJ_ASSERT(pumpedSoFar == amount);
             return input.pumpTo(pipe, amount2 - actual);
           }
-        }, teeExceptionPromise<uint64_t>(fulfiller)));
+        }, teeExceptionPromise<uint64_t>(fulfiller, canceler)));
       });
     }
 
@@ -2845,9 +2893,10 @@ public:
   }
 
   uint getPort() override {
-    return receivers[0]->getPort();
+    return receivers.size() > 0 ? receivers[0]->getPort() : 0u;
   }
   void getsockopt(int level, int option, void* value, uint* length) override {
+    KJ_REQUIRE(receivers.size() > 0);
     return receivers[0]->getsockopt(level, option, value, length);
   }
   void setsockopt(int level, int option, const void* value, uint length) override {
@@ -2857,6 +2906,7 @@ public:
     }
   }
   void getsockname(struct sockaddr* addr, uint* length) override {
+    KJ_REQUIRE(receivers.size() > 0);
     return receivers[0]->getsockname(addr, length);
   }
 

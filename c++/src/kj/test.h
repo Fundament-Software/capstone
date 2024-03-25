@@ -21,10 +21,11 @@
 
 #pragma once
 
-#include "debug.h"
-#include "vector.h"
-#include "function.h"
-#include "windows-sanity.h"  // work-around macro conflict with `ERROR`
+#include <kj/debug.h>
+#include <kj/glob-filter.h>
+#include <kj/vector.h>
+#include <kj/function.h>
+#include <kj/windows-sanity.h>  // work-around macro conflict with `ERROR`
 
 KJ_BEGIN_HEADER
 
@@ -92,6 +93,7 @@ private:
   else KJ_FAIL_EXPECT("failed: expected " #cond, _kjCondition, ##__VA_ARGS__)
 #endif
 
+// TODO(msvc): cast results to void like non-MSVC versions do
 #if _MSC_VER && !defined(__clang__)
 #define KJ_EXPECT_THROW_RECOVERABLE(type, code, ...) \
   do { \
@@ -106,7 +108,7 @@ private:
 #define KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(message, code, ...) \
   do { \
     KJ_IF_SOME(e, ::kj::runCatchingExceptions([&]() { code; })) { \
-      KJ_INDIRECT_EXPAND(KJ_EXPECT, (::kj::_::hasSubstring(e.getDescription(), message), \
+      KJ_INDIRECT_EXPAND(KJ_EXPECT, (e.getDescription().contains(message), \
           "exception description didn't contain expected substring", e, __VA_ARGS__)); \
     } else { \
       KJ_INDIRECT_EXPAND(KJ_FAIL_EXPECT, ("code did not throw: " #code, __VA_ARGS__)); \
@@ -115,7 +117,7 @@ private:
 #else
 #define KJ_EXPECT_THROW_RECOVERABLE(type, code, ...) \
   do { \
-    KJ_IF_SOME(e, ::kj::runCatchingExceptions([&]() { code; })) { \
+    KJ_IF_SOME(e, ::kj::runCatchingExceptions([&]() { (void)({code;}); })) { \
       KJ_EXPECT(e.getType() == ::kj::Exception::Type::type, \
           "code threw wrong exception type: " #code, e, ##__VA_ARGS__); \
     } else { \
@@ -125,8 +127,8 @@ private:
 
 #define KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(message, code, ...) \
   do { \
-    KJ_IF_SOME(e, ::kj::runCatchingExceptions([&]() { code; })) { \
-      KJ_EXPECT(::kj::_::hasSubstring(e.getDescription(), message), \
+    KJ_IF_SOME(e, ::kj::runCatchingExceptions([&]() { (void)({code;}); })) { \
+      KJ_EXPECT(e.getDescription().contains(message), \
           "exception description didn't contain expected substring", e, ##__VA_ARGS__); \
     } else { \
       KJ_FAIL_EXPECT("code did not throw: " #code, ##__VA_ARGS__); \
@@ -159,8 +161,6 @@ private:
 
 namespace _ {  // private
 
-bool hasSubstring(kj::StringPtr haystack, kj::StringPtr needle);
-
 bool expectExit(Maybe<int> statusCode, FunctionParam<void()> code) noexcept;
 // Expects that the given code will exit with a given statusCode.
 // The test will fork() and run in a subprocess. On Windows, where fork() is not available,
@@ -185,24 +185,6 @@ private:
   StringPtr substring;
   bool seen;
   UnwindDetector unwindDetector;
-};
-
-class GlobFilter {
-  // Implements glob filters for the --filter flag.
-  //
-  // Exposed in header only for testing.
-
-public:
-  explicit GlobFilter(const char* pattern);
-  explicit GlobFilter(ArrayPtr<const char> pattern);
-
-  bool matches(StringPtr name);
-
-private:
-  String pattern;
-  Vector<uint> states;
-
-  void applyState(char c, int state);
 };
 
 }  // namespace _ (private)

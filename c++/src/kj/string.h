@@ -151,6 +151,14 @@ public:
   inline Maybe<size_t> findFirst(char c) const { return asArray().findFirst(c); }
   inline Maybe<size_t> findLast(char c) const { return asArray().findLast(c); }
 
+  Maybe<size_t> find(const StringPtr& other) const;
+  // Return the index at which other appears in this string.
+  //
+  // In keeping with std::string::find, if other is the empty string, return 0 since the empty
+  // string is a substring of any string.
+
+  bool contains(const StringPtr& other) const { return find(other) != kj::none; }
+
   template <typename T>
   T parseAs() const;
   // Parse string as template number type.
@@ -167,6 +175,11 @@ public:
   ConstString attach() const KJ_WARN_UNUSED_RESULT;
   // Like ArrayPtr<T>::attach(), but instead promotes a StringPtr into a ConstString. Generally the
   // attachment should be an object that somehow owns the String that the StringPtr is pointing at.
+
+  template <typename T>
+  inline auto as() { return T::from(this); }
+  // Syntax sugar for invoking T::from.
+  // Used to chain conversion calls rather than wrap with function.
 
 private:
   inline explicit constexpr StringPtr(ArrayPtr<const char> content): content(content) {}
@@ -289,6 +302,14 @@ public:
   inline bool startsWith(const StringPtr& other) const { return asArray().startsWith(other);}
   inline bool endsWith(const StringPtr& other) const { return asArray().endsWith(other); }
 
+  Maybe<size_t> find(const StringPtr& other) const { return asPtr().find(other); }
+  // Return the index at which other appears in this string.
+  //
+  // In keeping with std::string::find, if other is the empty string, return 0 since the empty
+  // string is a substring of any string.
+
+  bool contains(const StringPtr& other) const { return asPtr().contains(other); }
+
   inline StringPtr slice(size_t start) const KJ_LIFETIMEBOUND {
     return StringPtr(*this).slice(start);
   }
@@ -305,6 +326,11 @@ public:
 
   template <typename T>
   Maybe<T> tryParseAs() const { return StringPtr(*this).tryParseAs<T>(); }
+
+  template <typename T>
+  inline auto as() { return T::from(this); }
+  // Syntax sugar for invoking T::from.
+  // Used to chain conversion calls rather than wrap with function.
 
 private:
   Array<char> content;
@@ -378,6 +404,14 @@ public:
 
   inline bool startsWith(const StringPtr& other) const { return asArray().startsWith(other);}
   inline bool endsWith(const StringPtr& other) const { return asArray().endsWith(other); }
+
+  Maybe<size_t> find(const StringPtr& other) const { return asPtr().find(other); }
+  // Return the index at which other appears in this string.
+  //
+  // In keeping with std::string::find, if other is the empty string, return 0 since the empty
+  // string is a substring of any string.
+
+  bool contains(const StringPtr& other) const { return asPtr().contains(other); }
 
   inline StringPtr slice(size_t start) const KJ_LIFETIMEBOUND {
     return StringPtr(*this).slice(start);

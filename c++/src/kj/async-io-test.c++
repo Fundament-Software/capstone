@@ -114,7 +114,7 @@ TEST(AsyncIo, SimpleNetworkAuthentication) {
       // `addr` was resolved from `localhost` and may contain multiple addresses, but
       // result.peerIdentity tells us the specific address that was used. So it should be one
       // of the ones on the list, but only one.
-      KJ_EXPECT(strstr(addr->toString().cStr(), id->getAddress().toString().cStr()) != nullptr);
+      KJ_EXPECT(addr->toString().contains(id->getAddress().toString()));
       KJ_EXPECT(id->getAddress().toString().findFirst(',') == nullptr);
 
       client = kj::mv(result.stream);
@@ -1473,6 +1473,33 @@ KJ_TEST("Userland pipe tryPumpFrom") {
   KJ_EXPECT(pumpPromise.wait(ws) == 3);
 }
 
+KJ_TEST("Userland pipe tryPumpFrom exception") {
+  // Check for a bug where exceptions don't propagate through tryPumpFrom() correctly.
+
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto [promise, fulfiller] = newPromiseAndFulfiller<Own<AsyncIoStream>>();
+  auto promiseStream = newPromisedStream(kj::mv(promise));
+
+  auto pipe = newOneWayPipe();
+  auto pumpPromise = KJ_ASSERT_NONNULL(pipe.out->tryPumpFrom(*promiseStream));
+
+  char buffer;
+  auto readPromise = pipe.in->tryRead(&buffer, 1, 1);
+
+  KJ_EXPECT(!pumpPromise.poll(ws));
+  KJ_EXPECT(!readPromise.poll(ws));
+
+  fulfiller->reject(KJ_EXCEPTION(FAILED, "foobar"));
+
+  KJ_EXPECT_THROW_MESSAGE("foobar", pumpPromise.wait(ws));
+
+  // Before the bugfix, `readPromise` would reject with the exception "disconnected: operation
+  // canceled" rather than propagate the original exception.
+  KJ_EXPECT_THROW_MESSAGE("foobar", readPromise.wait(ws));
+}
+
 KJ_TEST("Userland pipe pumpTo cancel") {
   kj::EventLoop loop;
   WaitScope ws(loop);
@@ -1577,7 +1604,7 @@ KJ_TEST("Userland pipe pump into zero-limited pipe, no data to pump") {
   auto pipe2 = newOneWayPipe(uint64_t(0));
   auto pumpPromise = KJ_ASSERT_NONNULL(pipe2.out->tryPumpFrom(*pipe.in));
 
-  expectRead(*pipe2.in, "");
+  expectRead(*pipe2.in, "").wait(ws);
   pipe.out = nullptr;
   KJ_EXPECT(pumpPromise.wait(ws) == 0);
 }
@@ -1590,7 +1617,7 @@ KJ_TEST("Userland pipe pump into zero-limited pipe, data is pumped") {
   auto pipe2 = newOneWayPipe(uint64_t(0));
   auto pumpPromise = KJ_ASSERT_NONNULL(pipe2.out->tryPumpFrom(*pipe.in));
 
-  expectRead(*pipe2.in, "");
+  expectRead(*pipe2.in, "").wait(ws);
   auto writePromise = pipe.out->write("foo", 3);
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("abortRead() has been called", pumpPromise.wait(ws));
 }
@@ -3051,6 +3078,16 @@ KJ_TEST("AggregateConnectionReceiver") {
 
   acceptPromise1.wait(ws);
   acceptPromise3.wait(ws);
+}
+
+KJ_TEST("AggregateConnectionReceiver empty") {
+  auto aggregate = newAggregateConnectionReceiver({});
+  KJ_EXPECT(aggregate->getPort() == 0);
+
+  int value;
+  uint length = sizeof(value);
+
+  KJ_EXPECT_THROW_MESSAGE("receivers.size() > 0", aggregate->getsockopt(0, 0, &value, &length));
 }
 
 // =======================================================================================
