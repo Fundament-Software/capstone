@@ -484,7 +484,7 @@ public:
       // will call this method to provide the shortened path.
 
       KJ_IF_SOME(currentParent, parent) {
-        parent = nullptr;
+        parent = kj::none;
 
         auto self = kj::mv(currentParent.state.get<kj::Own<PathProber>>());
         currentParent.state = Ended();  // temporary, we'll set this properly below
@@ -561,7 +561,7 @@ public:
             //   this task promise, which is an error... let the event loop do it later by
             //   detaching.
             task.attach(kj::mv(prober)).detach([](kj::Exception&&){});
-            parent = nullptr;
+            parent = kj::none;
 
             // OK, now we can change the parent state and signal it to proceed.
             currentParent.state = kj::mv(inner);
@@ -1147,7 +1147,7 @@ private:
     if (splitByte == 0) {
       // Oh thank god, the split is between two pieces.
       auto rest = pieces.slice(splitPiece, pieces.size());
-      return writeFirstPieces(pieces.slice(0, splitPiece))
+      return writeFirstPieces(pieces.first(splitPiece))
           .then([this,rest]() mutable {
         return write(rest);
       });
@@ -1161,7 +1161,7 @@ private:
       for (auto i: kj::zeroTo(right.size())) {
         right[i] = pieces[splitPiece + i];
       }
-      left.back() = pieces[splitPiece].slice(0, splitByte);
+      left.back() = pieces[splitPiece].first(splitByte);
       right.front() = pieces[splitPiece].slice(splitByte, pieces[splitPiece].size());
 
       return writeFirstPieces(left).attach(kj::mv(left))

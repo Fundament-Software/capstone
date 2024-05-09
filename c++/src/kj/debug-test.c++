@@ -63,7 +63,7 @@ public:
     return false;
 
 #else
-    int pipeFds[2];
+    int pipeFds[2]{};
     KJ_SYSCALL(pipe(pipeFds));
     pid_t child = fork();
     if (child == 0) {
@@ -76,7 +76,7 @@ public:
       close(pipeFds[1]);
 
       // Read child error messages into our local buffer.
-      char buf[1024];
+      char buf[1024]{};
       for (;;) {
         ssize_t n = read(pipeFds[0], buf, sizeof(buf));
         if (n < 0) {
@@ -182,7 +182,7 @@ std::string fileLine(std::string file, int line) {
   file = trimSourceFilename(file.c_str()).cStr();
 
   file += ':';
-  char buffer[32];
+  char buffer[32]{};
   snprintf(buffer, sizeof(buffer), "%d", line);
   file += buffer;
   return file;
@@ -289,7 +289,7 @@ TEST(Debug, Catch) {
     KJ_IF_SOME(e, exception) {
       String what = str(e);
       KJ_IF_SOME(eol, what.findFirst('\n')) {
-        what = kj::str(what.slice(0, eol));
+        what = kj::str(what.first(eol));
       }
       std::string text(what.cStr());
       EXPECT_EQ(fileLine(__FILE__, line) + ": failed: foo", text);
@@ -307,7 +307,7 @@ TEST(Debug, Catch) {
     KJ_IF_SOME(e, exception) {
       String what = str(e);
       KJ_IF_SOME(eol, what.findFirst('\n')) {
-        what = kj::str(what.slice(0, eol));
+        what = kj::str(what.first(eol));
       }
       std::string text(what.cStr());
       EXPECT_EQ(fileLine(__FILE__, line) + ": failed: foo", text);

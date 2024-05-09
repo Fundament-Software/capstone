@@ -64,7 +64,7 @@ kj::Exception getOpensslError() {
     }
 #endif
 
-    char message[1024];
+    char message[1024]{};
     ERR_error_string_n(error, message, sizeof(message));
     lines.add(kj::heapString(message));
   }
@@ -670,7 +670,7 @@ public:
         // rather cumbersome and actually broke code in the Workers Runtime that does complicated
         // stacking of kj::Network implementations.
         KJ_IF_SOME(pos, addr.findFirst(':')) {
-          hostname = kj::heapString(addr.slice(0, pos));
+          hostname = kj::heapString(addr.first(pos));
         } else {
           hostname = kj::heapString(addr);
         }

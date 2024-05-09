@@ -260,8 +260,8 @@ void Canceler::AdapterBase::unlink() {
   KJ_IF_SOME(n, next) {
     n.prev = prev;
   }
-  next = nullptr;
-  prev = nullptr;
+  next = kj::none;
+  prev = kj::none;
 }
 
 Canceler::AdapterImpl<void>::AdapterImpl(kj::PromiseFulfiller<void>& fulfiller,
@@ -307,7 +307,7 @@ public:
   Maybe<OwnTask>* prev = nullptr;
 
   kj::String trace() {
-    void* space[32];
+    void* space[32]{};
     _::TraceBuilder builder(space);
     node->tracePromise(builder, false);
     return kj::str("task: ", builder);
@@ -833,7 +833,7 @@ struct Executor::Impl {
   }
 
   void disconnect() {
-    state.lockExclusive()->loop = nullptr;
+    state.lockExclusive()->loop = kj::none;
 
     // Now that `loop` is set null in `state`, other threads will no longer try to manipulate our
     // lists, so we can access them without a lock. That's convenient because a bunch of the things
@@ -2285,7 +2285,7 @@ void Event::disarm() noexcept {
 }
 
 String Event::traceEvent() {
-  void* space[32];
+  void* space[32]{};
   TraceBuilder builder(space);
   traceEvent(builder);
   return kj::str(builder);
@@ -2310,7 +2310,7 @@ ArrayPtr<void* const> getAsyncTrace(ArrayPtr<void*> space) {
 }
 
 kj::String getAsyncTrace() {
-  void* space[32];
+  void* space[32]{};
   auto trace = getAsyncTrace(space);
   return kj::str(stringifyStackTraceAddresses(trace), stringifyStackTrace(trace));
 }
@@ -2320,7 +2320,7 @@ kj::String getAsyncTrace() {
 namespace _ {  // private
 
 kj::String PromiseBase::trace() {
-  void* space[32];
+  void* space[32]{};
   TraceBuilder builder(space);
   node->tracePromise(builder, false);
   return kj::str(builder);
@@ -3038,7 +3038,7 @@ Maybe<Own<Event>> CoroutineBase::fire() {
   // already know where it's going. But, we don't really know: the `co_await` might be in a
   // try-catch block, so we have no choice but to resume and throw later.
 
-  promiseNodeForTrace = nullptr;
+  promiseNodeForTrace = kj::none;
 
   coroutine.resume();
 
@@ -3103,7 +3103,7 @@ CoroutineBase::AwaiterBase::~AwaiterBase() noexcept(false) {
   // Make sure it's safe to generate an async stack trace between now and when the Coroutine is
   // destroyed.
   KJ_IF_SOME(coroutineEvent, maybeCoroutineEvent) {
-    coroutineEvent.promiseNodeForTrace = nullptr;
+    coroutineEvent.promiseNodeForTrace = kj::none;
   }
 
   unwindDetector.catchExceptionsIfUnwinding([this]() {

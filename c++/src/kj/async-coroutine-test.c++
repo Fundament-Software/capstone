@@ -51,7 +51,12 @@ KJ_TEST("Identity coroutine") {
 
 template <typename T>
 Promise<T> simpleCoroutine(kj::Promise<T> result, kj::Promise<bool> dontThrow = true) {
-  KJ_ASSERT(co_await dontThrow);
+  // TODO(cleanup): Storing the coroutine result in a variable to work around
+  // https://developercommunity.visualstudio.com/t/certain-coroutines-cause-error-C7587:-/10311276,
+  // which caused a compile error here. This was supposed to be resolved with version 17.9, but
+  // appears to still be happening as of 17.9.6. Clean up once this has been fixed.
+  auto resolved = co_await dontThrow;
+  KJ_ASSERT(resolved);
   co_return co_await result;
 }
 
@@ -442,7 +447,7 @@ Promise<void> sendData(Promise<Own<NetworkAddress>> addressPromise) {
 
 Promise<String> receiveDataCoroutine(Own<ConnectionReceiver> listener) {
   auto server = co_await listener->accept();
-  char buffer[4];
+  char buffer[4]{};
   auto n = co_await server->read(buffer, 3, 4);
   KJ_EXPECT(3u == n);
   co_return heapString(buffer, n);

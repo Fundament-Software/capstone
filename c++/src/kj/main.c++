@@ -59,7 +59,7 @@ StringPtr TopLevelProcessContext::getProgramName() {
 }
 
 void TopLevelProcessContext::exit() {
-  int exitCode = hadErrors ? 1 : 0;
+  int exitCode = hadErrors.load() ? 1 : 0;
   if (cleanShutdown) {
     throw CleanShutdownException { exitCode };
   }
@@ -177,12 +177,12 @@ static void writeLineToFd(int fd, StringPtr message) {
 #endif
 }
 
-void TopLevelProcessContext::warning(StringPtr message) {
+void TopLevelProcessContext::warning(StringPtr message) const {
   writeLineToFd(STDERR_FILENO, message);
 }
 
-void TopLevelProcessContext::error(StringPtr message) {
-  hadErrors = true;
+void TopLevelProcessContext::error(StringPtr message) const {
+  hadErrors.store(true);
   writeLineToFd(STDERR_FILENO, message);
 }
 
@@ -773,7 +773,7 @@ void MainBuilder::MainImpl::wrapText(Vector<char>& output, StringPtr indent, Str
 
     KJ_IF_SOME(lineEnd, text.findFirst('\n')) {
       if (lineEnd <= width) {
-        output.addAll(text.slice(0, lineEnd + 1));
+        output.addAll(text.first(lineEnd + 1));
         text = text.slice(lineEnd + 1);
         continue;
       }
@@ -797,7 +797,7 @@ void MainBuilder::MainImpl::wrapText(Vector<char>& output, StringPtr indent, Str
       }
     }
 
-    output.addAll(text.slice(0, wrapPos));
+    output.addAll(text.first(wrapPos));
     output.add('\n');
 
     // Skip spaces after the text that was printed.

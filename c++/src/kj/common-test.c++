@@ -926,6 +926,33 @@ KJ_TEST("kj::ArrayPtr startsWith / endsWith / findFirst / findLast") {
   KJ_EXPECT(arr.findLast(78).orDefault(100) == 100);
 }
 
+KJ_TEST("kj::ArrayPtr fill") {
+  int64_t int64Array[] = {12, 34, 56, 34, 12};
+  arrayPtr(int64Array).fill(42);
+  for (auto i: int64Array) {
+    KJ_EXPECT(i == 42);
+  }
+
+  // test small sizes separately, since compilers do a memset optimization
+  byte byteArray[256]{};
+  arrayPtr(byteArray).fill(42);
+  for (auto b: byteArray) {
+    KJ_EXPECT(b == 42);
+  }
+
+  // test an object
+  struct SomeObject {
+    int64_t i;
+    double d;
+  };
+  SomeObject objs[256];
+  arrayPtr(objs).fill(SomeObject{42, 3.1415926});
+  for (auto& o: objs) {
+    KJ_EXPECT(o.i == 42);
+    KJ_EXPECT(o.d == 3.1415926);
+  }
+}
+
 struct Std {
   template<typename T>
   static std::span<T> from(ArrayPtr<T>* arr) {
@@ -967,6 +994,47 @@ static_assert(_::isDisallowedInCoroutine<DisallowedInCoroutinePrivate*>());
 static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine>());
 static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine&>());
 static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine*>());
+
+KJ_TEST("_kjb") {
+  ArrayPtr<const byte> arr = "abc"_kjb;
+  KJ_EXPECT(arr.size() == 3);
+  KJ_EXPECT(arr[0] == 'a');
+  KJ_EXPECT(arr[1] == 'b');
+  KJ_EXPECT(arr[2] == 'c');
+}
+
+KJ_TEST("arrayPtr()") {
+  // arrayPtr can be used to create ArrayPtr from a fixed-size array without spelling out types
+  byte buffer[1024]{};
+  auto ptr = arrayPtr(buffer);
+  KJ_EXPECT(ptr.size() == 1024);
+}
+
+KJ_TEST("memzero<T>()") {
+  // memzero() works for primitive types
+  int64_t x = 42;
+  memzero(x);
+  KJ_EXPECT(x == 0);
+
+  // memzero() works for trivially constructible types
+  struct ZeroTest {
+    int64_t x;
+    double pi;
+  };
+  ZeroTest t1;
+
+  memzero(t1);
+  KJ_EXPECT(t1.x == 0);
+  KJ_EXPECT(t1.pi == 0.0);
+
+  // memzero works on statically-sized arrays
+  ZeroTest arr[256];
+  memset(arr, 0xff, 256 * sizeof(ZeroTest));
+  memzero(arr);
+  for (auto& t: arr) {
+    KJ_EXPECT(t.pi == 0);
+  }
+}
 
 }  // namespace
 }  // namespace kj

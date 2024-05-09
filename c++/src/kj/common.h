@@ -259,6 +259,14 @@ typedef unsigned char byte;
 // by allowing a syntax like `[[clang::lifetimebound(*this)]]`.
 // https://clang.llvm.org/docs/AttributeReference.html#lifetimebound
 
+#if KJ_HAS_CPP_ATTRIBUTE(clang::musttail)
+#define KJ_MUSTTAIL [[clang::musttail]]
+#else
+#define KJ_MUSTTAIL
+#endif
+// Annotation for "return" statements to require that they be compiled as tail calls.
+// https://clang.llvm.org/docs/AttributeReference.html#musttail
+
 #if __clang__
 #define KJ_UNUSED_MEMBER __attribute__((unused))
 // Inhibits "unused" warning for member variables.  Only Clang produces such a warning, while GCC
@@ -1675,6 +1683,9 @@ public:
 
   inline constexpr Maybe(kj::None): ptr(nullptr) {}
 
+  KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
+  inline Maybe& operator=(decltype(nullptr)) { ptr = nullptr; return *this; }
+
   inline Maybe& operator=(T& other) { ptr = &other; return *this; }
   inline Maybe& operator=(T* other) { ptr = other; return *this; }
   inline Maybe& operator=(PropagateConst<T, Maybe>& other) { ptr = other.ptr; return *this; }
@@ -1869,6 +1880,9 @@ public:
     return other.size() <= size_ && slice(size_ - other.size(), size_) == other;
   }
 
+  inline ArrayPtr first(size_t count) { return slice(0, count); }
+  inline ArrayPtr<const T> first(size_t count) const { return slice(0, count); }
+
   inline Maybe<size_t> findFirst(const T& match) const {
     for (size_t i = 0; i < size_; i++) {
       if (ptr[i] == match) {
@@ -1886,7 +1900,7 @@ public:
     return kj::none;
   }
 
-  inline ArrayPtr<PropagateConst<T, byte>> asBytes() const {
+  constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const {
     // Reinterpret the array as a byte array. This is explicitly legal under C++ aliasing
     // rules.
     return { reinterpret_cast<PropagateConst<T, byte>*>(ptr), size_ * sizeof(T) };
@@ -1931,6 +1945,14 @@ public:
   inline auto as() { return U::from(this); }
   // Syntax sugar for invoking U::from.
   // Used to chain conversion calls rather than wrap with function.
+
+  inline void fill(T t) { 
+    // Fill the area by copying t over every element.
+
+    for (size_t i = 0; i < size_; i++) { ptr[i] = t; } 
+    // All modern compilers are smart enough to optimize this loop for simple T's.
+    // libc++ std::fill doesn't have memset specialization either.
+  }
 
 private:
   T* ptr;
@@ -1990,6 +2012,12 @@ template <typename T>
 inline constexpr ArrayPtr<T> arrayPtr(T* begin KJ_LIFETIMEBOUND, T* end KJ_LIFETIMEBOUND) {
   // Use this function to construct ArrayPtrs without writing out the type name.
   return ArrayPtr<T>(begin, end);
+}
+
+template <typename T, size_t s>
+inline constexpr ArrayPtr<T> arrayPtr(T (&arr)[s]) {
+  // Use this function to construct ArrayPtrs without writing out the type name.
+  return ArrayPtr<T>(arr);
 }
 
 // =======================================================================================
@@ -2141,6 +2169,18 @@ constexpr bool isDisallowedInCoroutine() {
 // }
 //
 
+template<typename T, typename = EnableIf<KJ_HAS_TRIVIAL_CONSTRUCTOR(T)>>
+inline void memzero(T& t) {
+  // Zero-initialize memory region belonging to t. Type-safe wrapper around `memset`.
+  memset(&t, 0, sizeof(T));
+}
+
 }  // namespace kj
+
+constexpr kj::ArrayPtr<const kj::byte> operator "" _kjb(const char* str, size_t n) {
+  // "string"_kjb creates constexpr byte array pointer to the content of the string
+  // WITHOUT the trailing 0.
+  return kj::ArrayPtr<const char>(str, n).asBytes();
+};
 
 KJ_END_HEADER

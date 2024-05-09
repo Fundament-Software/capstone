@@ -125,6 +125,11 @@ kj::Exception toException(const rpc::Exception::Reader& exception) {
   if (exception.hasTrace()) {
     result.setRemoteTrace(kj::str(exception.getTrace()));
   }
+  for (auto detail : exception.getDetails()) {
+    if (detail.hasData()) {
+      result.setDetail(detail.getDetailId(), kj::heapArray(detail.getData()));
+    }
+  }
   return result;
 }
 
@@ -150,6 +155,16 @@ void fromException(const kj::Exception& exception, rpc::Exception::Builder build
 
   builder.setReason(description);
   builder.setType(static_cast<rpc::Exception::Type>(exception.getType()));
+
+  auto details = exception.getDetails();
+  if (details.size()) {
+    auto detailsBuilder = builder.initDetails(details.size());
+    for (auto i : kj::indices(details)) {
+      auto out = detailsBuilder[i];
+      out.setDetailId(details[i].id);
+      out.setData(details[i].value);
+    }
+  }
 
   KJ_IF_SOME(t, traceEncoder) {
     builder.setTrace(t(exception));
@@ -399,7 +414,7 @@ public:
     // After disconnect(), the RpcSystem could be destroyed, making `traceEncoder` a dangling
     // reference, so null it out before we return from here. We don't need it anymore once
     // disconnected anyway.
-    KJ_DEFER(traceEncoder = nullptr);
+    KJ_DEFER(traceEncoder = kj::none);
 
     if (!connection.is<Connected>()) {
       // Already disconnected.
@@ -1692,7 +1707,7 @@ private:
         // the ID is not re-allocated before the `Finish` message can be sent.
         if (question.isAwaitingReturn) {
           // Still waiting for return, so just remove the QuestionRef pointer from the table.
-          question.selfRef = nullptr;
+          question.selfRef = kj::none;
         } else {
           // Call has already returned, so we can now remove it from the table.
           connectionState->questions.erase(id, question);
@@ -2340,7 +2355,7 @@ private:
     RpcServerResponseImpl& response;
     kj::Own<RpcCallContext> context;  // owns `response`
 
-    kj::Own<ClientHook> getResolutionAtReturnTime(
+    static kj::Own<ClientHook> getResolutionAtReturnTime(
         kj::Own<ClientHook> original, RpcServerResponseImpl::Resolution resolution) {
       // Wait for `original` to resolve to `resolution.returnedCap`, then return
       // `resolution.unwrapped`.
@@ -2358,7 +2373,7 @@ private:
 
       KJ_IF_SOME(p, ptr->whenMoreResolved()) {
         return newLocalPromiseClient(p.then(
-            [this, original = kj::mv(original), resolution = kj::mv(resolution)]
+            [original = kj::mv(original), resolution = kj::mv(resolution)]
             (kj::Own<ClientHook> r) mutable {
           return getResolutionAtReturnTime(kj::mv(r), kj::mv(resolution));
         }));
@@ -2725,7 +2740,7 @@ private:
       } else {
         // We just have to null out callContext and set the exports.
         auto& answer = connectionState->answers[answerId];
-        answer.callContext = nullptr;
+        answer.callContext = kj::none;
         answer.resultExports = kj::mv(resultExports);
 
         if (shouldFreePipeline) {

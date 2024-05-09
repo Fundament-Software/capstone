@@ -523,7 +523,7 @@ kj::Promise<void> expectRead(kj::AsyncInputStream& in, kj::StringPtr expected) {
       KJ_FAIL_ASSERT("expected data never sent", expected);
     }
 
-    auto actual = buffer.slice(0, amount);
+    auto actual = buffer.first(amount);
     if (memcmp(actual.begin(), expected.begin(), actual.size()) != 0) {
       KJ_FAIL_ASSERT("data from stream doesn't match expected", expected, actual);
     }
@@ -543,7 +543,7 @@ kj::Promise<void> expectRead(kj::AsyncInputStream& in, kj::ArrayPtr<const byte> 
       KJ_FAIL_ASSERT("expected data never sent", expected);
     }
 
-    auto actual = buffer.slice(0, amount);
+    auto actual = buffer.first(amount);
     if (memcmp(actual.begin(), expected.begin(), actual.size()) != 0) {
       KJ_FAIL_ASSERT("data from stream doesn't match expected", expected, actual);
     }
@@ -1121,9 +1121,9 @@ KJ_TEST("HttpClient chunked body gather-write") {
     auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table));
 
     kj::ArrayPtr<const byte> bodyParts[] = {
-      "foo"_kj.asBytes(), " "_kj.asBytes(),
-      "bar"_kj.asBytes(), " "_kj.asBytes(),
-      "baz"_kj.asBytes()
+      "foo"_kjb, " "_kjb,
+      "bar"_kjb, " "_kjb,
+      "baz"_kjb
     };
 
     req.body->write(kj::arrayPtr(bodyParts, kj::size(bodyParts))).wait(waitScope);
@@ -1935,7 +1935,7 @@ KJ_TEST("WebSocket unexpected RSV bits") {
   }
 
   auto nread = clientTask.wait(waitScope);
-  assertContainsWebSocketClose(rawCloseMessage.slice(0, nread), 1002, "RSV bits"_kjc);
+  assertContainsWebSocketClose(rawCloseMessage.first(nread), 1002, "RSV bits"_kjc);
 }
 
 KJ_TEST("WebSocket unexpected continuation frame") {
@@ -1965,7 +1965,7 @@ KJ_TEST("WebSocket unexpected continuation frame") {
   }
 
   auto nread = clientTask.wait(waitScope);
-  assertContainsWebSocketClose(rawCloseMessage.slice(0, nread), 1002, "Unexpected continuation frame"_kjc);
+  assertContainsWebSocketClose(rawCloseMessage.first(nread), 1002, "Unexpected continuation frame"_kjc);
 }
 
 KJ_TEST("WebSocket missing continuation frame") {
@@ -1995,7 +1995,7 @@ KJ_TEST("WebSocket missing continuation frame") {
   }
 
   auto nread = clientTask.wait(waitScope);
-  assertContainsWebSocketClose(rawCloseMessage.slice(0, nread), 1002, "Missing continuation frame"_kjc);
+  assertContainsWebSocketClose(rawCloseMessage.first(nread), 1002, "Missing continuation frame"_kjc);
 }
 
 KJ_TEST("WebSocket fragmented control frame") {
@@ -2025,7 +2025,7 @@ KJ_TEST("WebSocket fragmented control frame") {
   }
 
   auto nread = clientTask.wait(waitScope);
-  assertContainsWebSocketClose(rawCloseMessage.slice(0, nread), 1002, "Received fragmented control frame"_kjc);
+  assertContainsWebSocketClose(rawCloseMessage.first(nread), 1002, "Received fragmented control frame"_kjc);
 }
 
 KJ_TEST("WebSocket unknown opcode") {
@@ -2055,7 +2055,7 @@ KJ_TEST("WebSocket unknown opcode") {
   }
 
   auto nread = clientTask.wait(waitScope);
-  assertContainsWebSocketClose(rawCloseMessage.slice(0, nread), 1002, "Unknown opcode 5"_kjc);
+  assertContainsWebSocketClose(rawCloseMessage.first(nread), 1002, "Unknown opcode 5"_kjc);
 }
 
 KJ_TEST("WebSocket unsolicited pong") {
@@ -2369,7 +2369,7 @@ KJ_TEST("WebSocket pump disconnect on send") {
   auto sendTask = client1->send("hello"_kj);
 
   // Endpoint reads three bytes and then disconnects.
-  char buffer[3];
+  char buffer[3]{};
   pipe2.ends[1]->read(buffer, 3).wait(waitScope);
   pipe2.ends[1] = nullptr;
 
@@ -2463,7 +2463,7 @@ KJ_TEST("WebSocket maximum message size") {
   }
 
   auto nread = clientTask.wait(waitScope);
-  assertContainsWebSocketClose(rawCloseMessage.slice(0, nread), 1009, "too large"_kjc);
+  assertContainsWebSocketClose(rawCloseMessage.first(nread), 1009, "too large"_kjc);
 }
 
 class TestWebSocketService final: public HttpService, private kj::TaskSet::ErrorHandler {
@@ -5304,7 +5304,7 @@ void doDelayedCompletionTest(bool exception, kj::Maybe<uint64_t> expectedLength)
   KJ_EXPECT(resp.statusCode == 200);
 
   // Read "foo" from the response body: works
-  char buffer[16];
+  char buffer[16]{};
   KJ_ASSERT(resp.body->tryRead(buffer, 1, sizeof(buffer)).wait(waitScope) == 3);
   buffer[3] = '\0';
   KJ_EXPECT(buffer == "foo"_kj);
@@ -5963,7 +5963,7 @@ KJ_TEST("HttpClientImpl connect()") {
 
   auto req = client->connect("foo:123", HttpHeaders(headerTable), {});
 
-  char buffer[16];
+  char buffer[16]{};
   auto readPromise = req.connection->tryRead(buffer, 16, 16);
 
   expectRead(*pipe.ends[1], "CONNECT foo:123 HTTP/1.1\r\n\r\n").wait(waitScope);

@@ -1173,7 +1173,7 @@ kj::Promise<void> TestMoreStuffImpl::writeToFd(WriteToFdContext context) {
     }
   }));
 
-  int pair[2];
+  int pair[2]{};
   KJ_SYSCALL(kj::miniposix::pipe(pair));
   kj::AutoCloseFd in(pair[0]);
   kj::AutoCloseFd out(pair[1]);
@@ -1190,6 +1190,13 @@ kj::Promise<void> TestMoreStuffImpl::throwException(ThrowExceptionContext contex
 
 kj::Promise<void> TestMoreStuffImpl::throwRemoteException(ThrowRemoteExceptionContext context) {
   return KJ_EXCEPTION(FAILED, "remote exception: test exception");
+}
+
+kj::Promise<void> TestMoreStuffImpl::throwExceptionWithDetail(
+    ThrowExceptionWithDetailContext context) {
+  auto e = KJ_EXCEPTION(FAILED, "test exception");
+  e.setDetail(1, kj::heapArray<byte>("foo"_kjb));
+  return e;
 }
 
 #endif  // !CAPNP_LITE

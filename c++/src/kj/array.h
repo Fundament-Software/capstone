@@ -189,6 +189,17 @@ public:
     KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().");
     return ArrayPtr<const T>(ptr + start, end - start);
   }
+  inline ArrayPtr<T> slice(size_t start) KJ_LIFETIMEBOUND {
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    return ArrayPtr<T>(ptr + start, size_ - start);
+  }
+  inline ArrayPtr<const T> slice(size_t start) const KJ_LIFETIMEBOUND {
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    return ArrayPtr<const T>(ptr + start, size_ - start);
+  }
+
+  inline ArrayPtr<T> first(size_t count) KJ_LIFETIMEBOUND { return slice(0, count); }
+  inline ArrayPtr<const T> first(size_t count) const KJ_LIFETIMEBOUND { return slice(0, count); }
 
   inline ArrayPtr<const byte> asBytes() const KJ_LIFETIMEBOUND { return asPtr().asBytes(); }
   inline ArrayPtr<PropagateConst<T, byte>> asBytes() KJ_LIFETIMEBOUND { return asPtr().asBytes(); }
@@ -199,6 +210,7 @@ public:
     // Like asBytes() but transfers ownership.
     static_assert(sizeof(T) == sizeof(byte),
         "releaseAsBytes() only possible on arrays with byte-size elements (e.g. chars).");
+    if (disposer == nullptr) return nullptr;
     Array<PropagateConst<T, byte>> result(
         reinterpret_cast<PropagateConst<T, byte>*>(ptr), size_, *disposer);
     ptr = nullptr;
@@ -209,6 +221,7 @@ public:
     // Like asChars() but transfers ownership.
     static_assert(sizeof(T) == sizeof(PropagateConst<T, char>),
         "releaseAsChars() only possible on arrays with char-size elements (e.g. bytes).");
+    if (disposer == nullptr) return nullptr;
     Array<PropagateConst<T, char>> result(
         reinterpret_cast<PropagateConst<T, char>*>(ptr), size_, *disposer);
     ptr = nullptr;
@@ -526,10 +539,13 @@ public:
   inline constexpr const T* begin() const KJ_LIFETIMEBOUND { return content; }
   inline constexpr const T* end() const KJ_LIFETIMEBOUND { return content + fixedSize; }
 
-  inline constexpr operator ArrayPtr<T>() KJ_LIFETIMEBOUND {
+  inline constexpr operator ArrayPtr<T>() KJ_LIFETIMEBOUND { return asPtr(); }
+  inline constexpr operator ArrayPtr<const T>() const KJ_LIFETIMEBOUND { return asPtr(); }
+
+  inline constexpr ArrayPtr<T> asPtr() KJ_LIFETIMEBOUND {
     return arrayPtr(content, fixedSize);
   }
-  inline constexpr operator ArrayPtr<const T>() const KJ_LIFETIMEBOUND {
+  inline constexpr ArrayPtr<const T> asPtr() const KJ_LIFETIMEBOUND {
     return arrayPtr(content, fixedSize);
   }
 
@@ -537,6 +553,8 @@ public:
   inline constexpr const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
     return content[index];
   }
+
+  inline void fill(T t) { asPtr().fill(t); }
 
 private:
   T content[fixedSize];
@@ -560,15 +578,15 @@ public:
   inline const T* begin() const KJ_LIFETIMEBOUND { return content; }
   inline const T* end() const KJ_LIFETIMEBOUND { return content + currentSize; }
 
-  inline operator ArrayPtr<T>() KJ_LIFETIMEBOUND {
-    return arrayPtr(content, currentSize);
-  }
-  inline operator ArrayPtr<const T>() const KJ_LIFETIMEBOUND {
-    return arrayPtr(content, currentSize);
-  }
+  inline operator ArrayPtr<T>() KJ_LIFETIMEBOUND { return asPtr(); }
+  inline operator ArrayPtr<const T>() const KJ_LIFETIMEBOUND { return asPtr(); }
+  inline ArrayPtr<T> asPtr() KJ_LIFETIMEBOUND { return arrayPtr(content, currentSize); }
+  inline ArrayPtr<const T> asPtr() const KJ_LIFETIMEBOUND { return arrayPtr(content, currentSize); }
 
   inline T& operator[](size_t index) KJ_LIFETIMEBOUND { return content[index]; }
   inline const T& operator[](size_t index) const KJ_LIFETIMEBOUND { return content[index]; }
+
+  inline void fill(T t) { asPtr().fill(t); }
 
 private:
   size_t currentSize;

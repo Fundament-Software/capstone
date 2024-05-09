@@ -237,7 +237,7 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount) {
   return getStackTrace(space, ignoreCount, GetCurrentThread(), context);
 #elif KJ_HAS_BACKTRACE
   size_t size = backtrace(space.begin(), space.size());
-  for (auto& addr: space.slice(0, size)) {
+  for (auto& addr: space.first(size)) {
     // The addresses produced by backtrace() are return addresses, which means they point to the
     // instruction immediately after the call. Invoking addr2line on these can be confusing because
     // it often points to the next line. If the next instruction is inlined from another function,
@@ -350,7 +350,7 @@ String stringifyStackTrace(ArrayPtr<void* const> trace) {
     return nullptr;
   }
 
-  char line[512];
+  char line[512]{};
   size_t i = 0;
   while (i < kj::size(lines) && fgets(line, sizeof(line), p) != nullptr) {
     // Don't include exception-handling infrastructure or promise infrastructure in stack trace.
@@ -443,7 +443,7 @@ StringPtr stringifyStackTraceAddresses(ArrayPtr<void* const> trace, ArrayPtr<cha
 }
 
 String getStackTrace() {
-  void* space[32];
+  void* space[32]{};
   auto trace = getStackTrace(space, 2);
   return kj::str(stringifyStackTraceAddresses(trace), stringifyStackTrace(trace));
 }
@@ -451,7 +451,7 @@ String getStackTrace() {
 namespace {
 
 [[noreturn]] void terminateHandler() {
-  void* traceSpace[32];
+  void* traceSpace[32]{};
 
   // ignoreCount = 3 to ignore std::terminate entry.
   auto trace = kj::getStackTrace(traceSpace, 3);
@@ -585,7 +585,7 @@ void printStackTraceOnCrash() {
 namespace {
 
 [[noreturn]] void crashHandler(int signo, siginfo_t* info, void* context) {
-  void* traceSpace[32];
+  void* traceSpace[32]{};
 
 #if KJ_USE_WIN32_DBGHELP
   // Win32 backtracing can't trace its way out of a Cygwin signal handler. However, Cygwin gives
@@ -807,6 +807,13 @@ Exception::Exception(const Exception& other) noexcept
   KJ_IF_SOME(c, other.context) {
     context = heap(*c);
   }
+
+  for (auto& detail: other.details) {
+    details.add(Detail {
+      .id = detail.id,
+      .value = kj::heapArray(detail.value.asPtr()),
+    });
+  }
 }
 
 Exception::~Exception() noexcept {}
@@ -838,7 +845,7 @@ void Exception::extendTrace(uint ignoreCount, uint limit) {
   auto newTrace = kj::getStackTrace(newTraceSpace, ignoreCount + 1);
   if (newTrace.size() > ignoreCount + 2) {
     // Remove suffix that won't fit into our static-sized trace.
-    newTrace = newTrace.slice(0, kj::min(kj::size(trace) - traceCount, newTrace.size()));
+    newTrace = newTrace.first(kj::min(kj::size(trace) - traceCount, newTrace.size()));
 
     // Copy the rest into our trace.
     memcpy(trace + traceCount, newTrace.begin(), newTrace.asBytes().size());
@@ -865,7 +872,7 @@ void Exception::truncateCommonTrace() {
 
   if (traceCount > 0) {
     // Create a "reference" stack trace that is a little bit deeper than the one in the exception.
-    void* refTraceSpace[sizeof(this->trace) / sizeof(this->trace[0]) + 4];
+    void* refTraceSpace[sizeof(this->trace) / sizeof(this->trace[0]) + 4]{};
     auto refTrace = kj::getStackTrace(refTraceSpace, 0);
 
     // We expect that the deepest frame in the exception's stack trace should be somewhere in our
@@ -914,6 +921,46 @@ void Exception::addTraceHere() {
 #else
   #error "please implement for your compiler"
 #endif
+}
+
+kj::Maybe<kj::ArrayPtr<const byte>> Exception::getDetail(DetailTypeId typeId) const {
+  for (auto& detail: details) {
+    if (detail.id == typeId) {
+      return detail.value.asPtr();
+    }
+  }
+  return kj::none;
+}
+
+kj::ArrayPtr<const Exception::Detail> Exception::getDetails() const {
+  return details.asPtr();
+}
+
+kj::Maybe<kj::Array<byte>> Exception::releaseDetail(DetailTypeId typeId) {
+  for (auto& detail: details) {
+    if (detail.id == typeId) {
+      kj::Array<byte> result = kj::mv(detail.value);
+      if (&detail != &details.back()) {
+        detail = kj::mv(details.back());
+      }
+      details.removeLast();
+      return kj::mv(result);
+    }
+  }
+  return kj::none;
+}
+
+void Exception::setDetail(DetailTypeId typeId, kj::Array<byte> value) {
+  for (auto& detail: details) {
+    if (detail.id == typeId) {
+      detail.value = kj::mv(value);
+      return;
+    }
+  }
+  details.add(Detail {
+    .id = typeId,
+    .value = kj::mv(value),
+  });
 }
 
 namespace {
@@ -1229,8 +1276,8 @@ size_t sharedSuffixLength(kj::ArrayPtr<void* const> a, kj::ArrayPtr<void* const>
   size_t result = 0;
   while (a.size() > 0 && b.size() > 0 && a.back() == b.back())  {
     ++result;
-    a = a.slice(0, a.size() - 1);
-    b = b.slice(0, b.size() - 1);
+    a = a.first(a.size() - 1);
+    b = b.first(b.size() - 1);
   }
   return result;
 }
@@ -1256,14 +1303,14 @@ kj::ArrayPtr<void* const> computeRelativeTrace(
        i <= (ssize_t)(relativeTo.size() - MIN_MATCH_LEN);
        i++) {
     // Negative values truncate `trace`, positive values truncate `relativeTo`.
-    kj::ArrayPtr<void* const> subtrace = trace.slice(0, trace.size() - kj::max<ssize_t>(0, -i));
+    kj::ArrayPtr<void* const> subtrace = trace.first(trace.size() - kj::max<ssize_t>(0, -i));
     kj::ArrayPtr<void* const> subrt = relativeTo
-        .slice(0, relativeTo.size() - kj::max<ssize_t>(0, i));
+        .first(relativeTo.size() - kj::max<ssize_t>(0, i));
 
     uint matchLen = sharedSuffixLength(subtrace, subrt);
     if (matchLen > bestMatchLen) {
       bestMatchLen = matchLen;
-      bestMatch = subtrace.slice(0, subtrace.size() - matchLen + 1);
+      bestMatch = subtrace.first(subtrace.size() - matchLen + 1);
     }
   }
 

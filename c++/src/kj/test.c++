@@ -23,6 +23,8 @@
 #define _GNU_SOURCE
 #endif
 
+#include <atomic>
+
 #include "test.h"
 #include "main.h"
 #include "io.h"
@@ -72,13 +74,21 @@ namespace {
 
 class TestExceptionCallback: public ExceptionCallback {
 public:
-  TestExceptionCallback(ProcessContext& context): context(context) {}
+  TestExceptionCallback(const ProcessContext& context)
+      : context(context), mainThreadCallback(kj::none) {}
 
   bool failed() { return sawError; }
 
+  void fail() const {
+    sawError.store(true);
+    KJ_IF_SOME(callback, mainThreadCallback) {
+      callback.fail();
+    }
+  }
+
   void logMessage(LogSeverity severity, const char* file, int line, int contextDepth,
                   String&& text) override {
-    void* traceSpace[32];
+    void* traceSpace[32]{};
     auto trace = getStackTrace(traceSpace, 2);
 
     if (text.size() == 0) {
@@ -88,16 +98,40 @@ public:
     text = kj::str(kj::repeat('_', contextDepth), file, ':', line, ": ", kj::mv(text));
 
     if (severity == LogSeverity::ERROR || severity == LogSeverity::FATAL) {
-      sawError = true;
+      fail();
       context.error(kj::str(text, "\nstack: ", stringifyStackTraceAddresses(trace), stringifyStackTrace(trace)));
     } else {
       context.warning(text);
     }
   }
 
+  Function<void(Function<void()>)> getThreadInitializer() override {
+    return [&](Function<void()> func) {
+      KJ_IF_SOME(callback, mainThreadCallback) {
+        TestExceptionCallback exceptionCallback(context, callback);
+        func();
+      } else {
+        TestExceptionCallback exceptionCallback(context, *this);
+        func();
+      }
+    };
+  }
+
 private:
-  ProcessContext& context;
-  bool sawError = false;
+  const ProcessContext& context;
+  // In the case where a thread spawns a thread, we report failure to the main thread's
+  // TestExceptionCallback, which I assume stays alive as long as all child threads.  If we reported
+  // failures to a thread's parent, we'd have to worry about a child thread spawning a grandchild
+  // thread and then immediately dying, leaving the grandchild thread with a dangling pointer to the
+  // now-dead child's TestExceptionCallback.
+  kj::Maybe<const TestExceptionCallback&> mainThreadCallback;
+  // sawError is mutable because we need to modify it in const-for-multithreadedness methods.
+  mutable std::atomic_bool sawError = false;
+
+  TestExceptionCallback(const ProcessContext& context,
+      const TestExceptionCallback& topLevelCallback)
+      : context(context), mainThreadCallback(topLevelCallback) {}
+
 };
 
 TimePoint readClock() {
@@ -157,7 +191,7 @@ public:
 
       if (parsedRange) {
         // We have an exact line number.
-        filePattern = pattern.slice(0, colonPos);
+        filePattern = pattern.first(colonPos);
       } else {
         // Can't parse as a number. Maybe the colon is part of a Windows path name or something.
         // Let's just keep it as part of the file pattern.
@@ -202,7 +236,7 @@ public:
     for (TestCase* testCase = testCasesHead; testCase != nullptr; testCase = testCase->next) {
       for (size_t i: kj::indices(commonPrefix)) {
         if (testCase->file[i] != commonPrefix[i]) {
-          commonPrefix = commonPrefix.slice(0, i);
+          commonPrefix = commonPrefix.first(i);
           break;
         }
       }
@@ -210,7 +244,7 @@ public:
 
     // Back off the prefix to the last '/'.
     while (commonPrefix.size() > 0 && commonPrefix.back() != '/' && commonPrefix.back() != '\\') {
-      commonPrefix = commonPrefix.slice(0, commonPrefix.size() - 1);
+      commonPrefix = commonPrefix.first(commonPrefix.size() - 1);
     }
 
     // Run the testts.
