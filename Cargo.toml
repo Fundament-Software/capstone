@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "c++/src/capnp/compiler/rust",
+    "c++/src/capnp/rust",
+    "c++/src/kj/rust",
+    #"c++/src/kj/compat",
+    "c++/src/kj/build",
+]
+
+[workspace.package]
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "MIT"
+repository = "https://github.com/fundament-software/capstone"
+documentation = "https://capnproto.org/"
+readme = "README.md"
+
+[workspace.dependencies]
+cxx = "1.0.76"
+eyre = "0.6.12"
+cc = "1.0.73"
+cxx-build = "1.0.76"
+#kj-compat-sys = { path = "c++/src/kj/compat" }
+kj-sys = { path = "c++/src/kj/rust" }
+kj-build = { path = "c++/src/kj/build" }

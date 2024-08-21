@@ -1,0 +1,26 @@
+[package]
+name = "capnp-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "capnp"
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = []
+libdl = ["kj-sys/libdl"]
+heavy = ["kj-sys/heavy", "kj-sys/async"]
+save_acquired_lock_info = ["kj-sys/save_acquired_lock_info"]
+track_lock_blocking = ["kj-sys/track_lock_blocking"]
+
+[dependencies]
+cxx.workspace = true
+kj-sys.workspace = true
+
+[build-dependencies]
+eyre.workspace = true
+cc.workspace = true
+cxx-build.workspace = true
+kj-build.workspace = true

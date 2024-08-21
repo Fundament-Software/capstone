@@ -86,3 +86,6 @@ bazel-*
 # generic build output
 /build/
 /result
+
+# Cargo artifacts
+/target/

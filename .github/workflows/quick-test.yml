@@ -120,3 +120,13 @@ jobs:
 
             cd build-output\src
             ctest -V -C debug
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        log-level: warn
+        command: check
+        arguments: --all-features

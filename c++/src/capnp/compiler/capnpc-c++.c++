@@ -524,7 +524,7 @@ private:
         const char* listType = "List";
         auto list = type.asList();
         if (list.getElementType().which() == schema::Type::ANY_POINTER) {
-          KJ_IF_SOME(param, list.getElementType().getBrandParameter()) {
+          KJ_IF_SOME(_, list.getElementType().getBrandParameter()) {
             listType = "TypedAnyList";
           }
         }
