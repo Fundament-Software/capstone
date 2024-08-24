@@ -2,6 +2,7 @@
 
 #include "glue.h"
 #include <capnp/compiler/compiler.h>
+#include <capnp/compiler/parser.h>
 #include <capnp/compiler/module-loader.h>
 #include <capnp/serialize.h>
 #include <kj/map.h>
@@ -234,4 +235,8 @@ rust::Vec<uint8_t> command(rust::Slice<const rust::String> files,
 
   glue.throwErrors(__FILE__, __LINE__);
   KJ_UNREACHABLE;
+}
+
+uint64_t genRandId() {
+  return generateRandomId();
 }

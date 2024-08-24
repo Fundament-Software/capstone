@@ -10,6 +10,8 @@ mod ffi {
             prefixes: &[String],
             standard_import: bool,
         ) -> Result<Vec<u8>>;
+
+        fn genRandId() -> u64;
     }
 }
 
@@ -29,4 +31,8 @@ pub fn call(
         prefix_list.as_slice(),
         standard_import,
     )
+}
+
+pub fn id() -> u64 {
+    ffi::genRandId()
 }

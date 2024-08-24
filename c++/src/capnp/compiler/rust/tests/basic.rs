@@ -46,3 +46,9 @@ fn test_calculator() -> Result<()> {
     assert_ne!(bytes.len(), 0);
     Ok(())
 }
+
+#[test]
+fn test_id() -> Result<()> {
+    capnpc_sys::id();
+    Ok(())
+}
