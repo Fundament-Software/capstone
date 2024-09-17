@@ -35,7 +35,6 @@
 #include <kj/filesystem.h>
 #include "../schema-loader.h"
 #include "../dynamic.h"
-#include <unordered_map>
 #include <unordered_set>
 #include <map>
 #include <set>
@@ -472,7 +471,7 @@ private:
       }
     }
 
-    if (result.size() == 4 && memcmp(result.begin(), "NULL", 4) == 0) {
+    if (result == "NULL"_kjb) {
       // NULL probably collides with a macro.
       result.add('_');
     }
@@ -3189,6 +3188,10 @@ private:
     schemaLoader.computeOptimizationHints();
 
     for (auto requestedFile: request.getRequestedFiles()) {
+      // Starting a new file. Set hasInterfaces back to false, so it only becomes true if this
+      // file contains interfaces.
+      hasInterfaces = false;
+
       auto schema = schemaLoader.get(requestedFile.getId());
       auto fileText = makeFileText(schema, requestedFile);
 

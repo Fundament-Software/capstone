@@ -302,6 +302,7 @@ private:
 
   static kj::Own<ClientHook> makeLocalClient(kj::Own<Capability::Server>&& server);
   static kj::Own<ClientHook> makeRevocableLocalClient(Capability::Server& server);
+  static void revokeLocalClientIfShared(ClientHook& hook);
   static void revokeLocalClient(ClientHook& hook);
   static void revokeLocalClient(ClientHook& hook, kj::Exception&& reason);
 
@@ -732,6 +733,8 @@ class RequestHook {
   // Hook interface implemented by RPC system representing a request being built.
 
 public:
+  RequestHook(const void* brand = nullptr): brand(brand) {}
+
   virtual RemotePromise<AnyPointer> send() = 0;
   // Send the call and return a promise for the result.
 
@@ -741,15 +744,18 @@ public:
   virtual AnyPointer::Pipeline sendForPipeline() = 0;
   // Send a call for pipelining purposes only.
 
-  virtual const void* getBrand() = 0;
-  // Returns a void* that identifies who made this request.  This can be used by an RPC adapter to
-  // discover when tail call is going to be sent over its own connection and therefore can be
-  // optimized into a remote tail call.
+  inline bool isBrand(const void* other) { return brand == other; }
+  // Checks if this RequestHook's brand, as passed to the constructor, matches the given pointer.
+  // This can be used by an RPC adapter to discover when tail call is going to be sent over its own
+  // connection and therefore can be optimized into a remote tail call.
 
   template <typename T, typename U>
   inline static kj::Own<RequestHook> from(Request<T, U>&& request) {
     return kj::mv(request.hook);
   }
+
+private:
+  const void* brand;
 };
 
 class ResponseHook {
@@ -772,7 +778,7 @@ public:
 
 class ClientHook {
 public:
-  ClientHook();
+  ClientHook(const void* brand = nullptr);
 
   using CallHints = Capability::Client::CallHints;
 
@@ -827,20 +833,21 @@ public:
   virtual kj::Own<ClientHook> addRef() = 0;
   // Return a new reference to the same capability.
 
-  virtual const void* getBrand() = 0;
-  // Returns a void* that identifies who made this client.  This can be used by an RPC adapter to
-  // discover when a capability it needs to marshal is one that it created in the first place, and
-  // therefore it can transfer the capability without proxying.
+  inline bool isBrand(const void* other) { return brand == other; }
+  // Checks if this ClientHooks's brand, as passed to the constructor, matches the given pointer.
+  // This can be used by an RPC adapter to discover when a capability it needs to marshal is one
+  // that it created in the first place, and therefore it can transfer the capability without
+  // proxying.
 
   static const uint NULL_CAPABILITY_BRAND;
   static const uint BROKEN_CAPABILITY_BRAND;
   // Values are irrelevant; used for pointers.
 
-  inline bool isNull() { return getBrand() == &NULL_CAPABILITY_BRAND; }
+  inline bool isNull() { return isBrand(&NULL_CAPABILITY_BRAND); }
   // Returns true if the capability was created as a result of assigning a Client to null or by
   // reading a null pointer out of a Cap'n Proto message.
 
-  inline bool isError() { return getBrand() == &BROKEN_CAPABILITY_BRAND; }
+  inline bool isError() { return isBrand(&BROKEN_CAPABILITY_BRAND); }
   // Returns true if the capability was created by newBrokenCap().
 
   virtual kj::Maybe<int> getFd() = 0;
@@ -848,6 +855,9 @@ public:
   // non-null, then Capability::Client::getFd() waits for resolution and tries again.
 
   static kj::Own<ClientHook> from(Capability::Client client) { return kj::mv(client.hook); }
+
+private:
+  const void* brand;
 };
 
 class RevocableClientHook: public ClientHook {
@@ -1208,7 +1218,9 @@ template <typename T>
 RevocableServer<T>::~RevocableServer() noexcept(false) {
   // Check if moved away.
   if (hook.get() != nullptr) {
-    Capability::Client::revokeLocalClient(*hook);
+    // Optimization: If we hold the only reference on the ClientHook, we don't really need to
+    // revoke it.
+    Capability::Client::revokeLocalClientIfShared(*hook);
   }
 }
 
@@ -1279,7 +1291,7 @@ kj::Promise<kj::Maybe<typename T::Server&>> CapabilityServerSet<T>::getLocalServ
   return getLocalServerInternal(client)
       .then([](void* server) -> kj::Maybe<typename T::Server&> {
     if (server == nullptr) {
-      return nullptr;
+      return kj::none;
     } else {
       return *reinterpret_cast<typename T::Server*>(server);
     }

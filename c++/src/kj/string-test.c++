@@ -185,22 +185,22 @@ TEST(String, tryParseAs) {
   KJ_EXPECT(isNaN(StringPtr("nan").tryParseAs<double>().orDefault(0.0)) == true);
   KJ_EXPECT(isNaN(StringPtr("NAN").tryParseAs<double>().orDefault(0.0)) == true);
   KJ_EXPECT(isNaN(StringPtr("NaN").tryParseAs<double>().orDefault(0.0)) == true);
-  KJ_EXPECT(StringPtr("").tryParseAs<double>() == nullptr);
-  KJ_EXPECT(StringPtr("a").tryParseAs<double>() == nullptr);
-  KJ_EXPECT(StringPtr("1a").tryParseAs<double>() == nullptr);
-  KJ_EXPECT(StringPtr("+-1").tryParseAs<double>() == nullptr);
+  KJ_EXPECT(StringPtr("").tryParseAs<double>() == kj::none);
+  KJ_EXPECT(StringPtr("a").tryParseAs<double>() == kj::none);
+  KJ_EXPECT(StringPtr("1a").tryParseAs<double>() == kj::none);
+  KJ_EXPECT(StringPtr("+-1").tryParseAs<double>() == kj::none);
 
   KJ_EXPECT(StringPtr("1").tryParseAs<float>() == 1.0);
 
   KJ_EXPECT(StringPtr("1").tryParseAs<int64_t>() == 1);
   KJ_EXPECT(StringPtr("9223372036854775807").tryParseAs<int64_t>() == 9223372036854775807LL);
   KJ_EXPECT(StringPtr("-9223372036854775808").tryParseAs<int64_t>() == -9223372036854775808ULL);
-  KJ_EXPECT(StringPtr("9223372036854775808").tryParseAs<int64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("-9223372036854775809").tryParseAs<int64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("").tryParseAs<int64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("a").tryParseAs<int64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("1a").tryParseAs<int64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("+-1").tryParseAs<int64_t>() == nullptr);
+  KJ_EXPECT(StringPtr("9223372036854775808").tryParseAs<int64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("-9223372036854775809").tryParseAs<int64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("").tryParseAs<int64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("a").tryParseAs<int64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("1a").tryParseAs<int64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("+-1").tryParseAs<int64_t>() == kj::none);
   KJ_EXPECT(StringPtr("010").tryParseAs<int64_t>() == 10);
   KJ_EXPECT(StringPtr("0010").tryParseAs<int64_t>() == 10);
   KJ_EXPECT(StringPtr("0x10").tryParseAs<int64_t>() == 16);
@@ -212,24 +212,24 @@ TEST(String, tryParseAs) {
   KJ_EXPECT(StringPtr("1").tryParseAs<uint64_t>() == 1);
   KJ_EXPECT(StringPtr("0").tryParseAs<uint64_t>() == 0);
   KJ_EXPECT(StringPtr("18446744073709551615").tryParseAs<uint64_t>() == 18446744073709551615ULL);
-  KJ_EXPECT(StringPtr("-1").tryParseAs<uint64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("18446744073709551616").tryParseAs<uint64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("").tryParseAs<uint64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("a").tryParseAs<uint64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("1a").tryParseAs<uint64_t>() == nullptr);
-  KJ_EXPECT(StringPtr("+-1").tryParseAs<uint64_t>() == nullptr);
+  KJ_EXPECT(StringPtr("-1").tryParseAs<uint64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("18446744073709551616").tryParseAs<uint64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("").tryParseAs<uint64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("a").tryParseAs<uint64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("1a").tryParseAs<uint64_t>() == kj::none);
+  KJ_EXPECT(StringPtr("+-1").tryParseAs<uint64_t>() == kj::none);
 
   KJ_EXPECT(StringPtr("1").tryParseAs<int32_t>() == 1);
   KJ_EXPECT(StringPtr("2147483647").tryParseAs<int32_t>() == 2147483647);
   KJ_EXPECT(StringPtr("-2147483648").tryParseAs<int32_t>() == -2147483648);
-  KJ_EXPECT(StringPtr("2147483648").tryParseAs<int32_t>() == nullptr);
-  KJ_EXPECT(StringPtr("-2147483649").tryParseAs<int32_t>() == nullptr);
+  KJ_EXPECT(StringPtr("2147483648").tryParseAs<int32_t>() == kj::none);
+  KJ_EXPECT(StringPtr("-2147483649").tryParseAs<int32_t>() == kj::none);
 
   KJ_EXPECT(StringPtr("1").tryParseAs<uint32_t>() == 1);
   KJ_EXPECT(StringPtr("0").tryParseAs<uint32_t>() == 0U);
   KJ_EXPECT(StringPtr("4294967295").tryParseAs<uint32_t>() == 4294967295U);
-  KJ_EXPECT(StringPtr("-1").tryParseAs<uint32_t>() == nullptr);
-  KJ_EXPECT(StringPtr("4294967296").tryParseAs<uint32_t>() == nullptr);
+  KJ_EXPECT(StringPtr("-1").tryParseAs<uint32_t>() == kj::none);
+  KJ_EXPECT(StringPtr("4294967296").tryParseAs<uint32_t>() == kj::none);
 
   KJ_EXPECT(StringPtr("1").tryParseAs<int16_t>() == 1);
   KJ_EXPECT(StringPtr("1").tryParseAs<uint16_t>() == 1);
@@ -309,12 +309,12 @@ KJ_TEST("parsing 'nan' returns canonical NaN value") {
   {
     double parsedNan = StringPtr("NaN").parseAs<double>();
     double canonicalNan = kj::nan();
-    KJ_EXPECT(memcmp(&parsedNan, &canonicalNan, sizeof(parsedNan)) == 0);
+    KJ_EXPECT(kj::arrayPtr(parsedNan).asBytes() == kj::arrayPtr(canonicalNan).asBytes());
   }
   {
     float parsedNan = StringPtr("NaN").parseAs<float>();
     float canonicalNan = kj::nan();
-    KJ_EXPECT(memcmp(&parsedNan, &canonicalNan, sizeof(parsedNan)) == 0);
+    KJ_EXPECT(kj::arrayPtr(parsedNan).asBytes() == kj::arrayPtr(canonicalNan).asBytes());
   }
 }
 
@@ -380,9 +380,57 @@ KJ_TEST("float stringification and parsing is not locale-dependent") {
   }
 }
 
-KJ_TEST("ConstString") {
+KJ_TEST("ConstString literal operator") {
   kj::ConstString theString = "it's a const string!"_kjc;
   KJ_EXPECT(theString == "it's a const string!");
+}
+
+KJ_TEST("ConstString promotion") {
+  kj::StringPtr theString = "it's a const string!";
+  kj::ConstString constString = theString.attach();
+  KJ_EXPECT(constString == "it's a const string!");
+}
+
+struct DestructionOrderRecorder {
+  DestructionOrderRecorder(uint& counter, uint& recordTo)
+    : counter(counter), recordTo(recordTo) {}
+  ~DestructionOrderRecorder() {
+    recordTo = ++counter;
+  }
+
+  uint& counter;
+  uint& recordTo;
+};
+
+KJ_TEST("ConstString attachment lifetimes") {
+  uint counter = 0;
+  uint destroyed1 = 0;
+  uint destroyed2 = 0;
+  uint destroyed3 = 0;
+
+  auto obj1 = kj::heap<DestructionOrderRecorder>(counter, destroyed1);
+  auto obj2 = kj::heap<DestructionOrderRecorder>(counter, destroyed2);
+  auto obj3 = kj::heap<DestructionOrderRecorder>(counter, destroyed3);
+
+  StringPtr theString = "it's a string!";
+  const char* ptr = theString.begin();
+
+  ConstString combined = theString.attach(kj::mv(obj1), kj::mv(obj2), kj::mv(obj3));
+
+  KJ_EXPECT(combined.begin() == ptr);
+
+  KJ_EXPECT(obj1.get() == nullptr);
+  KJ_EXPECT(obj2.get() == nullptr);
+  KJ_EXPECT(obj3.get() == nullptr);
+  KJ_EXPECT(destroyed1 == 0);
+  KJ_EXPECT(destroyed2 == 0);
+  KJ_EXPECT(destroyed3 == 0);
+
+  combined = nullptr;
+
+  KJ_EXPECT(destroyed1 == 1, destroyed1);
+  KJ_EXPECT(destroyed2 == 2, destroyed2);
+  KJ_EXPECT(destroyed3 == 3, destroyed3);
 }
 
 KJ_TEST("StringPtr find") {
@@ -454,6 +502,19 @@ KJ_TEST("as<Std>") {
   std::string stdPtr = ptr.as<Std>();
   KJ_EXPECT(stdPtr == "bar");
 }
+
+// Supports constexpr
+constexpr const StringPtr HELLO_WORLD = "hello world"_kj;
+static_assert(HELLO_WORLD.size() == 11);
+static_assert(HELLO_WORLD.startsWith("hello"_kj));
+static_assert(HELLO_WORLD.endsWith("world"_kj));
+static_assert(HELLO_WORLD[0] == *"h");
+static_assert(HELLO_WORLD.asArray().size() == 11);
+static_assert(HELLO_WORLD.first(2).size() == 2);
+static_assert(HELLO_WORLD.slice(5).size() == 6);
+static_assert(StringPtr().size() == 0);
+static_assert(StringPtr(nullptr).size() == 0);
+static_assert(StringPtr(HELLO_WORLD.begin(), HELLO_WORLD.size()).size() == 11);
 
 }  // namespace
 }  // namespace _ (private)

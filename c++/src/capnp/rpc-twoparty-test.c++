@@ -59,34 +59,6 @@ namespace capnp {
 namespace _ {
 namespace {
 
-class TestRestorer final: public SturdyRefRestorer<test::TestSturdyRefObjectId> {
-public:
-  TestRestorer(int& callCount, int& handleCount)
-      : callCount(callCount), handleCount(handleCount) {}
-
-  Capability::Client restore(test::TestSturdyRefObjectId::Reader objectId) override {
-    switch (objectId.getTag()) {
-      case test::TestSturdyRefObjectId::Tag::TEST_INTERFACE:
-        return kj::heap<TestInterfaceImpl>(callCount);
-      case test::TestSturdyRefObjectId::Tag::TEST_EXTENDS:
-        return Capability::Client(newBrokenCap("No TestExtends implemented."));
-      case test::TestSturdyRefObjectId::Tag::TEST_PIPELINE:
-        return kj::heap<TestPipelineImpl>(callCount);
-      case test::TestSturdyRefObjectId::Tag::TEST_TAIL_CALLEE:
-        return kj::heap<TestTailCalleeImpl>(callCount);
-      case test::TestSturdyRefObjectId::Tag::TEST_TAIL_CALLER:
-        return kj::heap<TestTailCallerImpl>(callCount);
-      case test::TestSturdyRefObjectId::Tag::TEST_MORE_STUFF:
-        return kj::heap<TestMoreStuffImpl>(callCount, handleCount);
-    }
-    KJ_UNREACHABLE;
-  }
-
-private:
-  int& callCount;
-  int& handleCount;
-};
-
 class TestMonotonicClock final: public kj::MonotonicClock {
 public:
   kj::TimePoint now() const override {
@@ -105,26 +77,20 @@ kj::AsyncIoProvider::PipeThread runServer(kj::AsyncIoProvider& ioProvider,
       [&callCount, &handleCount](
        kj::AsyncIoProvider& ioProvider, kj::AsyncIoStream& stream, kj::WaitScope& waitScope) {
     TwoPartyVatNetwork network(stream, rpc::twoparty::Side::SERVER);
-    TestRestorer restorer(callCount, handleCount);
-    auto server = makeRpcServer(network, restorer);
+    auto server = makeRpcServer(network, kj::heap<TestInterfaceImpl>(callCount, handleCount));
     network.onDisconnect().wait(waitScope);
   });
 }
 
-Capability::Client getPersistentCap(RpcSystem<rpc::twoparty::VatId>& client,
-                                    rpc::twoparty::Side side,
-                                    test::TestSturdyRefObjectId::Tag tag) {
+test::TestInterface::Client getBootstrap(RpcSystem<rpc::twoparty::VatId>& client,
+                                         rpc::twoparty::Side side) {
   // Create the VatId.
   MallocMessageBuilder hostIdMessage(8);
   auto hostId = hostIdMessage.initRoot<rpc::twoparty::VatId>();
   hostId.setSide(side);
 
-  // Create the SturdyRefObjectId.
-  MallocMessageBuilder objectIdMessage(8);
-  objectIdMessage.initRoot<test::TestSturdyRefObjectId>().setTag(tag);
-
   // Connect to the remote capability.
-  return client.restore(hostId, objectIdMessage.getRoot<AnyPointer>());
+  return client.bootstrap(hostId).castAs<test::TestInterface>();
 }
 
 TEST(TwoPartyNetwork, Basic) {
@@ -142,8 +108,7 @@ TEST(TwoPartyNetwork, Basic) {
   KJ_EXPECT(network.getOutgoingMessageWaitTime() == 0 * kj::SECONDS);
 
   // Request the particular capability from the server.
-  auto client = getPersistentCap(rpcClient, rpc::twoparty::Side::SERVER,
-      test::TestSturdyRefObjectId::Tag::TEST_INTERFACE).castAs<test::TestInterface>();
+  auto client = getBootstrap(rpcClient, rpc::twoparty::Side::SERVER);
   clock.increment(1 * kj::SECONDS);
 
   KJ_EXPECT(network.getCurrentQueueCount() == 1);
@@ -246,8 +211,8 @@ TEST(TwoPartyNetwork, Pipelining) {
 
   {
     // Request the particular capability from the server.
-    auto client = getPersistentCap(rpcClient, rpc::twoparty::Side::SERVER,
-        test::TestSturdyRefObjectId::Tag::TEST_PIPELINE).castAs<test::TestPipeline>();
+    auto client = getBootstrap(rpcClient, rpc::twoparty::Side::SERVER)
+        .getTestPipelineRequest().send().getCap();
 
     {
       // Use the capability.
@@ -338,8 +303,8 @@ TEST(TwoPartyNetwork, Release) {
   auto rpcClient = makeRpcClient(network);
 
   // Request the particular capability from the server.
-  auto client = getPersistentCap(rpcClient, rpc::twoparty::Side::SERVER,
-      test::TestSturdyRefObjectId::Tag::TEST_MORE_STUFF).castAs<test::TestMoreStuff>();
+  auto client = getBootstrap(rpcClient, rpc::twoparty::Side::SERVER)
+      .getTestMoreStuffRequest().send().getCap();
 
   auto handle1 = client.getHandleRequest().send().wait(ioContext.waitScope).getHandle();
   auto promise = client.getHandleRequest().send();
@@ -396,6 +361,7 @@ TEST(TwoPartyNetwork, Abort) {
   hostId.setSide(rpc::twoparty::Side::SERVER);
 
   auto conn = KJ_ASSERT_NONNULL(network.connect(hostId));
+  conn->setIdle(false);
 
   {
     // Send an invalid message (Return to non-existent question).
@@ -411,7 +377,7 @@ TEST(TwoPartyNetwork, Abort) {
     EXPECT_EQ(rpc::Message::ABORT, reply->getBody().getAs<rpc::Message>().which());
   }
 
-  EXPECT_TRUE(conn->receiveIncomingMessage().wait(ioContext.waitScope) == nullptr);
+  EXPECT_TRUE(conn->receiveIncomingMessage().wait(ioContext.waitScope) == kj::none);
 }
 
 TEST(TwoPartyNetwork, ConvenienceClasses) {
@@ -451,8 +417,8 @@ TEST(TwoPartyNetwork, HugeMessage) {
   TwoPartyVatNetwork network(*serverThread.pipe, rpc::twoparty::Side::CLIENT);
   auto rpcClient = makeRpcClient(network);
 
-  auto client = getPersistentCap(rpcClient, rpc::twoparty::Side::SERVER,
-      test::TestSturdyRefObjectId::Tag::TEST_MORE_STUFF).castAs<test::TestMoreStuff>();
+  auto client = getBootstrap(rpcClient, rpc::twoparty::Side::SERVER)
+      .getTestMoreStuffRequest().send().getCap();
 
   // Oversized request fails.
   {
@@ -494,7 +460,7 @@ private:
 
 class TestBootstrapFactory: public BootstrapFactory<rpc::twoparty::VatId> {
 public:
-  Capability::Client createFor(rpc::twoparty::VatId::Reader clientId) {
+  Capability::Client createFor(rpc::twoparty::VatId::Reader clientId) override {
     called = true;
     EXPECT_EQ(rpc::twoparty::Side::CLIENT, clientId.getSide());
     return kj::heap<TestAuthenticatedBootstrapImpl>(clientId);
@@ -641,9 +607,9 @@ public:
   kj::Promise<uint64_t> pumpTo(AsyncOutputStream& output, uint64_t amount) override {
     return inner->pumpTo(output, amount);
   }
-  kj::Promise<void> write(const void* buffer, size_t size) override {
-    written += size;
-    return inner->write(buffer, size);
+  kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override {
+    written += buffer.size();
+    return inner->write(buffer);
   }
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
     for (auto& piece: pieces) written += piece.size();
@@ -1106,7 +1072,7 @@ KJ_TEST("Dropping capability during call doesn't destroy server") {
   auto promise = cap.fooRequest().send();
   KJ_EXPECT(!promise.poll(waitScope));
   KJ_EXPECT(count == 1);
-  KJ_EXPECT(fulfillerSlot != nullptr);
+  KJ_EXPECT(fulfillerSlot != kj::none);
 
   // Dropping the capability should not destroy the server as long as the call is still
   // outstanding.

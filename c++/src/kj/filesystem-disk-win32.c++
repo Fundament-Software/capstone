@@ -306,12 +306,7 @@ protected:
   }
 };
 
-#if _MSC_VER && _MSC_VER < 1910 && !defined(__clang__)
-// TODO(msvc): MSVC 2015 can't initialize a constexpr's vtable correctly.
-const MmapDisposer mmapDisposer = MmapDisposer();
-#else
 constexpr MmapDisposer mmapDisposer = MmapDisposer();
-#endif
 
 void* win32Mmap(HANDLE handle, MmapRange range, DWORD pageProtect, DWORD access) {
   HANDLE mappingHandle;
@@ -854,7 +849,7 @@ public:
     auto filename = nativePath(path);
 
     if (has(mode, WriteMode::CREATE)) {
-      // First try just cerating the node in-place.
+      // First try just creating the node in-place.
       KJ_WIN32_HANDLE_ERRORS(tryCreate(filename.begin())) {
         case ERROR_ALREADY_EXISTS:
         case ERROR_FILE_EXISTS:
@@ -1255,7 +1250,7 @@ public:
     } else if (mode == TransferMode::MOVE) {
       return tryCommitReplacement(toPath, rawFromPath, toMode, toPath);
     } else if (mode == TransferMode::COPY) {
-      // We can accellerate copies on Windows.
+      // We can accelerate copies on Windows.
 
       if (!has(toMode, WriteMode::CREATE)) {
         // Non-atomically verify that target exists. There's no way to make this atomic.
@@ -1331,9 +1326,8 @@ public:
 
   FSNODE_METHODS
 
-  void write(const void* buffer, size_t size) override { stream.write(buffer, size); }
-  void write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
-    implicitCast<OutputStream&>(stream).write(pieces);
+  void write(ArrayPtr<const byte> data) override {
+    stream.write(data);
   }
 
 private:

@@ -19,6 +19,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+// Request 64-bit off_t and ino_t, otherwise this code will break when either value exceeds 2^32.
+#endif
+
 #include "debug.h"
 #include "filesystem.h"
 #include "string.h"
@@ -402,8 +407,8 @@ KJ_TEST("DiskDirectory") {
   KJ_EXPECT(dir->listNames() == nullptr);
   KJ_EXPECT(dir->listEntries() == nullptr);
   KJ_EXPECT(!dir->exists(Path("foo")));
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
 
   {
     auto file = dir->openFile(Path("foo"), WriteMode::CREATE);
@@ -433,8 +438,8 @@ KJ_TEST("DiskDirectory") {
 
   KJ_EXPECT(dir->openFile(Path("foo"))->readAllText() == "foobar");
 
-  KJ_EXPECT(dir->tryOpenFile(Path({"foo", "bar"}), WriteMode::MODIFY) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path({"foo", "bar"}), WriteMode::MODIFY) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::MODIFY) == kj::none);
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::CREATE));
 
@@ -512,8 +517,8 @@ KJ_TEST("DiskDirectory") {
 
   {
     auto appender = dir->appendFile(Path({"corge", "grault"}), WriteMode::MODIFY);
-    appender->write("waldo", 5);
-    appender->write("fred", 4);
+    appender->write("waldo"_kjb);
+    appender->write("fred"_kjb);
   }
 
   KJ_EXPECT(dir->openFile(Path({"corge", "grault"}))->readAllText() == "ragwaldofred");
@@ -559,9 +564,9 @@ KJ_TEST("DiskDirectory symlinks") {
   KJ_EXPECT(dir->readlink(Path("foo")) == "bar/qux/../baz");
 
   // Broken link into non-existing directory cannot be opened in any mode.
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path("foo"), WriteMode::CREATE | WriteMode::MODIFY));
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
@@ -573,9 +578,9 @@ KJ_TEST("DiskDirectory symlinks") {
   subdir->openSubdir(Path("qux"), WriteMode::CREATE);
 
   // Link still points to non-existing file so cannot be open in most modes.
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
 
   // But... CREATE | MODIFY works.
   dir->openFile(Path("foo"), WriteMode::CREATE | WriteMode::MODIFY)
@@ -591,11 +596,11 @@ KJ_TEST("DiskDirectory symlinks") {
   KJ_EXPECT(dir->readlink(Path("foo")) == "corge");
   KJ_EXPECT(!dir->exists(Path("foo")));
   KJ_EXPECT(dir->lstat(Path("foo")).type == FsNode::Type::SYMLINK);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
 
   dir->remove(Path("foo"));
   KJ_EXPECT(!dir->exists(Path("foo")));
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
 }
 #endif
 

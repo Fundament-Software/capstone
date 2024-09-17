@@ -623,10 +623,18 @@ public:
   // for the other end to send a Close reply. The application should await a reply before dropping
   // the WebSocket object.
 
-  virtual kj::Promise<void> disconnect() = 0;
-  // Sends EOF on the underlying connection without sending a "close" message. This is NOT a clean
-  // shutdown, but is sometimes useful when you want the other end to trigger whatever behavior
-  // it normally triggers when a connection is dropped.
+  virtual void disconnect() = 0;
+  // Immediately uncleanly disconnects the underlying connection in the outgoing direction without
+  // sending a "close" message. The other end will receive a DISCONNECTED exception from receive().
+  //
+  // This is an unclean shutdown, meaning that messages could be lost or truncated. For example,
+  // if the output is being buffered, disconnect() does not offer a chance to flush the buffer.
+  // For a clean shutdown, you must call close().
+  //
+  // Note that it is UB to call disconnect() while a send() or close() promise is still
+  // outstanding. As long as all promises are canceled, though, disconnect() is always legal to
+  // call and should not throw (e.g. there is no need to wrap in a try/catch when calling inside
+  // a destructor).
 
   virtual void abort() = 0;
   // Forcefully close this WebSocket, such that the remote end should get a DISCONNECTED error if
@@ -666,9 +674,8 @@ public:
   // again after Close is received.
 
   virtual kj::Promise<void> pumpTo(WebSocket& other);
-  // Continuously receives messages from this WebSocket and send them to `other`.
-  //
-  // On EOF, calls other.disconnect(), then resolves.
+  // Continuously receives messages from this WebSocket and send them to `other`, until a close
+  // message is seen.
   //
   // On other read errors, calls other.close() with the error, then resolves.
   //
@@ -753,7 +760,7 @@ public:
 
   kj::Promise<uint64_t> pumpTo(kj::AsyncOutputStream& output, uint64_t amount) override;
 
-  kj::Promise<void> write(const void* buffer, size_t size) override;
+  kj::Promise<void> write(ArrayPtr<const byte> buffer) override;
 
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override;
 
@@ -1142,7 +1149,7 @@ kj::Own<WebSocket> newWebSocket(kj::Own<kj::AsyncIoStream> stream,
 // `maskEntropySource` is used to generate cryptographically-random frame masks. If null, outgoing
 // frames will not be masked. Servers are required NOT to mask their outgoing frames, but clients
 // ARE required to do so. So, on the client side, you MUST specify an entropy source. The mask
-// must be crytographically random if the data being sent on the WebSocket may be malicious. The
+// must be cryptographically random if the data being sent on the WebSocket may be malicious. The
 // purpose of the mask is to prevent badly-written HTTP proxies from interpreting "things that look
 // like HTTP requests" in a message as being actual HTTP requests, which could result in cache
 // poisoning. See RFC6455 section 10.3.

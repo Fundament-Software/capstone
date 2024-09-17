@@ -49,6 +49,10 @@
 #include <deque>
 #include <atomic>
 
+#if __linux__
+#include <sys/prctl.h>
+#endif
+
 #if _WIN32 || __CYGWIN__
 #include <windows.h>  // for Sleep(0) and fibers
 #include <kj/windows-sanity.h>
@@ -190,10 +194,6 @@ public:
 private:
   _::PromiseNode* node;
   void* traceAddr;
-};
-
-struct DummyFunctor {
-  void operator()() {};
 };
 
 }  // namespace
@@ -363,7 +363,7 @@ TaskSet::~TaskSet() noexcept(false) {
 }
 
 void TaskSet::add(Promise<void>&& promise) {
-  auto task = _::appendPromise<Task>(_::PromiseNode::from(kj::mv(promise)), *this);
+  auto task = _::PromiseDisposer::appendPromise<Task>(_::PromiseNode::from(kj::mv(promise)), *this);
   KJ_IF_SOME(head, tasks) {
     head->prev = &task->next;
     task->next = kj::mv(tasks);
@@ -657,7 +657,7 @@ private:
   }
 #endif
 
-  void disposeImpl(void* pointer) const {
+  void disposeImpl(void* pointer) const override {
     _::FiberStack* stack = reinterpret_cast<_::FiberStack*>(pointer);
     KJ_DEFER(delete stack);
 
@@ -1412,6 +1412,14 @@ struct FiberStack::Impl {
       KJ_SYSCALL(munmap(stackMapping, allocSize)) { break; }
     });
 
+#if __linux__
+#if defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
+    // Try to name the virtual memory area for debugging purposes. This may fail if the kernel was
+    // not configured with the CONFIG_ANON_VMA_NAME option.
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, stackMapping, allocSize, "kj_fiber_stack");
+#endif
+#endif
+
     void* stack = reinterpret_cast<byte*>(stackMapping) + pageSize;
     // Now mark everything except the guard page as read-write. We assume the stack grows down, so
     // the guard page is at the beginning. No modern architecture uses stacks that grow up.
@@ -2050,46 +2058,6 @@ bool pollImpl(_::PromiseNode& node, WaitScope& waitScope, SourceLocation locatio
 
   loop.setRunnable(loop.isRunnable());
   return true;
-}
-
-Promise<void> yield() {
-  class YieldPromiseNode final: public _::PromiseNode {
-  public:
-    void destroy() override {}
-
-    void onReady(_::Event* event) noexcept override {
-      if (event) event->armBreadthFirst();
-    }
-    void get(_::ExceptionOrValue& output) noexcept override {
-      output.as<_::Void>() = _::Void();
-    }
-    void tracePromise(_::TraceBuilder& builder, bool stopAtNextEvent) override {
-      builder.add(reinterpret_cast<void*>(&kj::evalLater<DummyFunctor>));
-    }
-  };
-
-  static YieldPromiseNode NODE;
-  return _::PromiseNode::to<Promise<void>>(OwnPromiseNode(&NODE));
-}
-
-Promise<void> yieldHarder() {
-  class YieldHarderPromiseNode final: public _::PromiseNode {
-  public:
-    void destroy() override {}
-
-    void onReady(_::Event* event) noexcept override {
-      if (event) event->armLast();
-    }
-    void get(_::ExceptionOrValue& output) noexcept override {
-      output.as<_::Void>() = _::Void();
-    }
-    void tracePromise(_::TraceBuilder& builder, bool stopAtNextEvent) override {
-      builder.add(reinterpret_cast<void*>(&kj::evalLast<DummyFunctor>));
-    }
-  };
-
-  static YieldHarderPromiseNode NODE;
-  return _::PromiseNode::to<Promise<void>>(OwnPromiseNode(&NODE));
 }
 
 OwnPromiseNode readyNow() {
@@ -2870,6 +2838,46 @@ Promise<void> joinPromisesFailFast(Array<Promise<void>>&& promises, SourceLocati
       _::ArrayJoinBehavior::EAGER));
 }
 
+Promise<void> yield() {
+  class YieldPromiseNode final: public _::PromiseNode {
+  public:
+    void destroy() override {}
+
+    void onReady(_::Event* event) noexcept override {
+      if (event) event->armBreadthFirst();
+    }
+    void get(_::ExceptionOrValue& output) noexcept override {
+      output.as<_::Void>() = _::Void();
+    }
+    void tracePromise(_::TraceBuilder& builder, bool stopAtNextEvent) override {
+      builder.add(reinterpret_cast<void*>(&kj::yield));
+    }
+  };
+
+  static YieldPromiseNode NODE;
+  return _::PromiseNode::to<Promise<void>>(_::OwnPromiseNode(&NODE));
+}
+
+Promise<void> yieldUntilQueueEmpty() {
+  class YieldUntilQueueEmptyPromiseNode final: public _::PromiseNode {
+  public:
+    void destroy() override {}
+
+    void onReady(_::Event* event) noexcept override {
+      if (event) event->armLast();
+    }
+    void get(_::ExceptionOrValue& output) noexcept override {
+      output.as<_::Void>() = _::Void();
+    }
+    void tracePromise(_::TraceBuilder& builder, bool stopAtNextEvent) override {
+      builder.add(reinterpret_cast<void*>(&kj::yieldUntilQueueEmpty));
+    }
+  };
+
+  static YieldUntilQueueEmptyPromiseNode NODE;
+  return _::PromiseNode::to<Promise<void>>(_::OwnPromiseNode(&NODE));
+}
+
 namespace _ {  // (private)
 
 // -------------------------------------------------------------------
@@ -3020,7 +3028,7 @@ void CoroutineBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
   if (stopAtNextEvent) return;
 
   KJ_IF_SOME(promise, promiseNodeForTrace) {
-    promise.tracePromise(builder, stopAtNextEvent);
+    promise->tracePromise(builder, stopAtNextEvent);
   }
 
   // Maybe returning the address of coroutine() will give us a function name with meaningful type
@@ -3047,7 +3055,7 @@ Maybe<Own<Event>> CoroutineBase::fire() {
 
 void CoroutineBase::traceEvent(TraceBuilder& builder) {
   KJ_IF_SOME(promise, promiseNodeForTrace) {
-    promise.tracePromise(builder, true);
+    promise->tracePromise(builder, true);
   }
 
   // Maybe returning the address of coroutine() will give us a function name with meaningful type
@@ -3121,7 +3129,7 @@ void CoroutineBase::AwaiterBase::getImpl(ExceptionOrValue& result, void* awaited
     // comment there).
     exception.addTrace(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(awaitedAt) - 1));
 
-    // Pass kj::maxValue for ignoreCount here so that `throwFatalException()` dosen't try to
+    // Pass kj::maxValue for ignoreCount here so that `throwFatalException()` doesn't try to
     // extend the stack trace. There's no point in extending the trace beyond the single frame we
     // added above, as the rest of the trace will always be async framework stuff that no one wants
     // to see.
@@ -3144,9 +3152,9 @@ bool CoroutineBase::AwaiterBase::awaitSuspendImpl(CoroutineBase& coroutineEvent)
     // returned true from await_ready().
     return false;
   } else {
-    // Otherwise, we must suspend. Store a reference to the promise we're waiting on for tracing
-    // purposes; coroutineEvent.fire() and/or ~Adapter() will null this out.
-    coroutineEvent.promiseNodeForTrace = *node;
+    // Otherwise, we must suspend. Store a reference to the OwnPromiseNode we're waiting on for
+    // tracing purposes; coroutineEvent.fire() and/or ~Adapter() will null this out.
+    coroutineEvent.promiseNodeForTrace = node;
     maybeCoroutineEvent = coroutineEvent;
 
     coroutineEvent.hasSuspendedAtLeastOnce = true;

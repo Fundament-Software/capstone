@@ -109,7 +109,7 @@ class AsyncOutputStream: private AsyncObject {
   // Asynchronous equivalent of OutputStream (from io.h).
 
 public:
-  virtual Promise<void> write(const void* buffer, size_t size) KJ_WARN_UNUSED_RESULT = 0;
+  virtual Promise<void> write(ArrayPtr<const byte> buffer) KJ_WARN_UNUSED_RESULT = 0;
   virtual Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces)
       KJ_WARN_UNUSED_RESULT = 0;
 
@@ -169,6 +169,10 @@ public:
   virtual kj::Maybe<int> getFd() const { return kj::none; }
   // Get the underlying Unix file descriptor, if any. Returns kj::none if this object actually
   // isn't wrapping a file descriptor.
+
+  virtual kj::Maybe<void*> getWin32Handle() const { return kj::none; }
+  // Get the underlying Win32 HANDLE, if any. Returns nullptr if this object actually isn't
+  // wrapping a handle.
 };
 
 class NullStream final: public AsyncIoStream {
@@ -181,7 +185,7 @@ public:
   kj::Maybe<uint64_t> tryGetLength() override;
   kj::Promise<uint64_t> pumpTo(kj::AsyncOutputStream& output, uint64_t amount) override;
 
-  kj::Promise<void> write(const void* buffer, size_t size) override;
+  kj::Promise<void> write(ArrayPtr<const byte> buffer) override;
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override;
   kj::Promise<void> whenWriteDisconnected() override;
 
@@ -561,7 +565,7 @@ public:
 
 class DatagramPort {
 public:
-  virtual Promise<size_t> send(const void* buffer, size_t size, NetworkAddress& destination) = 0;
+  virtual Promise<size_t> send(ArrayPtr<const byte> buffer, NetworkAddress& destination) = 0;
   virtual Promise<size_t> send(ArrayPtr<const ArrayPtr<const byte>> pieces,
                                NetworkAddress& destination) = 0;
 
@@ -1050,8 +1054,8 @@ public:
   uint64_t getOffset() { return offset; }
   void seek(uint64_t newOffset) { offset = newOffset; }
 
-  Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes);
-  Maybe<uint64_t> tryGetLength();
+  Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override;
+  Maybe<uint64_t> tryGetLength() override;
 
   // (pumpTo() is not actually overridden here, but AsyncStreamFd's tryPumpFrom() will detect when
   // the source is a file.)
@@ -1080,9 +1084,9 @@ public:
   uint64_t getOffset() { return offset; }
   void seek(uint64_t newOffset) { offset = newOffset; }
 
-  Promise<void> write(const void* buffer, size_t size);
-  Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces);
-  Promise<void> whenWriteDisconnected();
+  Promise<void> write(kj::ArrayPtr<const byte> buffer) override;
+  Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override;
+  Promise<void> whenWriteDisconnected() override;
 
 private:
   const File& file;
@@ -1104,7 +1108,7 @@ inline Maybe<const T&> AncillaryMessage::as() const {
   if (data.size() >= sizeof(T)) {
     return *reinterpret_cast<const T*>(data.begin());
   } else {
-    return nullptr;
+    return kj::none;
   }
 }
 
@@ -1120,7 +1124,7 @@ class SecureNetworkWrapper {
   //   actually belongs to the responding server.
   // * No man-in-the-middle attacker can potentially see the bytes sent and received.
   //
-  // The typical implementation uses TLS. The object in this case could be configured to use cerain
+  // The typical implementation uses TLS. The object in this case could be configured to use certain
   // keys, certificates, etc. See kj/compat/tls.h for such an implementation.
   //
   // However, an implementation could use some other form of encryption, or might not need to use
@@ -1138,7 +1142,7 @@ public:
 
   virtual kj::Promise<kj::Own<kj::AsyncIoStream>> wrapClient(
       kj::Own<kj::AsyncIoStream> stream, kj::StringPtr expectedServerHostname) = 0;
-  // Act as the client side of a connection. The given stream is already connecetd to a server, but
+  // Act as the client side of a connection. The given stream is already connected to a server, but
   // no authentication has occurred. This method will verify that the server actually is the given
   // hostname, then return the stream representing a secure transport to that server.
 

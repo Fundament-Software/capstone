@@ -22,6 +22,7 @@
 #include "kj/common.h"
 #include "kj/string.h"
 #include "kj/test.h"
+#include "function.h"
 #include "memory.h"
 #include <signal.h>
 #include <kj/compat/gtest.h>
@@ -369,6 +370,20 @@ TEST(Memory, OwnConstVoid) {
     maybe = kj::none;
     KJ_EXPECT(maybe == kj::none);
   }
+
+  {
+    bool destructorCalled = false;
+    Own<SingularDerivedDynamic> ptr = heap<SingularDerivedDynamic>(123, destructorCalled);
+    SingularDerivedDynamic* addr = ptr.get();
+
+    KJ_EXPECT(ptr.disown(&_::HeapDisposer<SingularDerivedDynamic>::instance) == addr);
+    KJ_EXPECT(!destructorCalled);
+    ptr = nullptr;
+    KJ_EXPECT(!destructorCalled);
+
+    _::HeapDisposer<SingularDerivedDynamic>::instance.dispose(addr);
+    KJ_EXPECT(destructorCalled);
+  }
 }
 
 struct IncompleteType;
@@ -382,7 +397,7 @@ KJ_DECLARE_NON_POLYMORPHIC(IncompleteTemplate<T, U>)
 struct IncompleteDisposer: public Disposer {
   mutable void* sawPtr = nullptr;
 
-  virtual void disposeImpl(void* pointer) const {
+  void disposeImpl(void* pointer) const override {
     sawPtr = pointer;
   }
 };

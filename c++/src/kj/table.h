@@ -28,11 +28,7 @@
 
 #if _MSC_VER
 // Need _ReadWriteBarrier
-#if _MSC_VER < 1910
-#include <intrin.h>
-#else
 #include <intrin0.h>
-#endif
 #endif
 
 #if KJ_DEBUG_TABLE_IMPL
@@ -893,7 +889,10 @@ inline size_t probeHash(const kj::Array<HashBucket>& buckets, size_t i) {
 
 kj::Array<HashBucket> rehash(kj::ArrayPtr<const HashBucket> oldBuckets, size_t targetSize);
 
-uint chooseBucket(uint hash, uint count);
+inline uint chooseBucket(uint hash, uint count) {
+  KJ_IASSERT(kj::popCount(count) == 1, "hash bucket count must be power of two!");
+  return hash & (count - 1);
+}
 
 }  // namespace _ (private)
 

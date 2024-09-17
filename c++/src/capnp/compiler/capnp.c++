@@ -23,6 +23,11 @@
 #define _GNU_SOURCE
 #endif
 
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+// Request 64-bit off_t and ino_t, otherwise this code will break when either value exceeds 2^32.
+#endif
+
 #if _WIN32
 #include <kj/win32-api-version.h>
 #endif
@@ -37,6 +42,7 @@
 #include <kj/vector.h>
 #include <kj/io.h>
 #include <kj/miniposix.h>
+#include <kj/filesystem.h>
 #include <kj/debug.h>
 #include "../message.h"
 #include <kj/main.h>
@@ -984,7 +990,7 @@ private:
       }
     }
 
-    void onRecoverableException(kj::Exception&& e) {
+    void onRecoverableException(kj::Exception&& e) override {
       // Only capture the first exception, on the assumption that later exceptions are probably
       // just cascading problems.
       if (exception == kj::none) {
@@ -1040,9 +1046,9 @@ private:
         auto words = kj::heapArray<word>(computeUnpackedSizeInWords(allBytes));
         kj::ArrayInputStream input(allBytes);
         capnp::_::PackedInputStream unpacker(input);
-        unpacker.read(words.asBytes().begin(), words.asBytes().size());
+        unpacker.read(words.asBytes());
         word dummy;
-        KJ_ASSERT(unpacker.tryRead(&dummy, sizeof(dummy), sizeof(dummy)) == 0);
+        KJ_ASSERT(unpacker.tryRead(kj::arrayPtr(&dummy, 1).asBytes(), sizeof(dummy)) == 0);
 
         kj::ArrayPtr<const word> segments[1] = { words };
         SegmentArrayMessageReader message(segments, options);
@@ -1094,7 +1100,7 @@ private:
         auto words = kj::heapArray<word>(reader.totalSize().wordCount + 1);
         memset(words.begin(), 0, words.asBytes().size());
         copyToUnchecked(reader, words);
-        output.write(words.begin(), words.asBytes().size());
+        output.write(words.asBytes());
         return;
       }
       case Format::FLAT_PACKED: {
@@ -1103,19 +1109,19 @@ private:
         copyToUnchecked(reader, words);
         kj::BufferedOutputStreamWrapper buffered(output);
         capnp::_::PackedOutputStream packed(buffered);
-        packed.write(words.begin(), words.asBytes().size());
+        packed.write(words.asBytes());
         return;
       }
       case Format::CANONICAL: {
         auto words = reader.canonicalize();
-        output.write(words.begin(), words.asBytes().size());
+        output.write(words.asBytes());
         return;
       }
       case Format::TEXT: {
         TextCodec codec;
         codec.setPrettyPrint(pretty);
         auto text = codec.encode(reader.as<DynamicStruct>(rootType));
-        output.write({text.asBytes(), kj::StringPtr("\n").asBytes()});
+        output.write({text.asBytes(), "\n"_kjb});
         return;
       }
       case Format::JSON: {
@@ -1123,7 +1129,7 @@ private:
         codec.setPrettyPrint(pretty);
         codec.handleByAnnotation(rootType);
         auto text = codec.encode(reader.as<DynamicStruct>(rootType));
-        output.write({text.asBytes(), kj::StringPtr("\n").asBytes()});
+        output.write({text.asBytes(), "\n"_kjb});
         return;
       }
     }

@@ -21,6 +21,7 @@
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#include "kj/array.h"
 #endif
 
 #include "serialize.h"
@@ -207,10 +208,11 @@ public:
         lazy(lazy) {}
   ~TestInputStream() {}
 
-  size_t tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+  size_t tryRead(kj::ArrayPtr<byte> buffer, size_t minBytes) override {
+    size_t maxBytes = buffer.size();
     KJ_ASSERT(maxBytes <= size_t(end - pos), "Overran end of stream.");
     size_t amount = lazy ? minBytes : maxBytes;
-    memcpy(buffer, pos, amount);
+    memcpy(buffer.begin(), pos, amount);
     pos += amount;
     return amount;
   }
@@ -325,8 +327,8 @@ public:
   TestOutputStream() {}
   ~TestOutputStream() {}
 
-  void write(const void* buffer, size_t size) override {
-    data.append(reinterpret_cast<const char*>(buffer), size);
+  void write(kj::ArrayPtr<const byte> data) override {
+    this->data.append(data.asChars().begin(), data.size());
   }
 
   bool dataEquals(kj::ArrayPtr<const word> other) {
@@ -452,7 +454,7 @@ TEST(Serialize, RejectTooManySegments) {
     ADD_FAILURE() << "Should have thrown an exception.";
   });
 
-  KJ_EXPECT(e != nullptr, "Should have thrown an exception.");
+  KJ_EXPECT(e != kj::none, "Should have thrown an exception.");
 }
 
 #if !__MINGW32__  // Inexplicably crashes when exception is thrown from constructor.
@@ -471,9 +473,24 @@ TEST(Serialize, RejectHugeMessage) {
     ADD_FAILURE() << "Should have thrown an exception.";
   });
 
-  KJ_EXPECT(e != nullptr, "Should have thrown an exception.");
+  KJ_EXPECT(e != kj::none, "Should have thrown an exception.");
 }
 #endif  // !__MINGW32__
+
+TEST(Serialize, SegmentsTable) {
+  TestMessageBuilder builder(1);
+  initTestMessage(builder.initRoot<TestAllTypes>());
+  auto serialized = messageToFlatArray(builder);
+
+  auto segments = builder.getSegmentsForOutput();
+  auto table = serializeSegmentTable(segments);
+  
+  auto message = kj::heapArrayBuilder<kj::byte>(serialized.asBytes().size());
+  message.addAll(table.asBytes());
+  for (auto segment: segments) message.addAll(segment.asBytes());
+
+  KJ_EXPECT(serialized.asBytes() == message.asPtr());
+}
 
 // TODO(test):  Test error cases.
 

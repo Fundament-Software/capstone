@@ -136,6 +136,10 @@ if(MSVC)
 
   add_compile_options(/Zc:__cplusplus)
   # Set the __cplusplus macro properly.
+  add_compile_options(/Zc:inline)
+  # Do not generate code for unreferenced symbols with internal linkage. Significantly improves
+  # object code size and link speeds under MSVC (clang-cl is sane enough to not need a flag for
+  # this). https://devblogs.microsoft.com/cppblog/feedback-making-zcinline-default-for-debugrelease-configs-in-14/
 else()
   # Note that it's important to add new CXXFLAGS before ones specified by the
   # user, so that the user's flags override them. This is particularly
@@ -147,7 +151,7 @@ else()
   #   recognize as safe.
   # * sign-compare: Low S/N ratio.
   # * unused-parameter: Low S/N ratio.
-  add_compile_options(-Wall -Wextra -Wno-strict-aliasing -Wno-sign-compare -Wno-unused-parameter)
+  add_compile_options(-Wall -Wextra -Wsuggest-override -Wno-strict-aliasing -Wno-sign-compare -Wno-unused-parameter)
 
   if(DEFINED CMAKE_CXX_EXTENSIONS AND NOT CMAKE_CXX_EXTENSIONS)
     message(SEND_ERROR "Cap'n Proto requires compiler-specific extensions (e.g., -std=gnu++20). Please leave CMAKE_CXX_EXTENSIONS undefined or ON.")

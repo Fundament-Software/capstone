@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "function.h"
 #include "test.h"
 
 #include <string.h>
@@ -70,7 +71,7 @@ public:
                         Maybe<StringPtr> message)
       : type(type), message(message) {}
 
-  virtual void onFatalException(Exception&& exception) {
+  void onFatalException(Exception&& exception) override {
     KJ_IF_SOME(expectedType, type) {
       if (exception.getType() != expectedType) {
         KJ_LOG(ERROR, "threw exception of wrong type", exception, expectedType);

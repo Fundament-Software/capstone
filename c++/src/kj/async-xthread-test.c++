@@ -49,7 +49,7 @@ inline void delay() { usleep(10000); }
 namespace kj {
 namespace {
 
-KJ_TEST("synchonous simple cross-thread events") {
+KJ_TEST("synchronous simple cross-thread events") {
   MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
   Own<PromiseFulfiller<uint>> fulfiller;  // accessed only from the subthread
   thread_local bool isChild = false;  // to assert which thread we're in
@@ -151,7 +151,7 @@ KJ_TEST("asynchronous simple cross-thread events") {
   })();
 }
 
-KJ_TEST("synchonous promise cross-thread events") {
+KJ_TEST("synchronous promise cross-thread events") {
   MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
   Own<PromiseFulfiller<uint>> fulfiller;  // accessed only from the subthread
   Promise<uint> promise = nullptr;  // accessed only from the subthread
@@ -558,7 +558,7 @@ KJ_TEST("call own thread's executor") {
 
   KJ_EXPECT_THROW_MESSAGE(
       "can't call executeSync() on own thread's executor with a promise-returning function",
-      executor.executeSync([]() { return kj::evalLater([]() {}); }));
+      executor.executeSync([]() { return kj::yield(); }));
 
   {
     uint i = executor.executeAsync([]() {

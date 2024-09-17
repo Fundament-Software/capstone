@@ -23,12 +23,8 @@
 
 #include "memory.h"
 
-#if _MSC_VER
-#if _MSC_VER < 1910
-#include <intrin.h>
-#else
-#include <intrin0.h>
-#endif
+#if _MSC_VER && !defined(__clang__)
+#include <intrin0.h> // _InterlockedXX
 #endif
 
 KJ_BEGIN_HEADER
@@ -214,7 +210,8 @@ public:
   inline T* operator->() { return own.get(); }
   inline const T* operator->() const { return own.get(); }
 
-  // do not expose * to avoid dangling references
+  inline T* get() { return own.get(); }
+  inline const T* get() const { return own.get(); }
 
 private:
   Rc(T* t) : own(t, *t) { }
@@ -494,7 +491,8 @@ public:
   inline T* operator->() { return own.get(); }
   inline const T* operator->() const { return own.get(); }
 
-  // do not expose * to avoid dangling references
+  inline T* get() { return own.get(); }
+  inline const T* get() const { return own.get(); }
 
 private:
   Arc(T* t) : own(t, *t) { }

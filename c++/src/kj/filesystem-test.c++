@@ -357,7 +357,7 @@ KJ_TEST("InMemoryFile") {
     file->truncate(18);
     KJ_EXPECT(kj::str(mapping.slice(12, 17).asChars()) == kj::StringPtr("\0\0\0\0\0", 5));
 
-    // Can't grow past previoous capacity.
+    // Can't grow past previous capacity.
     KJ_EXPECT_THROW_MESSAGE("cannot resize the file backing store", file->truncate(100));
 
     clock.expectChanged(*file);
@@ -452,8 +452,8 @@ KJ_TEST("InMemoryDirectory") {
   KJ_EXPECT(dir->listNames() == nullptr);
   KJ_EXPECT(dir->listEntries() == nullptr);
   KJ_EXPECT(!dir->exists(Path("foo")));
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
   clock.expectUnchanged(*dir);
 
   {
@@ -493,8 +493,8 @@ KJ_TEST("InMemoryDirectory") {
   KJ_EXPECT(dir->openFile(Path("foo"))->readAllText() == "foobar");
   clock.expectUnchanged(*dir);
 
-  KJ_EXPECT(dir->tryOpenFile(Path({"foo", "bar"}), WriteMode::MODIFY) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path({"foo", "bar"}), WriteMode::MODIFY) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::MODIFY) == kj::none);
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::CREATE));
   clock.expectUnchanged(*dir);
@@ -583,8 +583,8 @@ KJ_TEST("InMemoryDirectory") {
 
   {
     auto appender = dir->appendFile(Path({"corge", "grault"}), WriteMode::MODIFY);
-    appender->write("waldo", 5);
-    appender->write("fred", 4);
+    appender->write("waldo"_kjb);
+    appender->write("fred"_kjb);
   }
 
   KJ_EXPECT(dir->openFile(Path({"corge", "grault"}))->readAllText() == "ragwaldofred");
@@ -638,9 +638,9 @@ KJ_TEST("InMemoryDirectory symlinks") {
   KJ_EXPECT(dir->readlink(Path("foo")) == "bar/qux/../baz");
 
   // Broken link into non-existing directory cannot be opened in any mode.
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path("foo"), WriteMode::CREATE | WriteMode::MODIFY));
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
@@ -652,9 +652,9 @@ KJ_TEST("InMemoryDirectory symlinks") {
   clock.expectChanged(*dir);
 
   // Link still points to non-existing file so cannot be open in most modes.
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == nullptr);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == kj::none);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
   clock.expectUnchanged(*dir);
 
   // But... CREATE | MODIFY works.
@@ -672,11 +672,11 @@ KJ_TEST("InMemoryDirectory symlinks") {
   KJ_EXPECT(dir->readlink(Path("foo")) == "corge");
   KJ_EXPECT(!dir->exists(Path("foo")));
   KJ_EXPECT(dir->lstat(Path("foo")).type == FsNode::Type::SYMLINK);
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
 
   dir->remove(Path("foo"));
   KJ_EXPECT(!dir->exists(Path("foo")));
-  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == nullptr);
+  KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
 }
 
 KJ_TEST("InMemoryDirectory link") {

@@ -890,7 +890,8 @@ void checkDynamicTestMessageAllZero(DynamicStruct::Reader reader) {
 
 #if !CAPNP_LITE
 
-TestInterfaceImpl::TestInterfaceImpl(int& callCount): callCount(callCount) {}
+TestInterfaceImpl::TestInterfaceImpl(int& callCount, kj::Maybe<int&> handleCount)
+    : callCount(callCount), handleCount(handleCount) {}
 
 kj::Promise<void> TestInterfaceImpl::foo(FooContext context) {
   ++callCount;
@@ -909,6 +910,24 @@ kj::Promise<void> TestInterfaceImpl::baz(BazContext context) {
   context.releaseParams();
   EXPECT_ANY_THROW(context.getParams());
 
+  return kj::READY_NOW;
+}
+
+kj::Promise<void> TestInterfaceImpl::getTestPipeline(GetTestPipelineContext context) {
+  context.getResults().setCap(kj::heap<TestPipelineImpl>(callCount));
+  return kj::READY_NOW;
+}
+kj::Promise<void> TestInterfaceImpl::getTestTailCallee(GetTestTailCalleeContext context) {
+  context.getResults().setCap(kj::heap<TestTailCalleeImpl>(callCount));
+  return kj::READY_NOW;
+}
+kj::Promise<void> TestInterfaceImpl::getTestTailCaller(GetTestTailCallerContext context) {
+  context.getResults().setCap(kj::heap<TestTailCallerImpl>(callCount));
+  return kj::READY_NOW;
+}
+kj::Promise<void> TestInterfaceImpl::getTestMoreStuff(GetTestMoreStuffContext context) {
+  context.getResults().setCap(
+      kj::heap<TestMoreStuffImpl>(callCount, KJ_REQUIRE_NONNULL(handleCount)));
   return kj::READY_NOW;
 }
 
@@ -1163,13 +1182,13 @@ kj::Promise<void> TestMoreStuffImpl::writeToFd(WriteToFdContext context) {
 
   promises.add(params.getFdCap1().getFd()
       .then([](kj::Maybe<int> fd) {
-    kj::FdOutputStream(KJ_ASSERT_NONNULL(fd)).write("foo", 3);
+    kj::FdOutputStream(KJ_ASSERT_NONNULL(fd)).write("foo"_kjb);
   }));
   promises.add(params.getFdCap2().getFd()
       .then([context](kj::Maybe<int> fd) mutable {
     context.getResults().setSecondFdPresent(fd != kj::none);
     KJ_IF_SOME(f, fd) {
-      kj::FdOutputStream(f).write("bar", 3);
+      kj::FdOutputStream(f).write("bar"_kjb);
     }
   }));
 
@@ -1178,7 +1197,7 @@ kj::Promise<void> TestMoreStuffImpl::writeToFd(WriteToFdContext context) {
   kj::AutoCloseFd in(pair[0]);
   kj::AutoCloseFd out(pair[1]);
 
-  kj::FdOutputStream(kj::mv(out)).write("baz", 3);
+  kj::FdOutputStream(kj::mv(out)).write("baz"_kjb);
   context.getResults().setFdCap3(kj::heap<TestFdCap>(kj::mv(in)));
 
   return kj::joinPromises(promises.finish());

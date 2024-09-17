@@ -20,8 +20,10 @@
 // THE SOFTWARE.
 
 #include "module-loader.h"
+#include "compiler.h"
 #include "lexer.h"
 #include "parser.h"
+#include <kj/filesystem.h>
 #include <kj/vector.h>
 #include <kj/mutex.h>
 #include <kj/debug.h>
@@ -79,7 +81,7 @@ struct FileKey {
     // check the content.
     auto mapping1 = KJ_ASSERT_NONNULL(file).mmap(0, size);
     auto mapping2 = KJ_ASSERT_NONNULL(other.file).mmap(0, size);
-    if (memcmp(mapping1.begin(), mapping2.begin(), size) != 0) return false;
+    if (mapping1 != mapping2) return false;
 
     if (path == other.path) {
       // Exactly the same content was mapped at exactly the same path relative to two different

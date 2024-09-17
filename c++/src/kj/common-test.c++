@@ -114,7 +114,7 @@ TEST(Common, Maybe) {
     }
     // We have moved the kj::Own away, so this should give us the default and leave the Maybe empty.
     EXPECT_EQ(456, m.orDefault(heap<CopyOrMove>(456))->i);
-    EXPECT_TRUE(m == nullptr);
+    EXPECT_TRUE(m == kj::none);
 
     bool ranLazy = false;
     EXPECT_EQ(123, mv(m).orDefault([&] {
@@ -122,17 +122,17 @@ TEST(Common, Maybe) {
       return heap<CopyOrMove>(123);
     })->i);
     EXPECT_TRUE(ranLazy);
-    EXPECT_TRUE(m == nullptr);
+    EXPECT_TRUE(m == kj::none);
 
     m = heap<CopyOrMove>(123);
-    EXPECT_TRUE(m != nullptr);
+    EXPECT_TRUE(m != kj::none);
     ranLazy = false;
     EXPECT_EQ(123, mv(m).orDefault([&] {
       ranLazy = true;
       return heap<CopyOrMove>(456);
     })->i);
     EXPECT_FALSE(ranLazy);
-    EXPECT_TRUE(m == nullptr);
+    EXPECT_TRUE(m == kj::none);
   }
 
   {
@@ -793,29 +793,216 @@ TEST(Common, ArrayAsBytes) {
   }
 }
 
-KJ_TEST("ArrayPtr operator ==") {
-  KJ_EXPECT(ArrayPtr<const int>({123, 456}) == ArrayPtr<const int>({123, 456}));
-  KJ_EXPECT(!(ArrayPtr<const int>({123, 456}) != ArrayPtr<const int>({123, 456})));
-  KJ_EXPECT(ArrayPtr<const int>({123, 456}) != ArrayPtr<const int>({123, 321}));
-  KJ_EXPECT(ArrayPtr<const int>({123, 456}) != ArrayPtr<const int>({123}));
+enum TestOrdering {
+  UNORDERED,
+  EQUAL,
+  LESS,
+  GREATER,
+  NOTEQUAL,
+};
 
-  KJ_EXPECT(ArrayPtr<const int>({123, 456}) == ArrayPtr<const short>({123, 456}));
-  KJ_EXPECT(!(ArrayPtr<const int>({123, 456}) != ArrayPtr<const short>({123, 456})));
-  KJ_EXPECT(ArrayPtr<const int>({123, 456}) != ArrayPtr<const short>({123, 321}));
-  KJ_EXPECT(ArrayPtr<const int>({123, 456}) != ArrayPtr<const short>({123}));
+template<typename A, typename B>
+void verifyEqualityComparisons(A a, B b, TestOrdering ord) {
+  const bool expectedEq = ord == EQUAL;
+  KJ_EXPECT((a == b) == expectedEq);
+  KJ_EXPECT((b == a) == expectedEq);
+  KJ_EXPECT((a != b) == !expectedEq);
+  KJ_EXPECT((b != a) == !expectedEq);
+}
 
-  KJ_EXPECT((ArrayPtr<const StringPtr>({"foo", "bar"}) ==
-             ArrayPtr<const char* const>({"foo", "bar"})));
-  KJ_EXPECT(!(ArrayPtr<const StringPtr>({"foo", "bar"}) !=
-             ArrayPtr<const char* const>({"foo", "bar"})));
-  KJ_EXPECT((ArrayPtr<const StringPtr>({"foo", "bar"}) !=
-             ArrayPtr<const char* const>({"foo", "baz"})));
-  KJ_EXPECT((ArrayPtr<const StringPtr>({"foo", "bar"}) !=
-             ArrayPtr<const char* const>({"foo"})));
+template<typename T>
+void strongComparisonsTests(T a, T b, TestOrdering ord) {
+  const bool expectedEq = ord == EQUAL;
+  const bool expectedLT = ord == LESS;
+  verifyEqualityComparisons(a, b, ord);
+  KJ_EXPECT((a <= b) == (expectedEq || expectedLT));
+  KJ_EXPECT((b <= a) == !expectedLT);
+  KJ_EXPECT((a >= b) == !expectedLT);
+  KJ_EXPECT((b >= a) == (expectedEq || expectedLT));
+  KJ_EXPECT((a < b) == expectedLT);
+  KJ_EXPECT((b < a) == !(expectedEq || expectedLT));
+  KJ_EXPECT((a > b) == !(expectedEq || expectedLT));
+  KJ_EXPECT((b > a) == expectedLT);
+}
 
-  // operator== should not use memcmp for double elements.
-  double d[1] = { nan() };
-  KJ_EXPECT(ArrayPtr<double>(d, 1) != ArrayPtr<double>(d, 1));
+template<typename A, typename B>
+struct ArrayComparisonTest {
+  Array<A> left;
+  Array<B> right;
+  TestOrdering expectedResult;
+  ArrayComparisonTest(std::initializer_list<A> left, std::initializer_list<B> right, TestOrdering expectedResult) :
+    left(heapArray(left)), right(heapArray(right)), expectedResult(expectedResult) {}
+
+  template<size_t N, size_t M>
+  ArrayComparisonTest(A (&left) [N], B(&right) [M], TestOrdering expectedResult) :
+    left(heapArray(left, N)), right(heapArray(right, M)), expectedResult(expectedResult) {}
+
+};
+
+KJ_TEST("ArrayPtr comparators for nullptr type") {
+  verifyEqualityComparisons(ArrayPtr<const int>({}), nullptr, EQUAL);
+  verifyEqualityComparisons(ArrayPtr<const int>({123}), nullptr, GREATER);
+}
+
+KJ_TEST("ArrayPtr comparators for same int type") {
+  using Test = ArrayComparisonTest<const int, const int>;
+  Test testCases[] = {
+    {{1,2}, {1,2}, EQUAL},
+    {{1,2}, {1,3}, LESS},
+    {{1,3}, {1,2}, GREATER},
+    {{1}  , {1,2}, LESS},
+    {{2}  , {1,2}, GREATER},
+    {{257,258}, {257,258}, EQUAL},
+    {{0xFF,0xFF}, {0x101,0xFF}, LESS},
+    {{0xFF,0x101}, {0xFF,0xFF}, GREATER},
+    {{0xFF}  , {0xFF,0x101}, LESS},
+    {{0x101}  , {0xFF,0x101}, GREATER},
+    {{-1,-2}, {-1,-2}, EQUAL},
+    {{-1,-3}, {-1,-2}, LESS},
+    {{-1,-2}, {-1,-3}, GREATER},
+    {{-1}  , {-1,-2}, LESS},
+    {{-1}  , {-2,-3}, GREATER},
+    {{-1,1}, {-1,1}, EQUAL},
+    {{-1,-1}, {-1,1}, LESS},
+    {{-1,1}, {-1,-1}, GREATER},
+    {{-1}  , {1,-2}, LESS},
+    {{1}  , {-1,2}, GREATER},
+  };
+
+  for (auto const& testCase : testCases) {
+    strongComparisonsTests(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+  }
+}
+KJ_TEST("ArrayPtr comparators for same int type") {
+  using Test = ArrayComparisonTest<const unsigned int, const unsigned int>;
+  Test testCases[] = {
+    {{1,2}, {1,2}, EQUAL},
+    {{1,2}, {1,3}, LESS},
+    {{1,3}, {1,2}, GREATER},
+    {{1}  , {1,2}, LESS},
+    {{2}  , {1,2}, GREATER},
+    {{257,258}, {257,258}, EQUAL},
+    {{0xFF,0xFF}, {0x101,0xFF}, LESS},
+    {{0xFF,0x101}, {0xFF,0xFF}, GREATER},
+    {{0xFF}  , {0xFF,0x101}, LESS},
+    {{0x101}  , {0xFF,0x101}, GREATER},
+    {{0x101}  , {0xFF}, GREATER},
+  };
+
+  for (auto const& testCase : testCases) {
+    strongComparisonsTests(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+  }
+}
+
+KJ_TEST("ArrayPtr equality comparisons for different int type") {
+  using Test = ArrayComparisonTest<const int, const short>;
+  Test testCases[] = {
+    {{1,2}, {1,2}, EQUAL},
+    {{1,2}, {1,3}, LESS},
+    {{1,3}, {1,2}, GREATER},
+    {{1}  , {1,2}, LESS},
+    {{2}  , {1,2}, GREATER},
+  };
+
+  for (auto const& testCase : testCases) {
+    verifyEqualityComparisons(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+  }
+}
+
+KJ_TEST("ArrayPtr comparators for doubles (testing partial orderings)") {
+  using Test = ArrayComparisonTest<const double, const double>;
+  const double d = nan();
+  Test testCases[] = {
+    {{0.0}, {0.0}, EQUAL},
+    {{1.0}, {0.0}, NOTEQUAL},
+    {{0.0}, {1.0}, NOTEQUAL},
+    {{0,0, 0.0}, {0.0}, NOTEQUAL},
+    {{0.0, 0.0}, {1.0}, NOTEQUAL},
+    {{d}, {d}, UNORDERED},
+  };
+
+  for (auto const& testCase : testCases) {
+    verifyEqualityComparisons(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+  }
+}
+
+KJ_TEST("ArrayPtr comparator for arrays of the same string type") {
+  using TestCase = ArrayComparisonTest<const StringPtr, const StringPtr>;
+  TestCase testCases[] = {
+    {{"foo", "bar"}, {"foo", "bar"}, EQUAL},
+    {{"foo", "bar"}, {"foo", "baz"}, LESS},
+    {{"foo", "bar"}, {"foo"       }, GREATER},
+  };
+
+  for (auto const& testCase : testCases) {
+    strongComparisonsTests(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+  }
+}
+
+KJ_TEST("ArrayPtr equality comparisons for UTF-8") {
+  using TestCase = ArrayComparisonTest<const char, const char>;
+
+  TestCase testCases[] = {
+    {"hello", "żółć", LESS},
+  };
+
+  for (auto const& testCase : testCases) {
+    strongComparisonsTests(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+    strongComparisonsTests(testCase.left.asBytes(), testCase.right.asBytes(), testCase.expectedResult);
+  }
+}
+
+KJ_TEST("ArrayPtr equality for arrays of different string types") {
+  using Test = ArrayComparisonTest<const StringPtr, const char* const>;
+  Test testCases[] = {
+    {{"foo", "bar"}, {"foo", "bar"}, EQUAL},
+    {{"foo", "bar"}, {"foo", "baz"}, LESS},
+    {{"foo", "bar"}, {"foo"       }, GREATER},
+  };
+
+  for (auto const& testCase : testCases) {
+    verifyEqualityComparisons(testCase.left.asPtr(), testCase.right.asPtr(), testCase.expectedResult);
+  }
+}
+
+KJ_TEST("asBytes Tests") {
+  const char helloMessage[] = "helloThere";
+
+  // Use size to specify
+  {
+    auto helloPtr = kj::asBytes(helloMessage, 5);
+    static_assert(isSameType<decltype(helloPtr), ArrayPtr<const byte>>());
+    KJ_EXPECT(helloPtr.size(), 5);
+    KJ_EXPECT(memcmp(helloPtr.begin(), helloMessage, 5) == 0);
+  }
+
+  // Use begin and end
+  {
+    auto helloPtr = kj::asBytes(helloMessage, helloMessage + 5);
+    static_assert(isSameType<decltype(helloPtr), ArrayPtr<const byte>>());
+    KJ_EXPECT(helloPtr.size(), 5);
+    KJ_EXPECT(memcmp(helloPtr.begin(), helloMessage, 5) == 0);
+  }
+
+  // Check struct to ArrayPtr<byte>
+  {
+    struct Foo {
+      size_t i = 0;
+      size_t j = 1;
+    };
+    const Foo foo {};
+    auto fooBytesPtr = asBytes(foo);
+    static_assert(isSameType<decltype(fooBytesPtr), ArrayPtr<const byte>>());
+    KJ_EXPECT(fooBytesPtr.size(), sizeof(Foo));
+    KJ_EXPECT(memcmp(fooBytesPtr.begin(), &foo, sizeof(Foo)) == 0);
+  }
+  {
+    const int simpleInts[] = {0, 100, 200, 300, -100};
+    auto simpleIntsPtr = asBytes(simpleInts);
+    static_assert(isSameType<decltype(simpleIntsPtr), ArrayPtr<const byte>>());
+    KJ_EXPECT(simpleIntsPtr.size(), sizeof(simpleInts));
+    KJ_EXPECT(memcmp(simpleIntsPtr.begin(), simpleInts, sizeof(simpleInts)) == 0);
+  }
 }
 
 KJ_TEST("kj::range()") {
@@ -951,6 +1138,12 @@ KJ_TEST("kj::ArrayPtr fill") {
     KJ_EXPECT(o.i == 42);
     KJ_EXPECT(o.d == 3.1415926);
   }
+
+  // test filling from an Array
+  byte byteArray2[10]{};
+  auto source = "abc"_kjb;
+  arrayPtr(byteArray2).fill(source);
+  KJ_EXPECT("abcabcabca"_kjb == byteArray2);
 }
 
 struct Std {
@@ -965,6 +1158,19 @@ KJ_TEST("ArrayPtr::as<Std>") {
   ArrayPtr<int> arr(rawArray);
   std::span<int> stdPtr = arr.as<Std>();
   KJ_EXPECT(stdPtr.size() == 5);
+}
+
+KJ_TEST("ArrayPtr::copyFrom") {
+  int arr1[] = {12, 34, 56, 34, 12};
+  int arr2[] = {98, 67, 9, 22, 107};
+  int arr3[] = {98, 67, 9, 22, 107};
+
+  KJ_EXPECT(arrayPtr(arr1) != arrayPtr(arr2));
+  KJ_EXPECT(arrayPtr(arr2) == arrayPtr(arr3));
+
+  arrayPtr(arr1).copyFrom(arr2);
+  KJ_EXPECT(arrayPtr(arr1) == arrayPtr(arr2));
+  KJ_EXPECT(arrayPtr(arr2) == arrayPtr(arr3));
 }
 
 // Verifies the expected values of kj::isDisallowedInCoroutine<T>
@@ -996,11 +1202,28 @@ static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine&>());
 static_assert(!_::isDisallowedInCoroutine<AllowedInCoroutine*>());
 
 KJ_TEST("_kjb") {
-  ArrayPtr<const byte> arr = "abc"_kjb;
-  KJ_EXPECT(arr.size() == 3);
-  KJ_EXPECT(arr[0] == 'a');
-  KJ_EXPECT(arr[1] == 'b');
-  KJ_EXPECT(arr[2] == 'c');
+  {
+    ArrayPtr<const byte> arr = "abc"_kjb;
+    KJ_EXPECT(arr.size() == 3);
+    KJ_EXPECT(arr[0] == 'a');
+    KJ_EXPECT(arr[1] == 'b');
+    KJ_EXPECT(arr[2] == 'c');
+    KJ_EXPECT(arr == "abc"_kjb);
+  }
+
+  {
+      // _kjb literals can be constexpr too
+    constexpr ArrayPtr<const byte> arr2 = "def"_kjb;
+    KJ_EXPECT(arr2.size() == 3);
+    KJ_EXPECT(arr2[0] == 'd');
+    KJ_EXPECT(arr2[1] == 'e');
+    KJ_EXPECT(arr2[2] == 'f');
+    KJ_EXPECT(arr2 == "def"_kjb);
+  }
+
+  // empty array
+  KJ_EXPECT(""_kjb.size() == 0);
+  KJ_EXPECT(""_kjb == nullptr);
 }
 
 KJ_TEST("arrayPtr()") {
@@ -1008,6 +1231,22 @@ KJ_TEST("arrayPtr()") {
   byte buffer[1024]{};
   auto ptr = arrayPtr(buffer);
   KJ_EXPECT(ptr.size() == 1024);
+}
+
+KJ_TEST("single item arrayPtr()") {
+  byte b = 42;
+  KJ_EXPECT(arrayPtr(b).size() == 1);
+  KJ_EXPECT(arrayPtr(b).begin() == &b);
+
+  // test an object
+  struct SomeObject {
+    int64_t i;
+    double d;
+  };
+  SomeObject obj = {42, 3.1415};
+  kj::arrayPtr(obj).asBytes().fill(0);
+  KJ_EXPECT(obj.i == 0);
+  KJ_EXPECT(obj.d == 0);
 }
 
 KJ_TEST("memzero<T>()") {

@@ -256,7 +256,7 @@ static MmapRange getMmapRange(uint64_t offset, uint64_t size) {
 class MmapDisposer: public ArrayDisposer {
 protected:
   void disposeImpl(void* firstElement, size_t elementSize, size_t elementCount,
-                   size_t capacity, void (*destroyElement)(void*)) const {
+                   size_t capacity, void (*destroyElement)(void*)) const override {
     auto range = getMmapRange(reinterpret_cast<uintptr_t>(firstElement),
                               elementSize * elementCount);
     KJ_SYSCALL(munmap(reinterpret_cast<byte*>(range.offset), range.size)) { break; }
@@ -950,7 +950,7 @@ public:
     auto filename = path.toString();
 
     if (has(mode, WriteMode::CREATE)) {
-      // First try just cerating the node in-place.
+      // First try just creating the node in-place.
       KJ_SYSCALL_HANDLE_ERRORS(tryCreate(filename)) {
         case EEXIST:
           // Target exists.
@@ -1117,7 +1117,7 @@ public:
           // Presumably because the target path doesn't exist.
           if (has(mode, WriteMode::CREATE)) {
             KJ_FAIL_ASSERT("rename(tmp, path) claimed path exists but "
-                "renameat2(fromPath, toPath, EXCHANGE) said it doest; concurrent modification?",
+                "renameat2(fromPath, toPath, EXCHANGE) said it doesn't; concurrent modification?",
                 fromPath, toPath) { return false; }
           } else {
             // Assume target doesn't exist.
@@ -1514,8 +1514,8 @@ public:
 
   FSNODE_METHODS(DiskAppendableFile);
 
-  void write(const void* buffer, size_t size) override {
-    FdOutputStream::write(buffer, size);
+  void write(ArrayPtr<const byte> buffer) override {
+    FdOutputStream::write(buffer);
   }
   void write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
     FdOutputStream::write(pieces);
@@ -1706,7 +1706,14 @@ private:
             pwdStat.st_dev == dotStat.st_dev) {
           return kj::mv(result);
         } else {
-          KJ_LOG(WARNING, "PWD environment variable doesn't match current directory", pwd);
+          // It appears PWD doesn't actually point at the current directory. In practice, only
+          // shells tend to update PWD. Other programs, like build tools, may do `chdir()` without
+          // actually updating PWD to match. Arguably they are buggy, but realistically we have to
+          // live with them. So, we will treat an incorrect PWD the same as an absent PWD, and fall
+          // back to using the current directory's canonical path.
+          //
+          // We used to log a WARNING here but it was deemed too noisy, so we changed it to INFO.
+          KJ_LOG(INFO, "PWD environment variable doesn't match current directory", pwd);
         }
       }
     }

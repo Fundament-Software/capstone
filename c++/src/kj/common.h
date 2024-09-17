@@ -73,8 +73,8 @@ KJ_BEGIN_HEADER
 
 #ifdef __GNUC__
   #if __clang__
-    #if __clang_major__ < 11
-      #warning "This library requires at least Clang 11.0."
+    #if __clang_major__ < 14
+      #warning "This library requires at least Clang 14.0."
     #endif
     #if __cplusplus >= 202002L && !(__has_include(<coroutine>) || __has_include(<experimental/coroutine>))
       #warning "Your compiler supports C++20 but your C++ standard library does not.  If your "\
@@ -115,8 +115,12 @@ KJ_BEGIN_HEADER
 #endif
 #endif
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
+#if _MSC_VER < 1920
 #include <intrin.h>  // __popcnt
+#else
+#include <intrin0.h>  // __popcnt
+#endif
 #endif
 
 // =======================================================================================
@@ -275,13 +279,7 @@ typedef unsigned char byte;
 #define KJ_UNUSED_MEMBER
 #endif
 
-#if __cplusplus > 201703L || (__clang__  && __clang_major__ >= 9 && __cplusplus >= 201103L)
-// Technically this was only added to C++20 but Clang allows it for >= C++11 and spelunking the
-// attributes manual indicates it first came in with Clang 9.
 #define KJ_NO_UNIQUE_ADDRESS [[no_unique_address]]
-#else
-#define KJ_NO_UNIQUE_ADDRESS
-#endif
 
 #if KJ_HAS_COMPILER_FEATURE(thread_sanitizer) || defined(__SANITIZE_THREAD__)
 #define KJ_DISABLE_TSAN __attribute__((no_sanitize("thread"), noinline))
@@ -323,10 +321,11 @@ KJ_NORETURN(void unreachable());
 
 }  // namespace _ (private)
 
-#ifdef KJ_DEBUG
 #if _MSC_VER && !defined(__clang__) && (!defined(_MSVC_TRADITIONAL) || _MSVC_TRADITIONAL)
 #define KJ_MSVC_TRADITIONAL_CPP 1
 #endif
+
+#ifdef KJ_DEBUG
 #if KJ_MSVC_TRADITIONAL_CPP
 #define KJ_IREQUIRE(condition, ...) \
     if (KJ_LIKELY(condition)); else ::kj::_::inlineRequireFailure( \
@@ -1839,7 +1838,7 @@ public:
   }
 
   inline constexpr size_t size() const { return size_; }
-  inline const T& operator[](size_t index) const {
+  inline constexpr const T& operator[](size_t index) const {
     KJ_IREQUIRE(index < size_, "Out-of-bounds ArrayPtr access.");
     return ptr[index];
   }
@@ -1848,40 +1847,40 @@ public:
     return ptr[index];
   }
 
-  inline T* begin() { return ptr; }
-  inline T* end() { return ptr + size_; }
-  inline T& front() { return *ptr; }
-  inline T& back() { return *(ptr + size_ - 1); }
+  inline constexpr T* begin() { return ptr; }
+  inline constexpr T* end() { return ptr + size_; }
+  inline constexpr T& front() { return *ptr; }
+  inline constexpr T& back() { return *(ptr + size_ - 1); }
   inline constexpr const T* begin() const { return ptr; }
   inline constexpr const T* end() const { return ptr + size_; }
-  inline const T& front() const { return *ptr; }
-  inline const T& back() const { return *(ptr + size_ - 1); }
+  inline constexpr const T& front() const { return *ptr; }
+  inline constexpr const T& back() const { return *(ptr + size_ - 1); }
 
-  inline ArrayPtr<const T> slice(size_t start, size_t end) const {
+  inline constexpr ArrayPtr<const T> slice(size_t start, size_t end) const {
     KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds ArrayPtr::slice().");
     return ArrayPtr<const T>(ptr + start, end - start);
   }
-  inline ArrayPtr slice(size_t start, size_t end) {
+  inline constexpr ArrayPtr slice(size_t start, size_t end) {
     KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds ArrayPtr::slice().");
     return ArrayPtr(ptr + start, end - start);
   }
-  inline ArrayPtr<const T> slice(size_t start) const {
+  inline constexpr ArrayPtr<const T> slice(size_t start) const {
     KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
     return ArrayPtr<const T>(ptr + start, size_ - start);
   }
-  inline ArrayPtr slice(size_t start) {
+  inline constexpr ArrayPtr slice(size_t start) {
     KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
     return ArrayPtr(ptr + start, size_ - start);
   }
-  inline bool startsWith(const ArrayPtr<const T>& other) const {
+  inline constexpr bool startsWith(const ArrayPtr<const T>& other) const {
     return other.size() <= size_ && slice(0, other.size()) == other;
   }
-  inline bool endsWith(const ArrayPtr<const T>& other) const {
+  inline constexpr bool endsWith(const ArrayPtr<const T>& other) const {
     return other.size() <= size_ && slice(size_ - other.size(), size_) == other;
   }
 
-  inline ArrayPtr first(size_t count) { return slice(0, count); }
-  inline ArrayPtr<const T> first(size_t count) const { return slice(0, count); }
+  inline constexpr ArrayPtr first(size_t count) { return slice(0, count); }
+  inline constexpr ArrayPtr<const T> first(size_t count) const { return slice(0, count); }
 
   inline Maybe<size_t> findFirst(const T& match) const {
     for (size_t i = 0; i < size_; i++) {
@@ -1911,14 +1910,16 @@ public:
     return { reinterpret_cast<PropagateConst<T, char>*>(ptr), size_ * sizeof(T) };
   }
 
-  inline bool operator==(decltype(nullptr)) const { return size_ == 0; }
+  inline constexpr bool operator==(decltype(nullptr)) const { return size_ == 0; }
 
-  inline bool operator==(const ArrayPtr& other) const {
+  inline constexpr bool operator==(const ArrayPtr& other) const {
     if (size_ != other.size_) return false;
+#if __has_feature(cxx_constexpr_string_builtins)
     if (isIntegral<RemoveConst<T>>()) {
       if (size_ == 0) return true;
-      return memcmp(ptr, other.ptr, size_ * sizeof(T)) == 0;
+      return __builtin_memcmp(ptr, other.ptr, size_ * sizeof(T)) == 0;
     }
+#endif
     for (size_t i = 0; i < size_; i++) {
       if (ptr[i] != other[i]) return false;
     }
@@ -1926,13 +1927,37 @@ public:
   }
 
   template <typename U>
-  inline bool operator==(const ArrayPtr<U>& other) const {
+  inline constexpr bool operator==(const ArrayPtr<U>& other) const {
     if (size_ != other.size()) return false;
     for (size_t i = 0; i < size_; i++) {
       if (ptr[i] != other[i]) return false;
     }
     return true;
   }
+
+  inline bool operator<(const ArrayPtr& other) const {
+    size_t comparisonSize = kj::min(size_, other.size_);
+    if constexpr (isSameType<RemoveConst<T>, char>() || isSameType<RemoveConst<T>, unsigned char>()) {
+      int ret = memcmp(ptr, other.ptr, comparisonSize * sizeof(T));
+      if (ret != 0) {
+        return ret < 0;
+      }
+    } else {
+      for (size_t i = 0; i < comparisonSize; i++) {
+        bool ret = ptr[i] == other.ptr[i];
+        if (!ret) {
+          return ptr[i] < other.ptr[i];
+        }
+      }
+    }
+    // arrays are equal up to comparisonSize
+    return size_ <  other.size_;
+  }
+
+  inline bool operator<=(const ArrayPtr& other) const { return !(other < *this); }
+  inline bool operator>=(const ArrayPtr& other) const { return other <= *this; }
+  // Note that only strongly ordered types are currently supported
+  inline bool operator> (const ArrayPtr& other) const { return other < *this; }
 
   template <typename... Attachments>
   Array<T> attach(Attachments&&... attachments) const KJ_WARN_UNUSED_RESULT;
@@ -1946,17 +1971,49 @@ public:
   // Syntax sugar for invoking U::from.
   // Used to chain conversion calls rather than wrap with function.
 
-  inline void fill(T t) { 
+  inline void fill(T t) {
     // Fill the area by copying t over every element.
 
-    for (size_t i = 0; i < size_; i++) { ptr[i] = t; } 
+    for (size_t i = 0; i < size_; i++) { ptr[i] = t; }
     // All modern compilers are smart enough to optimize this loop for simple T's.
     // libc++ std::fill doesn't have memset specialization either.
+  }
+
+  inline void fill(ArrayPtr<const T> other) {
+    // Fill the area by copying each element of other, in sequence, over every element.
+    const size_t otherSize = other.size();
+    KJ_IREQUIRE(otherSize > 0, "fill requires non-empty source array");
+    T* __restrict__ dst = begin();
+    const T* __restrict__ src = other.begin();
+    size_t counter = 0;
+    for (size_t s = size_, i = 0; i < s; i++) {
+      dst[i] = src[counter];
+      if (++counter == otherSize) counter = 0;
+    }
+  }
+
+  inline void copyFrom(kj::ArrayPtr<const T> other) {
+    // Copy data from the other array pointer.
+    // Arrays have to be of the same size and memory area MUST NOT overlap.
+    KJ_IREQUIRE(size_ == other.size(), "copy requires arrays of the same size");
+    KJ_IREQUIRE(!intersects(other), "copy memory area must not overlap");
+    T* __restrict__ dst = begin();
+    const T* __restrict__ src = other.begin();
+    for (size_t s = size_, i = 0; i < s; i++) { dst[i] = src[i]; }
   }
 
 private:
   T* ptr;
   size_t size_;
+
+  inline bool intersects(kj::ArrayPtr<const T> other) const {
+    // Checks if memory area intersects with another pointer.
+
+    // Memory _does not_ intersect if one of the arrays is completely on one side of the other:
+    //    begin() >= other.end() || other.begin() >= end()
+    // Negating the expression gets the result:
+    return begin() < other.end() && other.begin() < end();
+  }
 };
 
 template <>
@@ -2014,10 +2071,21 @@ inline constexpr ArrayPtr<T> arrayPtr(T* begin KJ_LIFETIMEBOUND, T* end KJ_LIFET
   return ArrayPtr<T>(begin, end);
 }
 
+template <typename T>
+inline constexpr ArrayPtr<T> arrayPtr(T& t KJ_LIFETIMEBOUND) {
+  // Construct ArrayPtr pointing to a single object instance.
+  return arrayPtr(&t, 1);
+}
+
 template <typename T, size_t s>
 inline constexpr ArrayPtr<T> arrayPtr(T (&arr)[s]) {
   // Use this function to construct ArrayPtrs without writing out the type name.
   return ArrayPtr<T>(arr);
+}
+
+template <typename... Params>
+auto asBytes(Params&&... params) {
+  return kj::arrayPtr(kj::fwd<Params>(params)...).asBytes();
 }
 
 // =======================================================================================
@@ -2175,12 +2243,40 @@ inline void memzero(T& t) {
   memset(&t, 0, sizeof(T));
 }
 
+namespace _ {
+template <size_t N>
+struct ByteLiteral {
+  // Helper class to implement _kjb suffix: constexpr is not allowed to cast `char*`
+  // to `unsigned char*`. To overcome this limitation every char needs to be cast individually
+  // (which is apparently ok for constexpr).
+  // This class may not contain any private members, or else you get a
+  // misleading compiler error.
+
+  constexpr ByteLiteral(const char (&init)[N]) {
+    for (auto i = 0; i < N-1; ++i) data[i] = (kj::byte)(init[i]);
+  }
+  constexpr size_t size() const { return N - 1; }
+  constexpr const kj::byte* begin() const { return data; }
+  kj::byte data[N-1]; // do not store 0-terminator
+};
+
+template<>
+struct ByteLiteral<1ul> {
+  // Empty string specialization to avoid `data` array of 0 size.
+  constexpr ByteLiteral(const char (&init)[1]) { }
+  constexpr size_t size() const { return 0; }
+  constexpr const kj::byte* begin() const { return nullptr; }
+};
+
+}
+
 }  // namespace kj
 
-constexpr kj::ArrayPtr<const kj::byte> operator "" _kjb(const char* str, size_t n) {
+template <kj::_::ByteLiteral s>
+constexpr kj::ArrayPtr<const kj::byte> operator "" _kjb() {
   // "string"_kjb creates constexpr byte array pointer to the content of the string
   // WITHOUT the trailing 0.
-  return kj::ArrayPtr<const char>(str, n).asBytes();
+  return kj::ArrayPtr<const kj::byte>(s.begin(), s.size());
 };
 
 KJ_END_HEADER

@@ -35,7 +35,6 @@
 #include "../schema-loader.h"
 #include "../dynamic.h"
 #include <kj/miniposix.h>
-#include <unordered_map>
 #include <kj/main.h>
 #include <algorithm>
 #include <map>
@@ -673,7 +672,7 @@ private:
     for (auto requestedFile: request.getRequestedFiles()) {
       genFile(schemaLoader.get(requestedFile.getId())).visit(
           [&](kj::ArrayPtr<const char> text) {
-            out.write(text.begin(), text.size());
+            out.write(text.asBytes());
           });
     }
 

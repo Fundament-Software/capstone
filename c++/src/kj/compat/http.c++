@@ -1770,7 +1770,8 @@ private:
               co_return HttpHeaders::ProtocolError {
                   .statusCode = 431,
                   .statusMessage = "Request Header Fields Too Large",
-                  .description = "header too large." };
+                  .description = "header too large.",
+                  .rawContent = nullptr };
             }
             auto newBuffer = kj::heapArray<char>(headerBuffer.size() * 2);
             memcpy(newBuffer.begin(), headerBuffer.begin(), headerBuffer.size());
@@ -2274,7 +2275,7 @@ public:
     queueWrite(kj::mv(content));
   }
 
-  kj::Promise<void> writeBodyData(const void* buffer, size_t size) {
+  kj::Promise<void> writeBodyData(ArrayPtr<const byte> buffer) {
     KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed");
     KJ_REQUIRE(inBody);
 
@@ -2283,7 +2284,7 @@ public:
     writeQueue = fork.addBranch();
 
     co_await fork;
-    co_await inner.write(buffer, size);
+    co_await inner.write(buffer);
 
     // We intentionally don't use KJ_DEFER to clean this up because if an exception is thrown, we
     // want to block further writes.
@@ -2383,7 +2384,7 @@ private:
     // concurrent writes.
 
     writeQueue = writeQueue.then([this,content=kj::mv(content)]() mutable {
-      auto promise = inner.write(content.begin(), content.size());
+      auto promise = inner.write(content.asBytes());
       return promise.attach(kj::mv(content));
     });
   }
@@ -2436,7 +2437,7 @@ private:
 class HttpNullEntityWriter final: public kj::AsyncOutputStream {
   // Does not inherit HttpEntityBodyWriter because it doesn't actually write anything.
 public:
-  Promise<void> write(const void* buffer, size_t size) override {
+  Promise<void> write(ArrayPtr<const byte> buffer) override {
     return KJ_EXCEPTION(FAILED, "HTTP message has no entity-body; can't write()");
   }
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
@@ -2450,7 +2451,7 @@ public:
 class HttpDiscardingEntityWriter final: public kj::AsyncOutputStream {
   // Does not inherit HttpEntityBodyWriter because it doesn't actually write anything.
 public:
-  Promise<void> write(const void* buffer, size_t size) override {
+  Promise<void> write(ArrayPtr<const byte> buffer) override {
     return kj::READY_NOW;
   }
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
@@ -2468,12 +2469,12 @@ public:
     if (length == 0) doneWriting();
   }
 
-  Promise<void> write(const void* buffer, size_t size) override {
-    if (size == 0) co_return;
-    KJ_REQUIRE(size <= length, "overwrote Content-Length");
-    length -= size;
+  Promise<void> write(ArrayPtr<const byte> buffer) override {
+    if (buffer == nullptr) co_return;
+    KJ_REQUIRE(buffer.size() <= length, "overwrote Content-Length");
+    length -= buffer.size();
 
-    co_await getInner().writeBodyData(buffer, size);
+    co_await getInner().writeBodyData(buffer);
     if (length == 0) doneWriting();
   }
 
@@ -2558,13 +2559,13 @@ public:
     }
   }
 
-  Promise<void> write(const void* buffer, size_t size) override {
-    if (size == 0) return kj::READY_NOW;  // can't encode zero-size chunk since it indicates EOF.
+  Promise<void> write(ArrayPtr<const byte> buffer) override {
+    if (buffer == nullptr) return kj::READY_NOW;  // can't encode zero-size chunk since it indicates EOF.
 
-    auto header = kj::str(kj::hex(size), "\r\n");
+    auto header = kj::str(kj::hex(buffer.size()), "\r\n");
     auto parts = kj::heapArray<ArrayPtr<const byte>>(3);
     parts[0] = header.asBytes();
-    parts[1] = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), size);
+    parts[1] = buffer;
     parts[2] = kj::StringPtr("\r\n").asBytes();
 
     auto promise = getInner().writeBodyData(parts.asPtr());
@@ -2662,24 +2663,17 @@ public:
     return promise.attach(kj::mv(payload));
   }
 
-  kj::Promise<void> disconnect() override {
-    KJ_REQUIRE(!currentlySending, "another message send is already in progress");
+  void disconnect() override {
+    // NOTE: While it's true that disconnect() is UB if called while a send is still in progress,
+    // it would be inappropriate for us to assert !currentlySending here because currentlySending
+    // remains true after a send is canceled, and it is OK to call disconnect() after canceling
+    // a send.
 
-    KJ_IF_SOME(p, sendingControlMessage) {
-      // We recently sent a control message; make sure it's finished before proceeding.
-      currentlySending = true;
-      auto promise = p.then([this]() {
-        currentlySending = false;
-        return disconnect();
-      });
-      sendingControlMessage = kj::none;
-      return promise;
-    }
+    // If we're sending a control message (e.g. a PONG), cancel it.
+    sendingControlMessage = kj::none;
 
     disconnected = true;
-
     stream->shutdownWrite();
-    return kj::READY_NOW;
   }
 
   void abort() override {
@@ -2859,9 +2853,17 @@ public:
             }
             bool addNullTerminator = true;
             // We want to add the null terminator when receiving a TEXT message.
-            auto decompressed = decompressor.processMessage(message, originalMaxSize,
+            auto decompressedOrError = decompressor.processMessage(message, originalMaxSize, 
                 addNullTerminator);
-            return Message(kj::String(decompressed.releaseAsChars()));
+            KJ_SWITCH_ONEOF(decompressedOrError) {
+              KJ_CASE_ONEOF(protocolError, ProtocolError) {
+                return sendCloseDueToError(protocolError.statusCode, protocolError.description)
+                    .attach(kj::mv(decompressedOrError));
+              }
+              KJ_CASE_ONEOF(decompressed, kj::Array<byte>) {
+                return Message(kj::String(decompressed.releaseAsChars()));
+              }
+            }
           }
 #endif // KJ_HAS_ZLIB
           message.back() = '\0';
@@ -2883,8 +2885,17 @@ public:
               // We must reset context on each message.
               decompressor.reset();
             }
-            auto decompressed = decompressor.processMessage(message, originalMaxSize);
-            return Message(decompressed.releaseAsBytes());
+            
+            auto decompressedOrError = decompressor.processMessage(message, originalMaxSize);
+            KJ_SWITCH_ONEOF(decompressedOrError) {
+              KJ_CASE_ONEOF(protocolError, ProtocolError) {
+                return sendCloseDueToError(protocolError.statusCode, protocolError.description)
+                    .attach(kj::mv(decompressedOrError));
+              }
+              KJ_CASE_ONEOF(decompressed, kj::Array<byte>) {
+                return Message(decompressed.releaseAsBytes());
+              }
+            }
           }
 #endif // KJ_HAS_ZLIB
           return Message(message.releaseAsBytes());
@@ -3266,7 +3277,7 @@ private:
 
     KJ_DISALLOW_COPY_AND_MOVE(ZlibContext);
 
-    kj::Array<kj::byte> processMessage(kj::ArrayPtr<const byte> message,
+    kj::OneOf<kj::Array<kj::byte>, ProtocolError> processMessage(kj::ArrayPtr<const byte> message,
         kj::Maybe<size_t> maxSize = kj::none,
         bool addNullTerminator = false) {
       // If `this` is the compressor, calling `processMessage()` will compress the `message`.
@@ -3281,7 +3292,15 @@ private:
       ctx.next_in = const_cast<byte*>(reinterpret_cast<const byte*>(message.begin()));
       ctx.avail_in = message.size();
 
-      kj::Vector<Result> parts(processLoop(maxSize));
+      kj::Vector<Result> parts;
+      KJ_SWITCH_ONEOF(processLoop(maxSize)) {
+        KJ_CASE_ONEOF(protocolError, ProtocolError) {
+          return kj::mv(protocolError);
+        }
+        KJ_CASE_ONEOF(dataParts, kj::Vector<Result>) {
+          parts = kj::mv(dataParts);
+        }
+      }
 
       size_t amountToAllocate = 0;
       for (const auto& part : parts) {
@@ -3364,7 +3383,7 @@ private:
       };
     }
 
-    kj::Vector<Result> processLoop(kj::Maybe<size_t> maxSize) {
+    kj::OneOf<kj::Vector<Result>, ProtocolError> processLoop(kj::Maybe<size_t> maxSize) {
       // Since Zlib buffers the writes, we want to continue processing until there's nothing left.
       kj::Vector<Result> output;
       size_t totalBytesProcessed = 0;
@@ -3379,8 +3398,11 @@ private:
           KJ_IF_SOME(m, maxSize) {
             // This is only non-null for `receive` calls, so we must be decompressing. We don't want
             // the decompressed message to OOM us, so let's make sure it's not too big.
-            KJ_REQUIRE(totalBytesProcessed < m,
-                "Decompressed WebSocket message is too large");
+            if (totalBytesProcessed > m) {
+              return ProtocolError {
+                  .statusCode = 1009,
+                  .description = "Message is too large"};
+            }
           }
         }
 
@@ -3517,16 +3539,24 @@ private:
           // We must reset context on each message.
           compressor.reset();
         }
-        auto& innerMessage = compressedMessage.emplace(compressor.processMessage(message));
-        if (message.size() > 0) {
-          KJ_ASSERT(innerMessage.asPtr().endsWith({0x00, 0x00, 0xFF, 0xFF}));
-          message = innerMessage.first(innerMessage.size() - 4);
-          // Strip 0x00 0x00 0xFF 0xFF off the tail.
-          // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.1
-        } else {
-          // RFC 7692 (7.2.3.6) specifies that an empty uncompressed DEFLATE block (0x00) should be
-          // built if the compression library doesn't generate data when the input is empty.
-          message = compressedMessage.emplace(kj::heapArray<byte>({0x00}));
+        
+        KJ_SWITCH_ONEOF(compressor.processMessage(message)) {
+          KJ_CASE_ONEOF(error, ProtocolError) {
+            KJ_FAIL_REQUIRE("Error compressing websocket message: ", error.description);
+          }
+          KJ_CASE_ONEOF(compressed, kj::Array<byte>) {
+            auto& innerMessage = compressedMessage.emplace(kj::mv(compressed));
+            if (message.size() > 0) {
+              KJ_ASSERT(innerMessage.asPtr().endsWith({0x00, 0x00, 0xFF, 0xFF}));
+              message = innerMessage.first(innerMessage.size() - 4);
+              // Strip 0x00 0x00 0xFF 0xFF off the tail.
+              // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.1
+            } else {
+              // RFC 7692 (7.2.3.6) specifies that an empty uncompressed DEFLATE block (0x00) should
+              // be built if the compression library doesn't generate data when the input is empty.
+              message = compressedMessage.emplace(kj::heapArray<byte>({0x00}));
+            }
+          }
         }
       }
 #endif // KJ_HAS_ZLIB
@@ -3672,7 +3702,7 @@ private:
 
     if (recvData.size() > 0) {
       // We have some data buffered. Write it first.
-      return other.stream->write(recvData.begin(), recvData.size())
+      return other.stream->write(recvData)
           .then([this, &other, size = recvData.size()]() {
         recvData = nullptr;
         other.sentBytes += size;
@@ -3748,12 +3778,14 @@ static kj::Promise<void> pumpWebSocketLoop(WebSocket& from, WebSocket& to) {
       }
     }
     KJ_UNREACHABLE;
-  }, [&to](kj::Exception&& e) {
-    if (e.getType() == kj::Exception::Type::DISCONNECTED) {
-      return to.disconnect();
-    } else {
-      return to.close(1002, e.getDescription());
-    }
+  }, [&to](kj::Exception&& e) -> kj::Promise<void> {
+    // We don't know if it was a read or a write that threw. If it was a read that threw, we need
+    // to send a disconnect on the destination. If it was the destination that threw, it
+    // shouldn't hurt to disconnect() it again, but we'll catch and squelch any exceptions.
+    kj::runCatchingExceptions([&to]() { to.disconnect(); });
+
+    // In any case, this error broke the pump. We should propagate it out as the pump result.
+    return kj::mv(e);
   });
 }
 
@@ -3840,13 +3872,12 @@ public:
           .then([&, size = reason.size()]() { transferredBytes += (2 +size); });
     }
   }
-  kj::Promise<void> disconnect() override {
+  void disconnect() override {
     KJ_IF_SOME(s, state) {
-      return s.disconnect();
+      s.disconnect();
     } else {
       ownState = heap<Disconnected>();
       state = *ownState;
-      return kj::READY_NOW;
     }
   }
   kj::Promise<void> whenAborted() override {
@@ -3972,7 +4003,7 @@ private:
     kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
       KJ_FAIL_ASSERT("another message send is already in progress");
     }
-    kj::Promise<void> disconnect() override {
+    void disconnect() override {
       KJ_FAIL_ASSERT("another message send is already in progress");
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
@@ -4074,7 +4105,7 @@ private:
     kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
       KJ_FAIL_ASSERT("another message send is already in progress");
     }
-    kj::Promise<void> disconnect() override {
+    void disconnect() override {
       KJ_FAIL_ASSERT("another message send is already in progress");
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
@@ -4174,11 +4205,11 @@ private:
       pipe.endState(*this);
       return kj::READY_NOW;
     }
-    kj::Promise<void> disconnect() override {
+    void disconnect() override {
       KJ_REQUIRE(canceler.isEmpty(), "already pumping");
       fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "WebSocket disconnected"));
       pipe.endState(*this);
-      return pipe.disconnect();
+      pipe.disconnect();
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
       KJ_REQUIRE(canceler.isEmpty(), "already pumping");
@@ -4267,19 +4298,13 @@ private:
         kj::throwRecoverableException(kj::mv(e));
       }));
     }
-    kj::Promise<void> disconnect() override {
+    void disconnect() override {
       KJ_REQUIRE(canceler.isEmpty(), "another message send is already in progress");
-      return canceler.wrap(output.disconnect().then([this]() {
-        canceler.release();
-        pipe.endState(*this);
-        fulfiller.fulfill();
-        return pipe.disconnect();
-      }, [this](kj::Exception&& e) {
-        canceler.release();
-        pipe.endState(*this);
-        fulfiller.reject(kj::cp(e));
-        kj::throwRecoverableException(kj::mv(e));
-      }));
+
+      output.disconnect();
+      pipe.endState(*this);
+      fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "WebSocket::disconnect() ended the pump"));
+      pipe.disconnect();
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
       KJ_REQUIRE(canceler.isEmpty(), "another message send is already in progress");
@@ -4338,8 +4363,8 @@ private:
     kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
       KJ_FAIL_REQUIRE("can't close() after disconnect()");
     }
-    kj::Promise<void> disconnect() override {
-      return kj::READY_NOW;
+    void disconnect() override {
+      // redundant; ignore
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
       KJ_FAIL_REQUIRE("can't tryPumpFrom() after disconnect()");
@@ -4382,8 +4407,8 @@ private:
     kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
       return KJ_EXCEPTION(DISCONNECTED, "other end of WebSocketPipe was destroyed");
     }
-    kj::Promise<void> disconnect() override {
-      return KJ_EXCEPTION(DISCONNECTED, "other end of WebSocketPipe was destroyed");
+    void disconnect() override {
+      // redundant; ignore
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
       return kj::Promise<void>(KJ_EXCEPTION(DISCONNECTED,
@@ -4427,8 +4452,8 @@ public:
   kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
     return out->close(code, reason);
   }
-  kj::Promise<void> disconnect() override {
-    return out->disconnect();
+  void disconnect() override {
+    out->disconnect();
   }
   void abort() override {
     in->abort();
@@ -4578,8 +4603,8 @@ public:
   }
 
   // AsyncOutputStream
-  Promise<void> write(const void* buffer, size_t size) override {
-    return stream->write(buffer, size);
+  Promise<void> write(ArrayPtr<const byte> buffer) override {
+    return stream->write(buffer);
   }
 
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
@@ -4599,7 +4624,7 @@ private:
     // If there is any data remaining in the leftover queue, we'll write it out first to output.
     if (leftover.size() > 0) {
       auto bytesToWrite = kj::min(leftover.size(), remaining);
-      return output.write(leftover.begin(), bytesToWrite).then(
+      return output.write(leftover.first(bytesToWrite)).then(
           [this, &output, remaining, total, bytesToWrite]() mutable -> kj::Promise<uint64_t> {
         leftover = leftover.slice(bytesToWrite, leftover.size());
         // If the leftover buffer has been fully consumed, go ahead and free it now.
@@ -4693,12 +4718,12 @@ public:
     }
   }
 
-  Promise<void> write(const void* buffer, size_t size) override {
+  Promise<void> write(ArrayPtr<const byte> buffer) override {
     if (writeGuardReleased) {
-      return inner->write(buffer, size);
+      return inner->write(buffer);
     } else {
-      return writeGuard.addBranch().then([this,buffer,size]() {
-        return inner->write(buffer, size);
+      return writeGuard.addBranch().then([this,buffer]() {
+        return inner->write(buffer);
       });
     }
   }
@@ -5842,8 +5867,8 @@ kj::Promise<uint64_t> PausableReadAsyncIoStream::pumpTo(
   return kj::unoptimizedPumpTo(*this, output, amount);
 }
 
-kj::Promise<void> PausableReadAsyncIoStream::write(const void* buffer, size_t size) {
-  return inner->write(buffer, size).attach(trackWrite());
+kj::Promise<void> PausableReadAsyncIoStream::write(ArrayPtr<const byte> buffer) {
+  return inner->write(buffer).attach(trackWrite());
 }
 
 kj::Promise<void> PausableReadAsyncIoStream::write(
@@ -6092,8 +6117,8 @@ public:
     return inner->pumpTo(output, amount);
   }
 
-  kj::Promise<void> write(const void* buffer, size_t size) override {
-    return inner->write(buffer, size);
+  kj::Promise<void> write(ArrayPtr<const byte> buffer) override {
+    return inner->write(buffer);
   }
 
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
@@ -6926,8 +6951,8 @@ private:
         return afterSendClosed();
       });
     }
-    kj::Promise<void> disconnect() override {
-      return inner->disconnect();
+    void disconnect() override {
+      inner->disconnect();
     }
     void abort() override {
       // Don't need to worry about completion task in this case -- cancelling it is reasonable.
@@ -7325,7 +7350,7 @@ kj::Own<HttpService> newHttpService(HttpClient& client) {
 kj::Promise<void> HttpService::Response::sendError(
     uint statusCode, kj::StringPtr statusText, const HttpHeaders& headers) {
   auto stream = send(statusCode, statusText, headers, statusText.size());
-  auto promise = stream->write(statusText.begin(), statusText.size());
+  auto promise = stream->write(statusText.asBytes());
   return promise.attach(kj::mv(stream));
 }
 
@@ -7895,7 +7920,6 @@ private:
     httpOutput.writeHeaders(headers.serializeResponse(
         statusCode, statusText, connectionHeadersArray));
 
-    kj::Own<kj::AsyncOutputStream> bodyStream;
     if (isHeadRequest) {
       // Ignore entity-body.
       httpOutput.finishBody();
@@ -8033,54 +8057,13 @@ private:
     // The client committed a protocol error during a WebSocket handshake. We will send an error
     // response back to them, and throw an exception from `acceptWebSocket()` to our app. We'll
     // label this as a DISCONNECTED exception, as if the client had simply closed the connection
-    // rather than commiting a protocol error. This is intended to let the server know that it
+    // rather than committing a protocol error. This is intended to let the server know that it
     // wasn't an error on the server's part. (This is a big of a hack...)
     kj::Exception exception = KJ_EXCEPTION(DISCONNECTED,
         "received bad WebSocket handshake", errorMessage);
     webSocketError = sendError(
         HttpHeaders::ProtocolError { 400, "Bad Request", errorMessage, nullptr });
-    kj::throwRecoverableException(kj::mv(exception));
-
-    // Fallback path when exceptions are disabled.
-    class BrokenWebSocket final: public WebSocket {
-    public:
-      BrokenWebSocket(kj::Exception exception): exception(kj::mv(exception)) {}
-
-      kj::Promise<void> send(kj::ArrayPtr<const byte> message) override {
-        return kj::cp(exception);
-      }
-      kj::Promise<void> send(kj::ArrayPtr<const char> message) override {
-        return kj::cp(exception);
-      }
-      kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
-        return kj::cp(exception);
-      }
-      kj::Promise<void> disconnect() override {
-        return kj::cp(exception);
-      }
-      void abort() override {
-        kj::throwRecoverableException(kj::cp(exception));
-      }
-      kj::Promise<void> whenAborted() override {
-        return kj::cp(exception);
-      }
-      kj::Promise<Message> receive(size_t maxSize) override {
-        return kj::cp(exception);
-      }
-
-      uint64_t sentByteCount() override { KJ_FAIL_ASSERT("received bad WebSocket handshake"); }
-      uint64_t receivedByteCount() override { KJ_FAIL_ASSERT("received bad WebSocket handshake"); }
-
-      kj::Maybe<kj::String> getPreferredExtensions(ExtensionsContext ctx) override {
-        KJ_FAIL_ASSERT(kj::cp(exception));
-      };
-
-    private:
-      kj::Exception exception;
-    };
-
-    return kj::heap<BrokenWebSocket>(KJ_EXCEPTION(FAILED,
-        "received bad WebSocket handshake", errorMessage));
+    kj::throwFatalException(kj::mv(exception));
   }
 
   kj::Own<kj::AsyncIoStream> getConnectStream() {
@@ -8295,8 +8278,7 @@ kj::Promise<void> HttpServerErrorHandler::handleClientProtocolError(
   auto body = response.send(protocolError.statusCode, protocolError.statusMessage,
                             headers, errorMessage.size());
 
-  return body->write(errorMessage.begin(), errorMessage.size())
-      .attach(kj::mv(errorMessage), kj::mv(body));
+  return body->write(errorMessage.asBytes()).attach(kj::mv(errorMessage), kj::mv(body));
 }
 
 kj::Promise<void> HttpServerErrorHandler::handleApplicationError(
@@ -8338,8 +8320,7 @@ kj::Promise<void> HttpServerErrorHandler::handleApplicationError(
       body = r.send(500, "Internal Server Error", headers, errorMessage.size());
     }
 
-    return body->write(errorMessage.begin(), errorMessage.size())
-        .attach(kj::mv(errorMessage), kj::mv(body));
+    return body->write(errorMessage.asBytes()).attach(kj::mv(errorMessage), kj::mv(body));
   }
 
   KJ_LOG(ERROR, "HttpService threw exception after generating a partial response",
@@ -8359,7 +8340,7 @@ kj::Promise<void> HttpServerErrorHandler::handleNoResponse(kj::HttpService::Resp
   constexpr auto errorMessage = "ERROR: The HttpService did not generate a response."_kj;
   auto body = response.send(500, "Internal Server Error", headers, errorMessage.size());
 
-  return body->write(errorMessage.begin(), errorMessage.size()).attach(kj::mv(body));
+  return body->write(errorMessage.asBytes()).attach(kj::mv(body));
 }
 
 } // namespace kj

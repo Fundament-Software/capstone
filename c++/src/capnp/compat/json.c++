@@ -20,6 +20,7 @@
 // THE SOFTWARE.
 
 #include "json.h"
+#include <capnp/message.h>
 #include <capnp/orphan.h>
 #include <kj/debug.h>
 #include <kj/function.h>
@@ -400,6 +401,10 @@ void JsonCodec::decodeObject(JsonValue::Reader input, StructSchema type, Orphana
   }
 }
 
+bool isPointerToJsonNull(JsonValue::Reader input, Type type) {
+  return input.isNull() && (type.isText() || type.isData() || type.isList() || type.isStruct());
+}
+
 void JsonCodec::decodeField(StructSchema::Field fieldSchema, JsonValue::Reader fieldValue,
                             Orphanage orphanage, DynamicStruct::Builder output) const {
   auto fieldType = fieldSchema.getType();
@@ -407,7 +412,11 @@ void JsonCodec::decodeField(StructSchema::Field fieldSchema, JsonValue::Reader f
   KJ_IF_SOME(handler, impl->fieldHandlers.find(fieldSchema)) {
     output.adopt(fieldSchema, handler->decodeBase(*this, fieldValue, fieldType, orphanage));
   } else {
-    output.adopt(fieldSchema, decode(fieldValue, fieldType, orphanage));
+    if (!isPointerToJsonNull(fieldValue, fieldType)) {
+      // If the schema type is a pointer type and the json value is null, we act as if the value
+      // doesn't exist.
+      output.adopt(fieldSchema, decode(fieldValue, fieldType, orphanage));
+    }
   }
 }
 
@@ -904,24 +913,26 @@ static constexpr uint64_t JSON_HEX_ANNOTATION_ID = 0xf061e22f0ae5c7b5ull;
 
 class JsonCodec::Base64Handler final: public JsonCodec::Handler<capnp::Data> {
 public:
-  void encode(const JsonCodec& codec, capnp::Data::Reader input, JsonValue::Builder output) const {
+  void encode(const JsonCodec& codec, capnp::Data::Reader input,
+              JsonValue::Builder output) const override {
     output.setString(kj::encodeBase64(input));
   }
 
   Orphan<capnp::Data> decode(const JsonCodec& codec, JsonValue::Reader input,
-                             Orphanage orphanage) const {
+                             Orphanage orphanage) const override {
     return orphanage.newOrphanCopy(capnp::Data::Reader(kj::decodeBase64(input.getString())));
   }
 };
 
 class JsonCodec::HexHandler final: public JsonCodec::Handler<capnp::Data> {
 public:
-  void encode(const JsonCodec& codec, capnp::Data::Reader input, JsonValue::Builder output) const {
+  void encode(const JsonCodec& codec, capnp::Data::Reader input,
+              JsonValue::Builder output) const override {
     output.setString(kj::encodeHex(input));
   }
 
   Orphan<capnp::Data> decode(const JsonCodec& codec, JsonValue::Reader input,
-                             Orphanage orphanage) const {
+                             Orphanage orphanage) const override {
     return orphanage.newOrphanCopy(capnp::Data::Reader(kj::decodeHex(input.getString())));
   }
 };

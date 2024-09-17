@@ -22,7 +22,7 @@
 #pragma once
 
 #include <capnp/test.capnp.h>
-#include <iostream>
+#include <initializer_list>
 #include <capnp/blob.h>
 #include <kj/compat/gtest.h>
 
@@ -81,6 +81,7 @@ using ::capnproto_test::capnp::test::TestUnionDefaults;
 using ::capnproto_test::capnp::test::TestNestedTypes;
 using ::capnproto_test::capnp::test::TestUsing;
 using ::capnproto_test::capnp::test::TestListDefaults;
+using ::capnproto_test::capnp::test::TestInterleavedGroups;
 
 void initTestMessage(TestAllTypes::Builder builder);
 void initTestMessage(TestDefaults::Builder builder);
@@ -184,14 +185,20 @@ void checkList(T reader, std::initializer_list<ReaderFor<Element>> expected) {
 
 class TestInterfaceImpl final: public test::TestInterface::Server {
 public:
-  TestInterfaceImpl(int& callCount);
+  TestInterfaceImpl(int& callCount, kj::Maybe<int&> handleCount = kj::none);
 
   kj::Promise<void> foo(FooContext context) override;
 
   kj::Promise<void> baz(BazContext context) override;
 
+  kj::Promise<void> getTestPipeline(GetTestPipelineContext context) override;
+  kj::Promise<void> getTestTailCallee(GetTestTailCalleeContext context) override;
+  kj::Promise<void> getTestTailCaller(GetTestTailCallerContext context) override;
+  kj::Promise<void> getTestMoreStuff(GetTestMoreStuffContext context) override;
+
 private:
   int& callCount;
+  kj::Maybe<int&> handleCount;
 };
 
 class TestExtendsImpl final: public test::TestExtends2::Server {
@@ -303,7 +310,7 @@ public:
     fulfiller->fulfill();
   }
 
-  kj::Promise<void> foo(FooContext context) {
+  kj::Promise<void> foo(FooContext context) override {
     return impl.foo(context);
   }
 

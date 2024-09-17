@@ -196,8 +196,11 @@ public:
 
   inline Promise(decltype(nullptr)) {}
 
-  template <typename Func, typename ErrorFunc = _::PropagateException>
-  PromiseForResult<Func, T> then(Func&& func, ErrorFunc&& errorHandler = _::PropagateException(),
+  template <typename Func>
+  PromiseForResult<Func, T> then(Func&& func) KJ_WARN_UNUSED_RESULT;
+
+  template <typename Func, typename ErrorFunc>
+  PromiseForResult<Func, T> then(Func&& func, ErrorFunc&& errorHandler,
                                  SourceLocation location = {}) KJ_WARN_UNUSED_RESULT;
   // Register a continuation function to be executed when the promise completes.  The continuation
   // (`func`) takes the promised value (an rvalue of type `T`) as its parameter.  The continuation
@@ -459,6 +462,14 @@ PromiseForResult<Func, void> evalLast(Func&& func) KJ_WARN_UNUSED_RESULT;
 // callback enqueues new events, then latter callbacks will not execute until those events are
 // drained.
 
+Promise<void> yield();
+// Like `eval()`, but without a function to be evaluated. Useful for yielding control temporarily
+// to serialize actions or schedule other actions for a later time using promise continuations.
+
+Promise<void> yieldUntilQueueEmpty();
+// Like `evalLast()`, but without a function to be evaluated. Useful for yielding control until the
+// event queue is otherwise completely empty and the thread is about to suspend waiting for I/O.
+
 ArrayPtr<void* const> getAsyncTrace(ArrayPtr<void*> space);
 kj::String getAsyncTrace();
 // If the event loop is currently running in this thread, get a trace back through the promise
@@ -689,10 +700,10 @@ public:
   virtual void fulfill(T&& value) = 0;
   // Fulfill the promise with the given value.
 
-  virtual void reject(Exception&& exception) = 0;
+  virtual void reject(Exception&& exception) override = 0;
   // Reject the promise with an error.
 
-  virtual bool isWaiting() = 0;
+  virtual bool isWaiting() override = 0;
   // Returns true if the promise is still unfulfilled and someone is potentially waiting for it.
   // Returns false if fulfill()/reject() has already been called *or* if the promise to be
   // fulfilled has been discarded and therefore the result will never be used anyway.
@@ -713,8 +724,8 @@ public:
   // Call with zero parameters.  The parameter is a dummy that only exists so that subclasses don't
   // have to specialize for <void>.
 
-  virtual void reject(Exception&& exception) = 0;
-  virtual bool isWaiting() = 0;
+  void reject(Exception&& exception) override = 0;
+  bool isWaiting() override = 0;
 
   template <typename Func>
   bool rejectIfThrows(Func&& func);

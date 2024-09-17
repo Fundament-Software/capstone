@@ -27,6 +27,7 @@
 
 #include "test.h"
 #include "main.h"
+#include <kj/glob-filter.h>
 #include "io.h"
 #include "miniposix.h"
 #include <stdlib.h>
@@ -302,7 +303,7 @@ private:
   };
 
   void write(StringPtr text) {
-    FdOutputStream(STDOUT_FILENO).write(text.begin(), text.size());
+    FdOutputStream(STDOUT_FILENO).write(text.asBytes());
   }
 
   void write(Color color, StringPtr prefix, StringPtr message) {

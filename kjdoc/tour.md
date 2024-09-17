@@ -435,7 +435,7 @@ These wrappers perform some extra bookkeeping:
 
 ### Supporting `-fno-exceptions`
 
-_NOTE: In KJ / Cap'n Proto v2.0, support for `-fno-exceptions` has been removed, making this section somewhat obsolete. However, instances of recovery blocks still apear in the codebase, and they may still be relevant in the case of destructors, where they protect against throwing during unwind. Recovery blocks appearing anywhere other than destructors or code called from destructors can safely be deleted._
+_NOTE: In KJ / Cap'n Proto v2.0, support for `-fno-exceptions` has been removed, making this section somewhat obsolete. However, instances of recovery blocks still appear in the codebase, and they may still be relevant in the case of destructors, where they protect against throwing during unwind. Recovery blocks appearing anywhere other than destructors or code called from destructors can safely be deleted._
 
 KJ strongly recommends using C++ exceptions. However, exceptions are controversial, and many C++ applications are compiled with exceptions disabled. Some KJ-based libraries (especially Cap'n Proto) would like to accommodate such users. To that end, KJ's exception and assertion infrastructure is designed to degrade gracefully when compiled without exception support. In this case, exceptions are split into two types:
 
@@ -536,9 +536,6 @@ This section describes KJ APIs that control process execution and low-level inte
 
 `kj::Lazy<T>` is an instance of `T` that is constructed on first access in a thread-safe way.
 
-Macros `KJ_TRACK_LOCK_BLOCKING` and `KJ_SAVE_ACQUIRED_LOCK_INFO` can be used to enable support utilities to implement deadlock detection & analysis.
-* `KJ_TRACK_LOCK_BLOCKING`: When the current thread is doing a blocking synchronous KJ operation, that operation is available via `kj::blockedReason()` (intention is for this to be invoked from the signal handler running on the thread that's doing the synchronous operation).
-* `KJ_SAVE_ACQUIRED_LOCK_INFO`: When enabled, lock acquisition will save state about the location of the acquired lock. When combined with `KJ_TRACK_LOCK_BLOCKING` this can be particularly helpful because any watchdog can just forward the signal to the thread that's holding the lock.
 ## Asynchronous Event Loop
 
 ### Promises

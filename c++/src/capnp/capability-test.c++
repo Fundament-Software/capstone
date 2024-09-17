@@ -35,6 +35,7 @@
 #include "test-util.h"
 #include <kj/debug.h>
 #include <kj/compat/gtest.h>
+#include <capnp/message.h>
 
 namespace capnp {
 namespace _ {
@@ -305,8 +306,8 @@ TEST(Capability, AsyncCancelation) {
       returned = true;
     }).eagerlyEvaluate(nullptr);
   }
-  kj::evalLater([]() {}).wait(waitScope);
-  kj::evalLater([]() {}).wait(waitScope);
+  kj::yield().wait(waitScope);
+  kj::yield().wait(waitScope);
 
   // We can detect that the method was canceled because it will drop the cap.
   EXPECT_FALSE(destroyed);
@@ -492,7 +493,7 @@ public:
   int& callCount;
 
   kj::Promise<void> call(InterfaceSchema::Method method,
-                         CallContext<DynamicStruct, DynamicStruct> context) {
+                         CallContext<DynamicStruct, DynamicStruct> context) override {
     auto methodName = method.getProto().getName();
     if (methodName == "foo") {
       ++callCount;
@@ -566,7 +567,7 @@ public:
   int& callCount;
 
   kj::Promise<void> call(InterfaceSchema::Method method,
-                         CallContext<DynamicStruct, DynamicStruct> context) {
+                         CallContext<DynamicStruct, DynamicStruct> context) override {
     auto methodName = method.getProto().getName();
     if (methodName == "foo") {
       ++callCount;
@@ -626,7 +627,7 @@ public:
   int& callCount;
 
   kj::Promise<void> call(InterfaceSchema::Method method,
-                         CallContext<DynamicStruct, DynamicStruct> context) {
+                         CallContext<DynamicStruct, DynamicStruct> context) override {
     auto methodName = method.getProto().getName();
     if (methodName == "getCap") {
       ++callCount;
@@ -719,7 +720,7 @@ public:
   int& callCount;
 
   kj::Promise<void> call(InterfaceSchema::Method method,
-                         CallContext<DynamicStruct, DynamicStruct> context) {
+                         CallContext<DynamicStruct, DynamicStruct> context) override {
     auto methodName = method.getProto().getName();
     if (methodName == "foo") {
       ++callCount;
@@ -1008,10 +1009,10 @@ TEST(Capability, CapabilityServerSet) {
   EXPECT_EQ(&server2, &KJ_ASSERT_NONNULL(set2.getLocalServer(client2).wait(waitScope)));
 
   // Getting the local server using the wrong set doesn't work.
-  EXPECT_TRUE(set1.getLocalServer(client2).wait(waitScope) == nullptr);
-  EXPECT_TRUE(set2.getLocalServer(client1).wait(waitScope) == nullptr);
-  EXPECT_TRUE(set1.getLocalServer(clientStandalone).wait(waitScope) == nullptr);
-  EXPECT_TRUE(set1.getLocalServer(clientNull).wait(waitScope) == nullptr);
+  EXPECT_TRUE(set1.getLocalServer(client2).wait(waitScope) == kj::none);
+  EXPECT_TRUE(set2.getLocalServer(client1).wait(waitScope) == kj::none);
+  EXPECT_TRUE(set1.getLocalServer(clientStandalone).wait(waitScope) == kj::none);
+  EXPECT_TRUE(set1.getLocalServer(clientNull).wait(waitScope) == kj::none);
 
   // A promise client waits to be resolved.
   auto paf = kj::newPromiseAndFulfiller<test::TestInterface::Client>();
@@ -1029,7 +1030,7 @@ TEST(Capability, CapabilityServerSet) {
   auto promise2 = set2.getLocalServer(clientPromise)
       .then([&](kj::Maybe<test::TestInterface::Server&> server) {
     resolved2 = true;
-    EXPECT_TRUE(server == nullptr);
+    EXPECT_TRUE(server == kj::none);
   });
   auto promise3 = set1.getLocalServer(errorPromise)
       .then([&](kj::Maybe<test::TestInterface::Server&> server) {
@@ -1039,10 +1040,10 @@ TEST(Capability, CapabilityServerSet) {
     KJ_EXPECT(e.getDescription().endsWith("foo"), e.getDescription());
   });
 
-  kj::evalLater([](){}).wait(waitScope);
-  kj::evalLater([](){}).wait(waitScope);
-  kj::evalLater([](){}).wait(waitScope);
-  kj::evalLater([](){}).wait(waitScope);
+  kj::yield().wait(waitScope);
+  kj::yield().wait(waitScope);
+  kj::yield().wait(waitScope);
+  kj::yield().wait(waitScope);
 
   EXPECT_FALSE(resolved1);
   EXPECT_FALSE(resolved2);
@@ -1070,7 +1071,7 @@ public:
   }
 
 protected:
-  kj::Promise<void> bar(BarContext context) {
+  kj::Promise<void> bar(BarContext context) override {
     ++callCount;
     return kj::READY_NOW;
   }

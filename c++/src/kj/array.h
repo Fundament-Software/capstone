@@ -159,12 +159,12 @@ public:
     return ArrayPtr<T>(ptr, size_);
   }
 
-  inline size_t size() const { return size_; }
-  inline T& operator[](size_t index) KJ_LIFETIMEBOUND {
+  inline constexpr size_t size() const { return size_; }
+  inline constexpr T& operator[](size_t index) KJ_LIFETIMEBOUND {
     KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
     return ptr[index];
   }
-  inline const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
+  inline constexpr const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
     KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
     return ptr[index];
   }
@@ -322,6 +322,15 @@ template <typename T, typename Iterator> Array<T> heapArray(Iterator begin, Iter
 template <typename T> Array<T> heapArray(std::initializer_list<T> init);
 // Allocate a heap array containing a copy of the given content.
 
+template <typename T, typename = EnableIf<KJ_HAS_TRIVIAL_CONSTRUCTOR(T)>>
+inline Array<T> heapArray(size_t size, T t) {
+  // Allocate array pre-filled with t.
+  // TODO: implement for complex T types without creating `size` instances first.
+  Array<T> array = heapArray<T>(size);
+  array.asPtr().fill(t);
+  return array;
+}
+
 template <typename T, typename Container>
 Array<T> heapArrayFromIterable(Container&& a) { return heapArray<T>(a.begin(), a.end()); }
 template <typename T>
@@ -433,7 +442,9 @@ public:
 
     T* target = ptr + size;
     if (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
-      pos = target;
+      // const_cast is safe here because the member won't ever be dereferenced because it 
+      // points to the end of the segment.
+      pos = const_cast<RemoveConst<T>*>(target);
     } else {
       while (pos > target) {
         kj::dtor(*--pos);
@@ -443,7 +454,9 @@ public:
 
   void clear() {
     if (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
-      pos = ptr;
+      // const_cast is safe here because the member won't ever be dereferenced because it 
+      // points to the end of the segment.
+      pos = const_cast<RemoveConst<T>*>(ptr);
     } else {
       while (pos > ptr) {
         kj::dtor(*--pos);
@@ -458,7 +471,9 @@ public:
     if (target > pos) {
       // expand
       if (KJ_HAS_TRIVIAL_CONSTRUCTOR(T)) {
-        pos = target;
+        // const_cast is safe here because the member won't ever be dereferenced because it 
+        // points to the end of the segment.
+        pos = const_cast<RemoveConst<T>*>(target);
       } else {
         while (pos < target) {
           kj::ctor(*pos++);
@@ -467,7 +482,9 @@ public:
     } else {
       // truncate
       if (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
-        pos = target;
+        // const_cast is safe here because the member won't ever be dereferenced because it 
+        // points to the end of the segment.
+        pos = const_cast<RemoveConst<T>*>(target);
       } else {
         while (pos > target) {
           kj::dtor(*--pos);
