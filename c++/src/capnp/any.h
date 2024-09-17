@@ -1049,10 +1049,10 @@ struct PointerHelpers<TypedAnyList<T>, K> {
     //return typename TypedAnyList<T>::Builder(TypedAnyList<T>::initPointer(builder, size));
     if (ElementSize::INLINE_COMPOSITE == _::elementSizeForType<T>())
     {
-      return TypedAnyList<T>::Builder(builder.initStructList(bounded(size) * ELEMENTS, _::structSize<T>()));
+      return typename TypedAnyList<T>::Builder(builder.initStructList(bounded(size) * ELEMENTS, _::structSize<T>()));
     }
     else {
-      return TypedAnyList<T>::Builder(builder.initList(
+      return typename TypedAnyList<T>::Builder(builder.initList(
         _::elementSizeForType<T>(), bounded(size) * ELEMENTS));
     }
   }

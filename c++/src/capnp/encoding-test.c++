@@ -1981,7 +1981,7 @@ TEST(Encoding, UnionInGenerics) {
   reader.hasListFoo();
   builder.hasListFoo();
 
-  auto list = builder.initListFoo(3);
+  [[maybe_unused]] auto list = builder.initListFoo(3);
 }
 
 KJ_TEST("Test generic passthrough doesn't corrupt list contents") {
@@ -2009,7 +2009,7 @@ KJ_TEST("Test generic passthrough doesn't corrupt list contents") {
 KJ_TEST("Test generic passthrough anypointer representation") {
   MallocMessageBuilder message;
   auto builder = message.initRoot<test::TestGenerics<test::TestAnyPointer, test::TestAnyPointer>>();
-  auto reader = builder.asReader();
+  [[maybe_unused]] auto reader = builder.asReader();
 
   auto list = builder.initListFoo(3);
 
@@ -2032,7 +2032,7 @@ KJ_TEST("Test generic passthrough interface") {
   MallocMessageBuilder message;
   auto builder = message.initRoot<test::TestGenerics<TestAllTypes, TestAllTypes>>();
   const int COUNT = 3;
-  auto list = builder.initListFoo(COUNT);
+  [[maybe_unused]] auto list = builder.initListFoo(COUNT);
   
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);

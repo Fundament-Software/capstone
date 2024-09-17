@@ -5,8 +5,10 @@
 #include <capnp/compiler/parser.h>
 #include <capnp/compiler/module-loader.h>
 #include <capnp/serialize.h>
+#include <kj/filesystem.h>
 #include <kj/map.h>
 #include <utility>
+#include <exception>
 
 using namespace capnp;
 using namespace compiler;
