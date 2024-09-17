@@ -520,16 +520,19 @@ private:
 
       case schema::Type::LIST: {
         CppTypeName result = CppTypeName::makeNamespace("capnp");
-        const char* listType = "List";
         auto list = type.asList();
         if (list.getElementType().which() == schema::Type::ANY_POINTER) {
-          KJ_IF_SOME(_, list.getElementType().getBrandParameter()) {
-            listType = "TypedAnyList";
+          if(!(list.getElementType().getBrandParameter() == kj::none)) {
+            auto params = kj::heapArrayBuilder<CppTypeName>(1);
+            params.add(typeName(list.getElementType(), method));
+            result.addMemberTemplate("TypedAnyList", params.finish());
+            return result;
           }
         }
-        auto params = kj::heapArrayBuilder<CppTypeName>(1);
+        auto params = kj::heapArrayBuilder<CppTypeName>(2);
         params.add(typeName(list.getElementType(), method));
-        result.addMemberTemplate(listType, params.finish());
+        params.add(whichKind(list.getElementType()));
+        result.addMemberTemplate("List", params.finish());
         return result;
       }
 
