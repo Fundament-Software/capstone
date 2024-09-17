@@ -85,7 +85,6 @@ fn main() -> eyre::Result<()> {
     build.flag_if_supported("/Zc:__cplusplus");
     build.flag_if_supported("/EHsc");
     build.flag_if_supported("/TP");
-    build.flag_if_supported("/ShowIncludes");
 
     kj_configure(
         &mut build,
