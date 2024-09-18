@@ -40,7 +40,6 @@ pub fn kj_configure(build: &mut cc::Build, heavy: bool, track: bool, save: bool)
         build.define("CAPNP_LITE", None);
     }
     build
-        .define("KJ_CONTENTION_WARNING_THRESHOLD", "100")
         .define("KJ_SAVE_ACQUIRED_LOCK_INFO", bool_int_str(save))
         .define("KJ_TRACK_LOCK_BLOCKING", bool_int_str(track))
 }
