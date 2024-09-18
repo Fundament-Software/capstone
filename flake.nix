@@ -39,24 +39,6 @@
 
     in
     rec {
-      capnproto = pkgs.llvmPackages_15.stdenv.mkDerivation {
-        pname = "capnproto";
-        version = "2.0";
-        dontStrip = true;
-        src = ./.;
-        enableParallelBuilding = true;
-
-        nativeBuildInputs = [ pkgs.cmake ];
-        buildInputs = [
-          pkgs.zlib
-          pkgs.openssl
-        ];
-
-        cmakeFlags = [ ];
-
-        outputs = [ "out" ];
-      };
-
       devShell = (pkgs.mkShell.override { stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv; }) {
         buildInputs = with pkgs; [
           openssl
@@ -77,6 +59,21 @@
       };
 
       default = { };
+
+      # capnproto = pkgs.llvmPackages_15.stdenv.mkDerivation {
+      #   pname = "capnproto";
+      #   version = "2.0";
+      #   dontStrip = true;
+      #   src = ./.;
+      #   enableParallelBuilding = true;
+      #   nativeBuildInputs = [ pkgs.cmake ];
+      #   buildInputs = [
+      #     pkgs.zlib
+      #     pkgs.openssl
+      #   ];
+      #   cmakeFlags = [ ];
+      #   outputs = [ "out" ];
+      # };
 
       checks =
         let
@@ -110,7 +107,7 @@
             pname = "${pname}-clippy";
             cargoClippyExtraArgs = "-- --deny warnings";
 
-            buildInputs = with pkgs; [ openssl pkg-config capnproto cmake ];
+            buildInputs = with pkgs; [ openssl pkg-config ];
           };
 
           # Check formatting
@@ -134,7 +131,7 @@
             partitions = 1;
             partitionType = "count";
 
-            buildInputs = with pkgs; [ openssl pkg-config capnproto cmake ];
+            buildInputs = with pkgs; [ openssl pkg-config ];
           };
         };
     });
