@@ -56,6 +56,7 @@
         # fetch with cli instead of native
         CARGO_NET_GIT_FETCH_WITH_CLI = "true";
         RUST_BACKTRACE = 1;
+        RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
       };
 
       default = { };
@@ -79,19 +80,22 @@
         let
           craneLib =
             (inputs.crane.mkLib pkgs).overrideToolchain rust-custom-toolchain;
-          src = ./.;
+          commonArgs = {
+            src = ./.;
+            buildInputs = with pkgs; [ pkg-config openssl zlib ];
+            strictDeps = true;
+            version = "0.1.0";
+            stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv;
+            CARGO_BUILD_RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
+          };
           pname = "capnp-checks";
-          version = "0.1.0";
-          stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv;
 
-          cargoArtifacts = craneLib.buildDepsOnly {
-            inherit src pname version stdenv;
-            buildInputs = with pkgs; [ pkg-config openssl zlib ];
-          };
-          build-tests = craneLib.buildPackage {
-            inherit cargoArtifacts src pname version stdenv;
-            buildInputs = with pkgs; [ pkg-config openssl zlib ];
-          };
+          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+            inherit pname;
+          } );
+          build-tests = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts pname;
+          } );
         in
         {
           inherit build-tests;
@@ -102,37 +106,31 @@
           # Note that this is done as a separate derivation so that
           # we can block the CI if there are issues here, but not
           # prevent downstream consumers from building our crate by itself.
-          capnp-clippy = craneLib.cargoClippy {
-            inherit cargoArtifacts src stdenv version;
+          capnp-clippy = craneLib.cargoClippy (commonArgs // {
+            inherit cargoArtifacts;
             pname = "${pname}-clippy";
             cargoClippyExtraArgs = "-- --deny warnings";
-
-            buildInputs = with pkgs; [ openssl pkg-config ];
-          };
+          } );
 
           # Check formatting
-          capnp-fmt = craneLib.cargoFmt {
-            inherit src stdenv version;
+          capnp-fmt = craneLib.cargoFmt (commonArgs // {
             pname = "${pname}-fmt";
-          };
+          } );
 
           # Audit dependencies
-          capnp-audit = craneLib.cargoAudit {
-            inherit src stdenv version;
+          capnp-audit = craneLib.cargoAudit (commonArgs // {
             pname = "${pname}-audit";
             advisory-db = inputs.advisory-db;
             cargoAuditExtraArgs = "--ignore RUSTSEC-2020-0071";
-          };
+          } );
 
           # Run tests with cargo-nextest
-          capnp-nextest = craneLib.cargoNextest {
-            inherit cargoArtifacts src stdenv version;
+          capnp-nextest = craneLib.cargoNextest (commonArgs // {
+            inherit cargoArtifacts;
             pname = "${pname}-nextest";
             partitions = 1;
             partitionType = "count";
-
-            buildInputs = with pkgs; [ openssl pkg-config ];
-          };
+          } );
         };
     });
 }

@@ -3,11 +3,6 @@ use eyre::Result;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-const FILE_LOCATION: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../../samples/addressbook.capnp"
-);
-
 fn get_samples_dir() -> Result<PathBuf> {
     let output = std::process::Command::new(env!("CARGO"))
         .arg("locate-project")
@@ -25,7 +20,7 @@ fn get_samples_dir() -> Result<PathBuf> {
 #[test]
 fn test_address_book() {
     let path = get_samples_dir().unwrap().join("addressbook.capnp");
-    let bytes = call(
+    let _bytes = call(
         [path.to_string_lossy()].into_iter(),
         Vec::<String>::new().into_iter(),
         Vec::<String>::new().into_iter(),

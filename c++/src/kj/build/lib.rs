@@ -17,8 +17,16 @@ pub fn stage_files(
                 .ok_or_else(|| eyre!("non–UTF-8 path: {:?}", path))?
         );
         let target = to.as_ref().join(file.as_ref());
-        std::fs::copy(&path, &target)
-            .map_err(|_| eyre!("Failed to copy {} to {}", path.display(), target.display()))?;
+        if !(std::fs::exists(&target)?) {
+            std::fs::copy(&path, &target).map_err(|e| {
+                eyre!(
+                    "Failed to copy {} to {}: {}",
+                    path.display(),
+                    target.display(),
+                    e.to_string()
+                )
+            })?;
+        }
         if compile {
             build.file(target);
         }
