@@ -30,7 +30,6 @@ static CAPNPC_HEADERS: &[&str] = &[
     "module-loader.h",
     "resolver.h",
 ];
-static CAPNPC_PRIVATE_HEADERS: &[&str] = &["../kj/miniposix.h"];
 
 fn main() -> eyre::Result<()> {
     let out_dir = env::var_os("OUT_DIR").ok_or_else(|| eyre!("OUT_DIR not set"))?;
@@ -44,7 +43,6 @@ fn main() -> eyre::Result<()> {
 
     CAPNPC_HEADERS
         .iter()
-        .chain(CAPNPC_PRIVATE_HEADERS)
         .chain(CAPNPC_EXTRAS)
         .chain(["glue.h"].iter())
         .map(|s| source_dir.join(s))
