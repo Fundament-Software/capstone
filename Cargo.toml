@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "c++/src/capnp/compiler/rust",
-    "c++/src/capnp/rust",
-    "c++/src/kj/rust",
-    #"c++/src/kj/compat",
+    "c++/src/capnp/compiler",
+    "c++/src/capnp",
+    "c++/src/kj",
     "c++/src/kj/build",
 ]
 
@@ -22,6 +21,5 @@ cxx = "1.0.76"
 eyre = "0.6.12"
 cc = "1.0.73"
 cxx-build = "1.0.76"
-#kj-compat-sys = { path = "c++/src/kj/compat" }
-kj-sys = { path = "c++/src/kj/rust" }
+kj-sys = { path = "c++/src/kj" }
 kj-build = { path = "c++/src/kj/build" }

@@ -22,7 +22,7 @@ track_lock_blocking = [
 
 [dependencies]
 cxx.workspace = true
-capnp-sys = { path = "../../rust", features = ["heavy"] }
+capnp-sys = { path = "..", features = ["heavy"] }
 kj-sys.workspace = true
 
 [dev-dependencies]

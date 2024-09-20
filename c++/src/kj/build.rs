@@ -1,8 +1,8 @@
 use eyre::eyre;
+use eyre::OptionExt;
 use eyre::Result;
 use kj_build::kj_configure;
-use kj_build::stage_files;
-use std::{env, fs, path::Path};
+use std::{env, path::Path};
 
 const CAPNP_HEAVY: bool = cfg!(feature = "heavy");
 
@@ -95,62 +95,49 @@ static KJ_ASYNC_PRIVATE_HEADERS: &[&str] = &["async-io-internal.h", "miniposix.h
 
 fn main() -> Result<()> {
     let out_dir = env::var_os("OUT_DIR").ok_or_else(|| eyre!("OUT_DIR not set"))?;
-    let sources = Path::new(&out_dir).join("sources");
-    let source_dir = Path::new("..");
-    let kj_source_dir = sources.join("kj");
+    let source_dir = Path::new(&out_dir)
+        .join("cxxbridge")
+        .join("crate")
+        .join("kj");
 
-    //let _ = fs::remove_dir_all(&kj_source_dir);
-    fs::create_dir_all(&kj_source_dir)?;
-    fs::create_dir_all(kj_source_dir.join("parse"))?;
-    fs::create_dir_all(kj_source_dir.join("std"))?;
-
-    cxx_build::CFG.exported_header_dirs.push(&sources);
     cxx_build::CFG.include_prefix = "kj";
     let mut build = cxx_build::bridge("lib.rs");
 
-    stage_files(
-        &mut build,
-        KJ_HEADERS
-            .iter()
-            .chain(KJ_PARSE_HEADERS)
-            .chain(KJ_STD_HEADERS)
-            .chain(KJ_PRIVATE_HEADERS)
-            .chain(KJ_ASYNC_HEADERS)
-            .chain(KJ_ASYNC_PRIVATE_HEADERS),
-        source_dir,
-        &kj_source_dir,
-        false,
-    )?;
-
-    stage_files(
-        &mut build,
-        KJ_SOURCES_LITE.iter(),
-        source_dir,
-        &kj_source_dir,
-        true,
-    )?;
+    KJ_HEADERS
+        .iter()
+        .chain(KJ_PARSE_HEADERS)
+        .chain(KJ_STD_HEADERS)
+        .chain(KJ_PRIVATE_HEADERS)
+        .chain(KJ_ASYNC_HEADERS)
+        .chain(KJ_ASYNC_PRIVATE_HEADERS)
+        .map(|s| source_dir.join(s))
+        .try_for_each(|p| {
+            println!(
+                "cargo:rerun-if-changed={}",
+                p.to_str().ok_or_eyre("non–UTF-8 path")?
+            );
+            Ok::<(), eyre::Report>(())
+        })?;
 
     // kj-async files break capnproto's own import conventions and are impossible to compile
     // seperately without significant header changes, so we compile it into the library as a feature.
-    if cfg!(feature = "async") {
-        stage_files(
-            &mut build,
-            KJ_ASYNC_SOURCES.iter(),
-            source_dir,
-            &kj_source_dir,
-            true,
-        )?;
-    }
-
-    if CAPNP_HEAVY {
-        stage_files(
-            &mut build,
-            KJ_SOURCES_HEAVY.iter(),
-            source_dir,
-            &kj_source_dir,
-            true,
-        )?;
-    }
+    KJ_SOURCES_LITE
+        .iter()
+        .chain(if cfg!(feature = "async") {
+            KJ_ASYNC_SOURCES
+        } else {
+            &[]
+        })
+        .chain(if CAPNP_HEAVY { KJ_SOURCES_HEAVY } else { &[] })
+        .map(|s| source_dir.join(s))
+        .try_for_each(|p| {
+            println!(
+                "cargo:rerun-if-changed={}",
+                p.to_str().ok_or_eyre("non–UTF-8 path")?
+            );
+            build.file(p);
+            Ok::<(), eyre::Report>(())
+        })?;
 
     kj_configure(
         &mut build,
@@ -158,6 +145,7 @@ fn main() -> Result<()> {
         cfg!(feature = "track_lock_blocking"),
         cfg!(feature = "save_acquired_lock_info"),
     );
+
     #[cfg(not(target_os = "windows"))]
     println!("cargo:rustc-link-lib=pthread");
     if cfg!(feature = "libdl") {

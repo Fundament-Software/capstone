@@ -1,7 +1,7 @@
 use eyre::eyre;
+use eyre::OptionExt;
 use kj_build::kj_configure;
-use kj_build::stage_files;
-use std::{env, fs, path::Path};
+use std::{env, path::Path};
 
 const CAPNP_HEAVY: bool = cfg!(feature = "heavy");
 
@@ -66,46 +66,44 @@ static CAPNP_COMPAT_HEADERS: &[&str] = &["compat/std-iterator.h"];
 
 fn main() -> eyre::Result<()> {
     let out_dir = env::var_os("OUT_DIR").ok_or_else(|| eyre!("OUT_DIR not set"))?;
-    let sources = Path::new(&out_dir).join("sources");
-    let source_dir = Path::new("..");
-    let capnp_source_dir = sources.join("capnp");
+    let source_dir = Path::new(&out_dir)
+        .join("cxxbridge")
+        .join("crate")
+        .join("capnp");
 
-    //let _ = fs::remove_dir_all(&capnp_source_dir);
-    fs::create_dir_all(capnp_source_dir.join("compat"))?;
-
-    cxx_build::CFG.exported_header_dirs.push(&sources);
     cxx_build::CFG.include_prefix = "capnp";
     let mut build = cxx_build::bridge("lib.rs");
 
-    stage_files(
-        &mut build,
-        CAPNP_HEADERS
-            .iter()
-            .chain(CAPNP_COMPAT_HEADERS)
-            .chain(CAPNP_PRIVATE_HEADERS)
-            .chain(CAPNP_EXTRAS),
-        source_dir,
-        &capnp_source_dir,
-        false,
-    )?;
+    CAPNP_HEADERS
+        .iter()
+        .chain(CAPNP_COMPAT_HEADERS)
+        .chain(CAPNP_PRIVATE_HEADERS)
+        .chain(CAPNP_EXTRAS)
+        .map(|s| source_dir.join(s))
+        .try_for_each(|p| {
+            println!(
+                "cargo:rerun-if-changed={}",
+                p.to_str().ok_or_eyre("non–UTF-8 path")?
+            );
+            Ok::<(), eyre::Report>(())
+        })?;
 
-    stage_files(
-        &mut build,
-        CAPNP_SOURCES_LITE.iter(),
-        source_dir,
-        &capnp_source_dir,
-        true,
-    )?;
-
-    if CAPNP_HEAVY {
-        stage_files(
-            &mut build,
-            CAPNP_SOURCES_HEAVY.iter(),
-            source_dir,
-            &capnp_source_dir,
-            true,
-        )?;
-    }
+    CAPNP_SOURCES_LITE
+        .iter()
+        .chain(if CAPNP_HEAVY {
+            CAPNP_SOURCES_HEAVY
+        } else {
+            &[]
+        })
+        .map(|s| source_dir.join(s))
+        .try_for_each(|p| {
+            println!(
+                "cargo:rerun-if-changed={}",
+                p.to_str().ok_or_eyre("non–UTF-8 path")?
+            );
+            build.file(p);
+            Ok::<(), eyre::Report>(())
+        })?;
 
     // Unfuck MSVC
     build.flag_if_supported("/Zc:__cplusplus");

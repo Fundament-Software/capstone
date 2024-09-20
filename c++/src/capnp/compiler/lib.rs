@@ -1,8 +1,8 @@
 #[cxx::bridge]
 mod ffi {
     unsafe extern "C++" {
-        include!(<capnp/compiler/compiler.h>);
-        include!(<capnp/glue.h>);
+        include!(<compiler/compiler.h>);
+        include!(<compiler/glue.h>);
 
         fn command(
             files: &[String],
