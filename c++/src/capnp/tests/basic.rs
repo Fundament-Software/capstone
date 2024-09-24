@@ -1,4 +1,4 @@
-use capnpc_sys::call;
+use capnp_sys::call;
 use eyre::Result;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -44,6 +44,6 @@ fn test_calculator() -> Result<()> {
 
 #[test]
 fn test_id() -> Result<()> {
-    capnpc_sys::id();
+    capnp_sys::id();
     Ok(())
 }

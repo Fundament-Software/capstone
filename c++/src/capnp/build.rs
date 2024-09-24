@@ -3,6 +3,7 @@ use kj_build::kj_configure;
 use std::{env, path::Path};
 
 const CAPNP_HEAVY: bool = cfg!(feature = "heavy");
+const CAPNPC: bool = cfg!(feature = "compiler");
 
 static CAPNP_SOURCES_LITE: &[&str] = &[
     "any.c++",
@@ -22,13 +23,6 @@ static CAPNP_SOURCES_HEAVY: &[&str] = &[
     "schema.c++",
     "schema-loader.c++",
     "stringify.c++",
-];
-static CAPNP_EXTRAS: &[&str] = &[
-    "c++.capnp.h",
-    "schema.capnp.h",
-    "stream.capnp.h",
-    "schema-parser.c++",
-    "serialize-text.c++",
 ];
 static CAPNP_HEADERS: &[&str] = &[
     "any.h",
@@ -63,6 +57,37 @@ static CAPNP_HEADERS: &[&str] = &[
 static CAPNP_PRIVATE_HEADERS: &[&str] = &["arena.h"];
 static CAPNP_COMPAT_HEADERS: &[&str] = &["compat/std-iterator.h"];
 
+static CAPNPC_SOURCES: &[&str] = &[
+    "compiler/type-id.c++",
+    "compiler/error-reporter.c++",
+    "compiler/lexer.capnp.c++",
+    "compiler/lexer.c++",
+    "compiler/grammar.capnp.c++",
+    "compiler/parser.c++",
+    "compiler/generics.c++",
+    "compiler/node-translator.c++",
+    "compiler/compiler.c++",
+    //"compiler/capnp.c++",
+    "compiler/module-loader.c++",
+    "schema-parser.c++",
+    "serialize-text.c++",
+    "compiler/glue.c++",
+];
+static CAPNPC_HEADERS: &[&str] = &[
+    "compiler/type-id.h",
+    "compiler/error-reporter.h",
+    "compiler/lexer.capnp.h",
+    "compiler/lexer.h",
+    "compiler/grammar.capnp.h",
+    "compiler/parser.h",
+    "compiler/generics.h",
+    "compiler/node-translator.h",
+    "compiler/compiler.h",
+    "compiler/module-loader.h",
+    "compiler/resolver.h",
+    "compiler/glue.h",
+];
+
 fn main() -> eyre::Result<()> {
     let out_dir = env::var_os("OUT_DIR").ok_or_else(|| eyre!("OUT_DIR not set"))?;
     let source_dir = Path::new(&out_dir)
@@ -77,7 +102,7 @@ fn main() -> eyre::Result<()> {
         .iter()
         .chain(CAPNP_COMPAT_HEADERS)
         .chain(CAPNP_PRIVATE_HEADERS)
-        .chain(CAPNP_EXTRAS)
+        .chain(if CAPNPC { CAPNPC_HEADERS } else { &[] })
         .for_each(|s| println!("cargo:rerun-if-changed={}", s));
 
     CAPNP_SOURCES_LITE
@@ -87,6 +112,7 @@ fn main() -> eyre::Result<()> {
         } else {
             &[]
         })
+        .chain(if CAPNPC { CAPNPC_SOURCES } else { &[] })
         .map(|s| (s, source_dir.join(s)))
         .for_each(|(s, p)| {
             println!("cargo:rerun-if-changed={}", s);
@@ -114,8 +140,12 @@ fn main() -> eyre::Result<()> {
         println!("cargo:rustc-link-lib=dl");
     }
 
-    build.opt_level(3);
-    build.warnings(false).std("c++20").compile("capnp");
+    build.opt_level(3).warnings(false).std("c++20");
+    if CAPNPC {
+        build.compile("capnpc");
+    } else {
+        build.compile("capnp");
+    }
 
     Ok(())
 }
