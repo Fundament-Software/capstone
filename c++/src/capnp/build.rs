@@ -1,5 +1,4 @@
 use eyre::eyre;
-use eyre::OptionExt;
 use kj_build::kj_configure;
 use std::{env, path::Path};
 
@@ -79,14 +78,7 @@ fn main() -> eyre::Result<()> {
         .chain(CAPNP_COMPAT_HEADERS)
         .chain(CAPNP_PRIVATE_HEADERS)
         .chain(CAPNP_EXTRAS)
-        .map(|s| source_dir.join(s))
-        .try_for_each(|p| {
-            println!(
-                "cargo:rerun-if-changed={}",
-                p.to_str().ok_or_eyre("non–UTF-8 path")?
-            );
-            Ok::<(), eyre::Report>(())
-        })?;
+        .for_each(|s| println!("cargo:rerun-if-changed={}", s));
 
     CAPNP_SOURCES_LITE
         .iter()
@@ -95,15 +87,13 @@ fn main() -> eyre::Result<()> {
         } else {
             &[]
         })
-        .map(|s| source_dir.join(s))
-        .try_for_each(|p| {
-            println!(
-                "cargo:rerun-if-changed={}",
-                p.to_str().ok_or_eyre("non–UTF-8 path")?
-            );
+        .map(|s| (s, source_dir.join(s)))
+        .for_each(|(s, p)| {
+            println!("cargo:rerun-if-changed={}", s);
+            // This copy is only here in case the symlink fails on windows
+            let _ = std::fs::copy(Path::new(s), &p);
             build.file(p);
-            Ok::<(), eyre::Report>(())
-        })?;
+        });
 
     // Unfuck MSVC
     build.flag_if_supported("/Zc:__cplusplus");

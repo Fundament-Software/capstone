@@ -1,5 +1,4 @@
 use eyre::eyre;
-use eyre::OptionExt;
 use eyre::Result;
 use kj_build::kj_configure;
 use std::{env, path::Path};
@@ -110,14 +109,7 @@ fn main() -> Result<()> {
         .chain(KJ_PRIVATE_HEADERS)
         .chain(KJ_ASYNC_HEADERS)
         .chain(KJ_ASYNC_PRIVATE_HEADERS)
-        .map(|s| source_dir.join(s))
-        .try_for_each(|p| {
-            println!(
-                "cargo:rerun-if-changed={}",
-                p.to_str().ok_or_eyre("non–UTF-8 path")?
-            );
-            Ok::<(), eyre::Report>(())
-        })?;
+        .for_each(|s| println!("cargo:rerun-if-changed={}", s));
 
     // kj-async files break capnproto's own import conventions and are impossible to compile
     // seperately without significant header changes, so we compile it into the library as a feature.
@@ -129,15 +121,13 @@ fn main() -> Result<()> {
             &[]
         })
         .chain(if CAPNP_HEAVY { KJ_SOURCES_HEAVY } else { &[] })
-        .map(|s| source_dir.join(s))
-        .try_for_each(|p| {
-            println!(
-                "cargo:rerun-if-changed={}",
-                p.to_str().ok_or_eyre("non–UTF-8 path")?
-            );
+        .map(|s| (s, source_dir.join(s)))
+        .for_each(|(s, p)| {
+            println!("cargo:rerun-if-changed={}", s);
+            // This copy is only here in case the symlink fails on windows
+            let _ = std::fs::copy(Path::new(s), &p);
             build.file(p);
-            Ok::<(), eyre::Report>(())
-        })?;
+        });
 
     kj_configure(
         &mut build,
