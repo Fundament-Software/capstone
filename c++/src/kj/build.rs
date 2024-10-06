@@ -3,6 +3,10 @@ use eyre::Result;
 use std::{env, path::Path};
 
 const CAPNP_HEAVY: bool = cfg!(feature = "heavy");
+const KJ_ASYNC: bool = cfg!(feature = "async");
+const KJ_HTTP: bool = cfg!(feature = "http");
+const KJ_WITH_SSL: bool = cfg!(feature = "ssl");
+const KJ_WITH_ZLIB: bool = cfg!(feature = "zlib");
 
 static KJ_SOURCES_LITE: &[&str] = &[
     "arena.c++",
@@ -25,6 +29,7 @@ static KJ_SOURCES_LITE: &[&str] = &[
     "test-helpers.c++",
     "thread.c++",
     "units.c++",
+    "time.c++", // capnproto incorrectly relies on this in mutex.c++ on windows only.
 ];
 static KJ_SOURCES_HEAVY: &[&str] = &[
     "filesystem.c++",
@@ -33,7 +38,6 @@ static KJ_SOURCES_HEAVY: &[&str] = &[
     "parse/char.c++",
     "refcount.c++",
     "string-tree.c++",
-    "time.c++",
 ];
 static KJ_HEADERS: &[&str] = &["arena.h", "common.h", "list.h"];
 static KJ_PRIVATE_HEADERS: &[&str] = &[
@@ -89,6 +93,23 @@ static KJ_ASYNC_HEADERS: &[&str] = &[
     "async-queue.h",
     "timer.h",
 ];
+
+static KJ_HTTP_SOURCES: &[&str] = &["compat/http.c++", "compat/url.c++"];
+static KJ_HTTP_HEADERS: &[&str] = &["compat/http.h", "compat/url.h"];
+
+static KJ_TLS_SOURCES: &[&str] = &["compat/readiness-io.c++", "compat/tls.c++"];
+static KJ_TLS_HEADERS: &[&str] = &["compat/readiness-io.h", "compat/tls.h"];
+
+static KJ_GZIP_SOURCES: &[&str] = &["compat/gzip.c++"];
+static KJ_GZIP_HEADERS: &[&str] = &["compat/gzip.h"];
+
+fn get_predicate(predicate: bool, src: &'static [&'static str]) -> &'static [&'static str] {
+    if predicate {
+        src
+    } else {
+        &[]
+    }
+}
 static KJ_ASYNC_PRIVATE_HEADERS: &[&str] = &["async-io-internal.h", "miniposix.h"];
 
 fn main() -> Result<()> {
@@ -106,20 +127,22 @@ fn main() -> Result<()> {
         .chain(KJ_PARSE_HEADERS)
         .chain(KJ_STD_HEADERS)
         .chain(KJ_PRIVATE_HEADERS)
-        .chain(KJ_ASYNC_HEADERS)
-        .chain(KJ_ASYNC_PRIVATE_HEADERS)
+        .chain(get_predicate(KJ_ASYNC, KJ_ASYNC_HEADERS))
+        .chain(get_predicate(KJ_ASYNC, KJ_ASYNC_PRIVATE_HEADERS))
+        .chain(get_predicate(KJ_HTTP, KJ_HTTP_HEADERS))
+        .chain(get_predicate(KJ_WITH_SSL, KJ_TLS_HEADERS))
+        .chain(get_predicate(KJ_WITH_ZLIB, KJ_GZIP_HEADERS))
         .for_each(|s| println!("cargo:rerun-if-changed={}", s));
 
     // kj-async files break capnproto's own import conventions and are impossible to compile
     // seperately without significant header changes, so we compile it into the library as a feature.
     KJ_SOURCES_LITE
         .iter()
-        .chain(if cfg!(feature = "async") {
-            KJ_ASYNC_SOURCES
-        } else {
-            &[]
-        })
-        .chain(if CAPNP_HEAVY { KJ_SOURCES_HEAVY } else { &[] })
+        .chain(get_predicate(KJ_ASYNC, KJ_ASYNC_SOURCES))
+        .chain(get_predicate(CAPNP_HEAVY, KJ_SOURCES_HEAVY))
+        .chain(get_predicate(KJ_HTTP, KJ_HTTP_SOURCES))
+        .chain(get_predicate(KJ_WITH_SSL, KJ_TLS_SOURCES))
+        .chain(get_predicate(KJ_WITH_ZLIB, KJ_GZIP_SOURCES))
         .map(|s| (s, source_dir.join(s)))
         .for_each(|(s, p)| {
             println!("cargo:rerun-if-changed={}", s);
@@ -130,18 +153,8 @@ fn main() -> Result<()> {
         });
 
     if !CAPNP_HEAVY {
-        build.define("CAPNP_LITE", None);
+        build.define("CAPNP_LITE", "1");
     }
-    let bool_int_str = |x: bool| if x { "1" } else { "0" };
-    build
-        .define(
-            "KJ_SAVE_ACQUIRED_LOCK_INFO",
-            bool_int_str(cfg!(feature = "save_acquired_lock_info")),
-        )
-        .define(
-            "KJ_TRACK_LOCK_BLOCKING",
-            bool_int_str(cfg!(feature = "track_lock_blocking")),
-        );
 
     #[cfg(not(target_os = "windows"))]
     println!("cargo:rustc-link-lib=pthread");

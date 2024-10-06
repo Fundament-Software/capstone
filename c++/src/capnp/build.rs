@@ -127,18 +127,8 @@ fn main() -> eyre::Result<()> {
     build.flag_if_supported("/TP");
 
     if !CAPNP_HEAVY {
-        build.define("CAPNP_LITE", None);
+        build.define("CAPNP_LITE", "1");
     }
-    let bool_int_str = |x: bool| if x { "1" } else { "0" };
-    build
-        .define(
-            "KJ_SAVE_ACQUIRED_LOCK_INFO",
-            bool_int_str(cfg!(feature = "save_acquired_lock_info")),
-        )
-        .define(
-            "KJ_TRACK_LOCK_BLOCKING",
-            bool_int_str(cfg!(feature = "track_lock_blocking")),
-        );
 
     println!("cargo:rustc-link-lib=kj");
     #[cfg(not(target_os = "windows"))]
