@@ -9,12 +9,13 @@ links = "kj"
 path = "lib.rs"
 
 [features]
-default = []
-async = []
+default = ["heavy"]
+async = ["heavy"]
+http = ["heavy"]
+zlib = ["heavy"]
+ssl = ["heavy"]
 heavy = []
 libdl = []
-save_acquired_lock_info = []
-track_lock_blocking = []
 
 [dependencies]
 cxx.workspace = true
@@ -23,4 +24,3 @@ cxx.workspace = true
 eyre.workspace = true
 cc.workspace = true
 cxx-build.workspace = true
-kj-build.workspace = true

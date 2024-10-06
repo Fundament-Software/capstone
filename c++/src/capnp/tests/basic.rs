@@ -1,7 +1,9 @@
-use capnpc_sys::call;
 use eyre::Result;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+#[cfg(feature = "compiler")]
+use capnp_sys::call;
 
 fn get_samples_dir() -> Result<PathBuf> {
     let output = std::process::Command::new(env!("CARGO"))
@@ -17,6 +19,7 @@ fn get_samples_dir() -> Result<PathBuf> {
 }
 
 #[should_panic]
+#[cfg(feature = "compiler")]
 #[test]
 fn test_address_book() {
     let path = get_samples_dir().unwrap().join("addressbook.capnp");
@@ -29,6 +32,7 @@ fn test_address_book() {
     .unwrap();
 }
 
+#[cfg(feature = "compiler")]
 #[test]
 fn test_calculator() -> Result<()> {
     let path = get_samples_dir()?.join("calculator.capnp");
@@ -42,8 +46,9 @@ fn test_calculator() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "compiler")]
 #[test]
 fn test_id() -> Result<()> {
-    capnpc_sys::id();
+    capnp_sys::id();
     Ok(())
 }
