@@ -1,4 +1,5 @@
 #[cxx::bridge]
+#[cfg(feature = "compiler")]
 mod ffi {
     unsafe extern "C++" {
         include!(<capnp/compiler/compiler.h>);
@@ -15,6 +16,7 @@ mod ffi {
     }
 }
 
+#[cfg(feature = "compiler")]
 pub fn call(
     files: impl Iterator<Item = impl AsRef<str>>,
     imports: impl Iterator<Item = impl AsRef<str>>,
@@ -33,6 +35,7 @@ pub fn call(
     )
 }
 
+#[cfg(feature = "compiler")]
 pub fn id() -> u64 {
     ffi::genRandId()
 }

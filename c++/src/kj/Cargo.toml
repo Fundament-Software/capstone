@@ -23,4 +23,3 @@ cxx.workspace = true
 eyre.workspace = true
 cc.workspace = true
 cxx-build.workspace = true
-kj-build.workspace = true

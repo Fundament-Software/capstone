@@ -1,6 +1,5 @@
 use eyre::eyre;
 use eyre::Result;
-use kj_build::kj_configure;
 use std::{env, path::Path};
 
 const CAPNP_HEAVY: bool = cfg!(feature = "heavy");
@@ -130,12 +129,19 @@ fn main() -> Result<()> {
             build.file(p);
         });
 
-    kj_configure(
-        &mut build,
-        CAPNP_HEAVY,
-        cfg!(feature = "track_lock_blocking"),
-        cfg!(feature = "save_acquired_lock_info"),
-    );
+    if !CAPNP_HEAVY {
+        build.define("CAPNP_LITE", None);
+    }
+    let bool_int_str = |x: bool| if x { "1" } else { "0" };
+    build
+        .define(
+            "KJ_SAVE_ACQUIRED_LOCK_INFO",
+            bool_int_str(cfg!(feature = "save_acquired_lock_info")),
+        )
+        .define(
+            "KJ_TRACK_LOCK_BLOCKING",
+            bool_int_str(cfg!(feature = "track_lock_blocking")),
+        );
 
     #[cfg(not(target_os = "windows"))]
     println!("cargo:rustc-link-lib=pthread");
