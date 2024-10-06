@@ -148,7 +148,10 @@ fn main() -> Result<()> {
             println!("cargo:rerun-if-changed={}", s);
             // This copy is only here in case the symlink fails on windows
             let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let _ = std::fs::copy(Path::new(s), &p);
+            let _ = match std::fs::exists(&p) {
+                Ok(true) => Ok(0),
+                _ => std::fs::copy(Path::new(s), &p),
+            };
             build.file(p);
         });
 
