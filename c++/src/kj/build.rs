@@ -1,5 +1,5 @@
-use eyre::eyre;
 use eyre::Result;
+use eyre::eyre;
 use std::{env, path::Path};
 
 const CAPNP_HEAVY: bool = cfg!(feature = "heavy");
@@ -104,11 +104,7 @@ static KJ_GZIP_SOURCES: &[&str] = &["compat/gzip.c++"];
 static KJ_GZIP_HEADERS: &[&str] = &["compat/gzip.h"];
 
 fn get_predicate(predicate: bool, src: &'static [&'static str]) -> &'static [&'static str] {
-    if predicate {
-        src
-    } else {
-        &[]
-    }
+    if predicate { src } else { &[] }
 }
 static KJ_ASYNC_PRIVATE_HEADERS: &[&str] = &["async-io-internal.h", "miniposix.h"];
 
