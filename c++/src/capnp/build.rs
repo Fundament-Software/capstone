@@ -132,10 +132,12 @@ fn main() -> eyre::Result<()> {
     if !CAPNP_HEAVY {
         build.define("CAPNP_LITE", "1");
     }
-
     println!("cargo:rustc-link-lib=kj");
     #[cfg(not(target_os = "windows"))]
     println!("cargo:rustc-link-lib=pthread");
+    #[cfg(target_os = "windows")]
+    println!("cargo:rustc-link-lib=advapi32");
+
     if cfg!(feature = "libdl") {
         println!("cargo:rustc-link-lib=dl");
     }
