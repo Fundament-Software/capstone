@@ -37,7 +37,7 @@ namespace kj {
   class StringTree;   // string-tree.h
 }
 
-constexpr kj::StringPtr operator "" _kj(const char* str, size_t n);
+constexpr kj::StringPtr operator ""_kj(const char* str, size_t n);
 // You can append _kj to a string literal to make its type be StringPtr. There are a few cases
 // where you must do this for correctness:
 // - When you want to declare a constexpr StringPtr. Without _kj, this is a compile error.
@@ -53,15 +53,9 @@ constexpr kj::StringPtr operator "" _kj(const char* str, size_t n);
 // string literal vs. one with _kj (assuming the compiler is able to optimize away strlen() on a
 // string literal).
 
-constexpr kj::LiteralStringConst operator "" _kjc(const char* str, size_t n);
+constexpr kj::LiteralStringConst operator ""_kjc(const char* str, size_t n);
 
 namespace kj {
-
-// Our STL string SFINAE trick does not work with GCC 4.7, but it works with Clang and GCC 4.8, so
-// we'll just preprocess it out if not supported.
-#if __clang__ || __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8) || _MSC_VER
-#define KJ_COMPILER_SUPPORTS_STL_STRING_INTEROP 1
-#endif
 
 // =======================================================================================
 // StringPtr -- A NUL-terminated ArrayPtr<const char> containing UTF-8 text.
@@ -78,10 +72,10 @@ public:
   inline constexpr StringPtr(const char* value KJ_LIFETIMEBOUND, size_t size): content(value, size + 1) {
     KJ_IREQUIRE(value[size] == '\0', "StringPtr must be NUL-terminated.");
   }
-  inline StringPtr(const char* begin KJ_LIFETIMEBOUND, const char* end KJ_LIFETIMEBOUND): StringPtr(begin, end - begin) {}
-  inline StringPtr(String&& value KJ_LIFETIMEBOUND) : StringPtr(value) {}
-  inline StringPtr(const String& value KJ_LIFETIMEBOUND);
-  inline StringPtr(const ConstString& value KJ_LIFETIMEBOUND);
+  inline constexpr StringPtr(const char* begin KJ_LIFETIMEBOUND, const char* end KJ_LIFETIMEBOUND): StringPtr(begin, end - begin) {}
+  inline constexpr StringPtr(String&& value KJ_LIFETIMEBOUND) : StringPtr(value) {}
+  inline constexpr StringPtr(const String& value KJ_LIFETIMEBOUND);
+  inline constexpr StringPtr(const ConstString& value KJ_LIFETIMEBOUND);
   StringPtr& operator=(String&& value) = delete;
   inline StringPtr& operator=(decltype(nullptr)) {
     content = ArrayPtr<const char>("", 1);
@@ -95,25 +89,6 @@ public:
   inline StringPtr(const char8_t* begin KJ_LIFETIMEBOUND, const char8_t* end KJ_LIFETIMEBOUND)
       : StringPtr(reinterpret_cast<const char*>(begin), reinterpret_cast<const char*>(end)) {}
   // KJ strings are and always have been UTF-8, so screw this C++20 char8_t stuff.
-#endif
-
-#if KJ_COMPILER_SUPPORTS_STL_STRING_INTEROP
-  template <
-    typename T,
-    typename = EnableIf<canConvert<decltype(instance<T>().c_str()), const char*>()>,
-    typename = decltype(instance<T>().size())>
-  inline StringPtr(const T& t KJ_LIFETIMEBOUND): StringPtr(t.c_str(), t.size()) {}
-  // Allow implicit conversion from any class that has a c_str() and a size() method (namely, std::string).
-  // We use a template trick to detect std::string in order to avoid including the header for
-  // those who don't want it.
-  template <
-    typename T,
-    typename = EnableIf<canConvert<decltype(instance<T>().c_str()), const char*>()>,
-    typename = decltype(instance<T>().size())>
-  inline operator T() const { return {cStr(), size()}; }
-  // Allow implicit conversion to any class that has a c_str() method and a size() method (namely, std::string).
-  // We use a template trick to detect std::string in order to avoid including the header for
-  // those who don't want it.
 #endif
 
   inline constexpr operator ArrayPtr<const char>() const;
@@ -135,10 +110,10 @@ public:
   inline constexpr bool operator==(decltype(nullptr)) const { return content.size() <= 1; }
 
   inline constexpr bool operator==(const StringPtr& other) const;
-  inline bool operator< (const StringPtr& other) const;
-  inline bool operator> (const StringPtr& other) const { return other < *this; }
-  inline bool operator<=(const StringPtr& other) const { return !(other < *this); }
-  inline bool operator>=(const StringPtr& other) const { return !(*this < other); }
+  inline constexpr bool operator< (const StringPtr& other) const;
+  inline constexpr bool operator> (const StringPtr& other) const { return other < *this; }
+  inline constexpr bool operator<=(const StringPtr& other) const { return !(other < *this); }
+  inline constexpr bool operator>=(const StringPtr& other) const { return !(*this < other); }
 
   inline constexpr StringPtr slice(size_t start) const;
   inline constexpr ArrayPtr<const char> slice(size_t start, size_t end) const;
@@ -173,20 +148,19 @@ public:
   Maybe<T> tryParseAs() const;
   // Same as parseAs, but rather than throwing an exception we return NULL.
 
-  template <typename... Attachments>
-  ConstString attach(Attachments&&... attachments) const KJ_WARN_UNUSED_RESULT;
-  ConstString attach() const KJ_WARN_UNUSED_RESULT;
-  // Like ArrayPtr<T>::attach(), but instead promotes a StringPtr into a ConstString. Generally the
-  // attachment should be an object that somehow owns the String that the StringPtr is pointing at.
+  template <typename T>
+  inline auto as() { return asImpl((T*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(T*, StringPtr&).
+  // Used to chain conversion calls rather than wrap with function.
 
   template <typename T>
-  inline auto as() { return T::from(this); }
-  // Syntax sugar for invoking T::from.
+  inline auto as() const { return asImpl((T*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(T*, const StringPtr&).
   // Used to chain conversion calls rather than wrap with function.
 
 private:
   inline explicit constexpr StringPtr(ArrayPtr<const char> content): content(content) {}
-  friend constexpr StringPtr (::operator "" _kj)(const char* str, size_t n);
+  friend constexpr StringPtr (::operator ""_kj)(const char* str, size_t n);
   friend class LiteralStringConst;
 
   ArrayPtr<const char> content;
@@ -227,7 +201,7 @@ public:
 
 private:
   inline explicit constexpr LiteralStringConst(ArrayPtr<const char> content): StringPtr(content) {}
-  friend constexpr LiteralStringConst (::operator "" _kjc)(const char* str, size_t n);
+  friend constexpr LiteralStringConst (::operator ""_kjc)(const char* str, size_t n);
 };
 
 // =======================================================================================
@@ -332,8 +306,13 @@ public:
   Maybe<T> tryParseAs() const { return StringPtr(*this).tryParseAs<T>(); }
 
   template <typename T>
-  inline auto as() { return T::from(this); }
-  // Syntax sugar for invoking T::from.
+  inline auto as() { return asImpl((T*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(T*, String&).
+  // Used to chain conversion calls rather than wrap with function.
+
+  template <typename T>
+  inline auto as() const { return asImpl((T*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(T*, const String&).
   // Used to chain conversion calls rather than wrap with function.
 
 private:
@@ -371,6 +350,9 @@ public:
   inline Array<const char> releaseArray() { return kj::mv(content); }
   // Disowns the backing array (which includes the NUL terminator) and returns it. The ConstString value
   // is clobbered (as if moved away).
+
+  inline ConstString clone() const;
+  // Clones the string, avoiding heap allocation if it is based on a string literal.
 
   inline constexpr const char* cStr() const KJ_LIFETIMEBOUND;
 
@@ -433,6 +415,16 @@ public:
 
   template <typename T>
   Maybe<T> tryParseAs() const { return StringPtr(*this).tryParseAs<T>(); }
+
+  template <typename T>
+  inline auto as() { return asImpl((T*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(T*, ConstString&).
+  // Used to chain conversion calls rather than wrap with function.
+
+  template <typename T>
+  inline auto as() const { return asImpl((T*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(T*, const ConstString&).
+  // Used to chain conversion calls rather than wrap with function.
 
 private:
   Array<const char> content;
@@ -590,10 +582,8 @@ struct Stringifier {
   CappedArray<char, 32> operator*(double f) const;
   CappedArray<char, sizeof(const void*) * 2 + 1> operator*(const void* s) const;
 
-#if KJ_COMPILER_SUPPORTS_STL_STRING_INTEROP  // supports expression SFINAE?
   template <typename T, typename Result = decltype(instance<T>().toString())>
   inline Result operator*(T&& value) const { return kj::fwd<T>(value).toString(); }
-#endif
 };
 static KJ_CONSTEXPR(const) Stringifier STR = Stringifier();
 
@@ -709,8 +699,8 @@ inline _::Delimited<ArrayPtr<const T>> operator*(const _::Stringifier&, const Ar
 // =======================================================================================
 // Inline implementation details.
 
-inline StringPtr::StringPtr(const String& value): content(value.cStr(), value.size() + 1) {}
-inline StringPtr::StringPtr(const ConstString& value): content(value.cStr(), value.size() + 1) {}
+inline constexpr StringPtr::StringPtr(const String& value): content(value.cStr(), value.size() + 1) {}
+inline constexpr StringPtr::StringPtr(const ConstString& value): content(value.cStr(), value.size() + 1) {}
 
 inline constexpr StringPtr::operator ArrayPtr<const char>() const {
   return ArrayPtr<const char>(content.begin(), content.size() - 1);
@@ -724,7 +714,7 @@ inline constexpr bool StringPtr::operator==(const StringPtr& other) const {
   return content == other.content;
 }
 
-inline bool StringPtr::operator< (const StringPtr& other) const {
+inline constexpr bool StringPtr::operator< (const StringPtr& other) const {
   return content < other.content;
 }
 
@@ -738,16 +728,6 @@ inline constexpr ArrayPtr<const char> StringPtr::first(size_t count) const { ret
 
 inline LiteralStringConst::operator ConstString() const {
   return ConstString(begin(), size(), NullArrayDisposer::instance);
-}
-
-inline ConstString StringPtr::attach() const {
-  // This is meant as a roundabout way to make a ConstString from a StringPtr
-  return ConstString(begin(), size(), NullArrayDisposer::instance);
-}
-
-template <typename... Attachments>
-inline ConstString StringPtr::attach(Attachments&&... attachments) const {
-  return ConstString { content.attach(kj::fwd<Attachments>(attachments)...) };
 }
 
 inline constexpr String::operator ArrayPtr<char>() {
@@ -794,6 +774,15 @@ inline String::String(char* value, size_t size, const ArrayDisposer& disposer)
 inline ConstString::ConstString(const char* value, size_t size, const ArrayDisposer& disposer)
     : content(value, size + 1, disposer) {
   KJ_IREQUIRE(value[size] == '\0', "String must be NUL-terminated.");
+}
+
+inline ConstString ConstString::clone() const {
+  // NullArrayDisposer indicates strings constructed via LiteralStringConst
+  if (content.hasNullDisposer()) {
+    return ConstString(Array(content.begin(), content.size(), NullArrayDisposer::instance));
+  } else {
+    return ConstString(heapArray<char>(content));
+  }
 }
 
 inline String::String(Array<char> buffer): content(kj::mv(buffer)) {
@@ -921,13 +910,31 @@ _::Delimited<T> delimited(T&& arr, kj::StringPtr delim) {
   return _::Delimited<T>(kj::fwd<T>(arr), delim);
 }
 
+
+template <typename T>
+concept Stringifiable = requires(_::Stringifier s, const T& t) {
+  { s * t };
+};
+
+// TODO(someday) an ideal implementation would use kj::toCharSequence instead of kj::str,
+// This would avoid an extra copy and allocation when the Maybe is embedded in a larger string.
+template <typename T>
+requires Stringifiable<T>
+kj::String KJ_STRINGIFY(const kj::Maybe<T>& maybe) {
+  KJ_IF_SOME(val, maybe) {
+    return str(val);
+  } else {
+    return str("(none)");
+  }
+}
+
 }  // namespace kj
 
-constexpr kj::StringPtr operator "" _kj(const char* str, size_t n) {
+constexpr kj::StringPtr operator ""_kj(const char* str, size_t n) {
   return kj::StringPtr(kj::ArrayPtr<const char>(str, n + 1));
 };
 
-constexpr kj::LiteralStringConst operator "" _kjc(const char* str, size_t n) {
+constexpr kj::LiteralStringConst operator ""_kjc(const char* str, size_t n) {
   return kj::LiteralStringConst(kj::ArrayPtr<const char>(str, n + 1));
 };
 

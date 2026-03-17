@@ -24,7 +24,7 @@
 
 namespace kj {
 
-struct SetTrueInDestructor: public Refcounted, EnableAddRefToThis<SetTrueInDestructor> {
+struct SetTrueInDestructor: public Refcounted {
   SetTrueInDestructor(bool* ptr): ptr(ptr) {}
   ~SetTrueInDestructor() { *ptr = true; }
 
@@ -133,7 +133,7 @@ KJ_TEST("Rc inheritance") {
   EXPECT_TRUE(b);
 }
 
-KJ_TEST("Refcounted::EnableAddRefToThis") {
+KJ_TEST("Refcounted::addRefToThis") {
   bool b = false;
 
   auto ref1 = kj::rc<SetTrueInDestructor>(&b);
@@ -230,13 +230,12 @@ KJ_TEST("RefcountedWrapper") {
 }
 
 
-struct AtomicSetTrueInDestructor: public AtomicRefcounted, 
-    EnableAddRefToThis<AtomicSetTrueInDestructor> {
+struct AtomicSetTrueInDestructor: public AtomicRefcounted {
 
   AtomicSetTrueInDestructor(bool* ptr): ptr(ptr) {}
   ~AtomicSetTrueInDestructor() { *ptr = true; }
 
-  kj::Arc<AtomicSetTrueInDestructor> newRef() { return addRefToThis(); }
+  kj::Arc<AtomicSetTrueInDestructor> newRef() const { return addRefToThis(); }
 
   bool* ptr;
 };
@@ -269,7 +268,7 @@ KJ_TEST("Arc") {
   EXPECT_TRUE(b);
 }
 
-KJ_TEST("AtomicRefcounted::EnableAddRefToThis") {
+KJ_TEST("AtomicRefcounted::addRefToThis") {
   bool b = false;
 
   kj::Arc<AtomicSetTrueInDestructor> ref1 = kj::arc<AtomicSetTrueInDestructor>(&b);
@@ -301,6 +300,24 @@ KJ_TEST("Arc Own interop") {
   EXPECT_FALSE(b);
   own = nullptr;
   EXPECT_TRUE(b);
+}
+
+KJ_TEST("Arc disown / reown") {
+  bool b = false;
+  const AtomicSetTrueInDestructor* ptr = nullptr;
+
+  {
+    kj::Arc<AtomicSetTrueInDestructor> ref = kj::arc<AtomicSetTrueInDestructor>(&b);
+    ptr = ref.disown();
+  }
+
+  KJ_EXPECT(b == false);
+
+  {
+    auto ref = kj::Arc<AtomicSetTrueInDestructor>::reown(ptr);
+  }
+
+  KJ_EXPECT(b == true);
 }
 
 }  // namespace kj

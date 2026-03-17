@@ -22,7 +22,7 @@
 @0xb665280aaff2e632;
 # Cap'n Proto interface for HTTP.
 
-using import "byte-stream.capnp".ByteStream;
+using import "/capnp/compat/byte-stream.capnp".ByteStream;
 
 using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("capnp");
@@ -184,6 +184,9 @@ enum HttpMethod {
   notify @23;
   subscribe @24;
   unsubscribe @25;
+
+  query @26;
+  ban @27;
 }
 
 annotation commonText @0x857745131db6fc83(enumerant) :Text;

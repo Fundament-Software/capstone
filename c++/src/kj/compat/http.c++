@@ -360,6 +360,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
 
   switch (*p++) {
     case 'A': EXPECT_REST(A,CL)
+    case 'B': EXPECT_REST(B,AN)
     case 'C':
       switch (*p++) {
         case 'H': EXPECT_REST(CH,ECKOUT)
@@ -415,6 +416,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
           }
         default: return kj::none;
       }
+    case 'Q': EXPECT_REST(Q,UERY)
     case 'R': EXPECT_REST(R,EPORT)
     case 'S':
       switch (*p++) {
@@ -430,6 +432,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
         case 'S': EXPECT_REST(UNS,UBSCRIBE)
         default: return kj::none;
       }
+
     default: return kj::none;
   }
 #undef EXPECT_REST
@@ -497,8 +500,8 @@ static void requireValidHeaderName(kj::StringPtr name) {
   }
 }
 
-static void requireValidHeaderValue(kj::StringPtr value) {
-  KJ_REQUIRE(HttpHeaders::isValidHeaderValue(value), "invalid header value",
+static void requireValidHeaderValue(kj::StringPtr value, auto name) {
+  KJ_REQUIRE(HttpHeaders::isValidHeaderValue(value), name, "invalid header value",
       kj::encodeCEscape(value));
 }
 
@@ -694,31 +697,44 @@ bool HttpHeaders::isWebSocket() const {
 }
 
 void HttpHeaders::set(HttpHeaderId id, kj::StringPtr value) {
+  // TODO(cleanup): Remove this soon.
+  setPtr(id, value);
+}
+
+void HttpHeaders::setPtr(HttpHeaderId id, kj::StringPtr value) {
   id.requireFrom(*table);
-  requireValidHeaderValue(value);
+  requireValidHeaderValue(value, id);
 
   indexedHeaders[id.id] = value;
 }
 
 void HttpHeaders::set(HttpHeaderId id, kj::String&& value) {
-  set(id, kj::StringPtr(value));
+  setPtr(id, kj::StringPtr(value));
   takeOwnership(kj::mv(value));
 }
 
-void HttpHeaders::add(kj::StringPtr name, kj::StringPtr value) {
+void HttpHeaders::addPtrPtr(kj::StringPtr name, kj::StringPtr value) {
   requireValidHeaderName(name);
-  requireValidHeaderValue(value);
+  requireValidHeaderValue(value, name);
 
   addNoCheck(name, value);
 }
 
-void HttpHeaders::add(kj::StringPtr name, kj::String&& value) {
-  add(name, kj::StringPtr(value));
+void HttpHeaders::add(kj::StringPtr name, kj::StringPtr value) {
+  addPtrPtr(name, value);
+}
+
+void HttpHeaders::addPtr(kj::StringPtr name, kj::String&& value) {
+  addPtrPtr(name, kj::StringPtr(value));
   takeOwnership(kj::mv(value));
 }
 
+void HttpHeaders::add(kj::StringPtr name, kj::String&& value) {
+  addPtr(name, kj::mv(value));
+}
+
 void HttpHeaders::add(kj::String&& name, kj::String&& value) {
-  add(kj::StringPtr(name), kj::StringPtr(value));
+  addPtrPtr(kj::StringPtr(name), kj::StringPtr(value));
   takeOwnership(kj::mv(name));
   takeOwnership(kj::mv(value));
 }
@@ -1057,13 +1073,13 @@ bool HttpHeaders::parseHeaders(char* ptr, char* end) {
 kj::String HttpHeaders::serializeRequest(
     HttpMethod method, kj::StringPtr url,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
-  return serialize(kj::toCharSequence(method), url, kj::StringPtr("HTTP/1.1"), connectionHeaders);
+  return serialize(kj::toCharSequence(method), url, "HTTP/1.1"_kj, connectionHeaders);
 }
 
 kj::String HttpHeaders::serializeConnectRequest(
     kj::StringPtr authority,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
-  return serialize("CONNECT"_kj, authority, kj::StringPtr("HTTP/1.1"), connectionHeaders);
+  return serialize("CONNECT"_kj, authority, "HTTP/1.1"_kj, connectionHeaders);
 }
 
 kj::String HttpHeaders::serializeResponse(
@@ -1071,7 +1087,7 @@ kj::String HttpHeaders::serializeResponse(
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
   auto statusCodeStr = kj::toCharSequence(statusCode);
 
-  return serialize(kj::StringPtr("HTTP/1.1"), statusCodeStr, statusText, connectionHeaders);
+  return serialize("HTTP/1.1"_kj, statusCodeStr, statusText, connectionHeaders);
 }
 
 kj::String HttpHeaders::serialize(kj::ArrayPtr<const char> word1,
@@ -1558,16 +1574,20 @@ public:
 
         uint64_t value = 0;
         for (char c: text) {
+          uint64_t digit;
           if ('0' <= c && c <= '9') {
-            value = value * 16 + (c - '0');
+            digit = c - '0';
           } else if ('a' <= c && c <= 'f') {
-            value = value * 16 + (c - 'a' + 10);
+            digit = c - 'a' + 10;
           } else if ('A' <= c && c <= 'F') {
-            value = value * 16 + (c - 'A' + 10);
+            digit = c - 'A' + 10;
           } else {
             KJ_FAIL_REQUIRE("invalid HTTP chunk size", text, text.asBytes()) { break; }
             co_return value;
           }
+          KJ_REQUIRE(value <= (uint64_t(kj::maxValue) >> 4),
+              "HTTP chunk size overflow", text, text.asBytes()) { break; }
+          value = value * 16 + digit;
         }
 
         co_return value;
@@ -1647,6 +1667,28 @@ public:
     }
   }
 
+  Promise<uint64_t> pumpTo(AsyncOutputStream& output, uint64_t amount) {
+    KJ_REQUIRE(onMessageDone != kj::none);
+
+    if (leftover == nullptr) {
+      // No leftovers. Forward directly to inner stream.
+      co_return co_await inner.pumpTo(output, amount);
+    } else if (leftover.size() >= amount) {
+      // Didn't even read the entire leftover buffer.
+      co_await output.write(leftover.first(amount).asBytes());
+      leftover = leftover.slice(amount, leftover.size());
+      co_return amount;
+    } else {
+      // Read the entire leftover buffer, plus some.
+      co_await output.write(leftover.asBytes());
+      size_t firstWrite = leftover.size();
+      leftover = nullptr;
+
+      auto rest = co_await inner.pumpTo(output, amount - firstWrite);
+      co_return firstWrite + rest;
+    }
+  }
+
   enum RequestOrResponse {
     REQUEST,
     RESPONSE
@@ -1663,8 +1705,15 @@ public:
     kj::ArrayPtr<byte> leftover;
   };
 
+  // Used when suspending a request, or when switching protocols (e.g. WebSocket, CONNENCT).
+  // HttpinputStream can no longer be used after this.
   ReleasedBuffer releaseBuffer() {
     return { headerBuffer.releaseAsBytes(), leftover.asBytes() };
+  }
+
+  // Used when suspending a request. HttpinputStream can no longer be used after this.
+  kj::HttpHeaders releaseHeaders() {
+    return kj::mv(headers);
   }
 
   kj::Promise<void> discard(AsyncOutputStream &output, size_t maxBytes) {
@@ -1791,7 +1840,7 @@ private:
           maxBytes = kj::min(maxBytes, MAX_CHUNK_HEADER_SIZE);
         }
 
-        readPromise = inner.read(headerBuffer.begin() + bufferEnd, 1, maxBytes);
+        readPromise = inner.read(headerBuffer.slice(bufferEnd).first(maxBytes).asBytes(), 1);
       }
 
       auto amount = co_await readPromise;
@@ -2030,9 +2079,66 @@ public:
     }
   }
 
+  Promise<uint64_t> pumpTo(AsyncOutputStream& output, uint64_t amount) override {
+    // SUBTLE: Before we go and implement pumpTo() ourselves, let's try to call
+    //   output.tryPumpFrom(). This is not because we think `output` might have some sort of
+    //   optimization that recognizes `HttpFixedLengthEntityReader` specifically, but rather
+    //   because if `output` never actually gets hooked up to anything, we'd like to avoid marking
+    //   ourselves dirty. In particular, if `output` is a PromisedOutputStream or one end of an
+    //   `AsyncPipe`, then its `tryPumpFrom()` will return a promise that first waits to find out
+    //   where the output will eventually flow to, then calls `input.pumpTo()` to pump directly to
+    //   that destination. That call to `pumpTo()` comes right back to *this* object, but with
+    //   a new `output`. Eventually, when we get hooked up to a stream whose `tryPumpFrom()`
+    //   returns null, THEN we have found our final destination, and we can mark ourselves dirty.
+    //
+    //   If we don't do this, there are cases where we'll set `clean = false` too soon, even though
+    //   the pump ends up being canceled before it actually connects to anything. This in turn
+    //   breaks the logic which tries to discard the request body if the app never read it -- we
+    //   can't discard the request body if we don't know how much there is to discard, and if
+    //   `clean = false` then we must assume we don't know.
+    KJ_IF_SOME(promise, output.tryPumpFrom(*this, amount)) {
+      return kj::mv(promise);
+    } else {
+      return pumpToImpl(output, amount);
+    }
+  }
+
 private:
   size_t length;
   bool clean = true;
+
+  Promise<uint64_t> pumpToImpl(AsyncOutputStream& output, uint64_t amount) {
+    KJ_REQUIRE(clean, "can't read more data after a previous read didn't complete");
+    clean = false;
+
+    // Clamp to the expected length.
+    if (amount > length) amount = length;
+
+    if (amount == 0) {
+      clean = true;
+      co_return 0;
+    }
+
+    auto actual = co_await getInner().pumpTo(output, amount);
+    length -= actual;
+
+    if (length == 0) {
+      doneReading();
+    } else if (actual < amount) {
+      // We hit EOF before pumping what was expected, but this means the stream ended prematurely
+      // without reaching the expected content-length, so throw an exception instead.
+      size_t expectedLength = length + actual;
+      kj::throwRecoverableException(KJ_EXCEPTION(
+        DISCONNECTED,
+        "premature EOF in HTTP entity body; did not reach Content-Length",
+        expectedLength,
+        actual
+      ));
+    }
+
+    clean = true;
+    co_return actual;
+  }
 };
 
 class HttpChunkedEntityReader final: public HttpEntityBodyReader {
@@ -2145,7 +2251,15 @@ kj::Own<kj::AsyncInputStream> HttpInputStreamImpl::getEntityBody(
       // Body elided.
       kj::Maybe<uint64_t> length;
       KJ_IF_SOME(cl, headers.get(HttpHeaderId::CONTENT_LENGTH)) {
-        length = strtoull(cl.cStr(), nullptr, 10);
+        // Validate that the Content-Length is a non-negative integer. Note that strtoull() accepts
+        // leading '-' signs and silently converts negative values to large unsigned values, so we
+        // must explicitly check for a leading digit.
+        char* end;
+        uint64_t parsedValue = strtoull(cl.cStr(), &end, 10);
+        if (cl[0] >= '0' && cl[0] <= '9' && end > cl.begin() && *end == '\0') {
+          length = parsedValue;
+        }
+        // If invalid, we just leave `length` as kj::none, since the body is elided anyway.
       } else if (headers.get(HttpHeaderId::TRANSFER_ENCODING) == kj::none) {
         // HACK: Neither Content-Length nor Transfer-Encoding header in response to HEAD
         //   request. Propagate this fact with a 0 expected body length.
@@ -2179,6 +2293,18 @@ kj::Own<kj::AsyncInputStream> HttpInputStreamImpl::getEntityBody(
     if (fastCaseCmp<'c','h','u','n','k','e','d'>(te.cStr())) {
       // #3¶1
       return kj::heap<HttpChunkedEntityReader>(*this);
+    } else if (fastCaseCmp<'c','h','u','n','k','e','d',',',
+                      ' ','c','h','u','n','k','e','d'>(te.cStr()) ||
+               fastCaseCmp<'c','h','u','n','k','e','d',',',
+                      'c','h','u','n','k','e','d'>(te.cStr())) {
+      // Handle "chunked, chunked" (with or without space) as equivalent to "chunked"
+      // This is technically invalid per HTTP spec, but we treat it as single chunked encoding
+      // to avoid breaking compatibility with misconfigured clients/proxies
+      // Note that this does not create a risk for request smuggling because, in the worst case,
+      // if the sender actually did double-chunk the stream, we'll merely end up delivering a
+      // corrupted stream (the body will contain chunk framing).
+      // We would not end up misinterpreting the outer framing, so we won't desync.
+      return kj::heap<HttpChunkedEntityReader>(*this);
     } else if (fastCaseCmp<'i','d','e','n','t','i','t','y'>(te.cStr())) {
       // #3¶2
       KJ_REQUIRE(type != REQUEST, "request body cannot have Transfer-Encoding other than chunked");
@@ -2194,7 +2320,9 @@ kj::Own<kj::AsyncInputStream> HttpInputStreamImpl::getEntityBody(
     //   "Content-Length: 5, 5, 5". Hopefully no one actually does that...
     char* end;
     uint64_t length = strtoull(cl.cStr(), &end, 10);
-    if (end > cl.begin() && *end == '\0') {
+    // Note that strtoull() accepts leading '-' signs and silently converts negative values to
+    // large unsigned values, so we must explicitly check for a leading digit.
+    if (cl[0] >= '0' && cl[0] <= '9' && end > cl.begin() && *end == '\0') {
       // #5
       return kj::heap<HttpFixedLengthEntityReader>(*this, length);
     } else {
@@ -2566,7 +2694,7 @@ public:
     auto parts = kj::heapArray<ArrayPtr<const byte>>(3);
     parts[0] = header.asBytes();
     parts[1] = buffer;
-    parts[2] = kj::StringPtr("\r\n").asBytes();
+    parts[2] = "\r\n"_kjb;
 
     auto promise = getInner().writeBodyData(parts.asPtr());
     return promise.attach(kj::mv(header), kj::mv(parts));
@@ -2584,7 +2712,7 @@ public:
     for (auto& piece: pieces) {
       partsBuilder.add(piece);
     }
-    partsBuilder.add(kj::StringPtr("\r\n").asBytes());
+    partsBuilder.add("\r\n"_kjb);
 
     auto parts = partsBuilder.finish();
     auto promise = getInner().writeBodyData(parts.asPtr());
@@ -2853,7 +2981,7 @@ public:
             }
             bool addNullTerminator = true;
             // We want to add the null terminator when receiving a TEXT message.
-            auto decompressedOrError = decompressor.processMessage(message, originalMaxSize, 
+            auto decompressedOrError = decompressor.processMessage(message, originalMaxSize,
                 addNullTerminator);
             KJ_SWITCH_ONEOF(decompressedOrError) {
               KJ_CASE_ONEOF(protocolError, ProtocolError) {
@@ -2885,7 +3013,7 @@ public:
               // We must reset context on each message.
               decompressor.reset();
             }
-            
+
             auto decompressedOrError = decompressor.processMessage(message, originalMaxSize);
             KJ_SWITCH_ONEOF(decompressedOrError) {
               KJ_CASE_ONEOF(protocolError, ProtocolError) {
@@ -3347,7 +3475,7 @@ private:
     }
 
   private:
-    Result pumpOnce() {
+    kj::OneOf<Result, ProtocolError> pumpOnce() {
       // Prepares Zlib's internal state for a call to deflate/inflate, then calls the relevant
       // function to process the input buffer. It is assumed that the caller has already set up
       // Zlib's input buffer.
@@ -3371,6 +3499,13 @@ private:
           break;
         case Mode::DECOMPRESS:
           result = inflate(&ctx, Z_SYNC_FLUSH);
+          // inflate() returns Z_DATA_ERROR if the provided input is not valid compressed data.
+          // Return a protocol error in that case.
+          if (result == Z_DATA_ERROR) {
+              return ProtocolError {
+                  .statusCode = 1002,
+                  .description = "Invalid compressed data"};
+          }
           KJ_REQUIRE(result == Z_OK || result == Z_BUF_ERROR || result == Z_STREAM_END,
                       "Decompression failed", result, " with reason", ctx.msg);
           break;
@@ -3388,32 +3523,37 @@ private:
       kj::Vector<Result> output;
       size_t totalBytesProcessed = 0;
       for (;;) {
-        Result result = pumpOnce();
+        KJ_SWITCH_ONEOF(pumpOnce()) {
+          KJ_CASE_ONEOF(protocolError, ProtocolError) {
+            return kj::mv(protocolError);
+          }
+          KJ_CASE_ONEOF(result, Result) {
+            auto status = result.processResult;
+            auto bytesProcessed = result.size;
+            if (bytesProcessed > 0) {
+              output.add(kj::mv(result));
+              totalBytesProcessed += bytesProcessed;
+              KJ_IF_SOME(m, maxSize) {
+                // This is only non-null for `receive` calls, so we must be decompressing. We don't want
+                // the decompressed message to OOM us, so let's make sure it's not too big.
+                if (totalBytesProcessed > m) {
+                  return ProtocolError {
+                      .statusCode = 1009,
+                      .description = "Message is too large"};
+                }
+              }
+            }
 
-        auto status = result.processResult;
-        auto bytesProcessed = result.size;
-        if (bytesProcessed > 0) {
-          output.add(kj::mv(result));
-          totalBytesProcessed += bytesProcessed;
-          KJ_IF_SOME(m, maxSize) {
-            // This is only non-null for `receive` calls, so we must be decompressing. We don't want
-            // the decompressed message to OOM us, so let's make sure it's not too big.
-            if (totalBytesProcessed > m) {
-              return ProtocolError {
-                  .statusCode = 1009,
-                  .description = "Message is too large"};
+            if ((ctx.avail_in == 0 && ctx.avail_out != 0) || status == Z_STREAM_END) {
+              // If we're out of input to consume, and we have space in the output buffer, then we must
+              // have flushed the remaining message, so we're done pumping. Alternatively, if we found a
+              // BFINAL deflate block, then we know the stream is completely finished.
+              if (status == Z_STREAM_END) {
+                reset();
+              }
+              return kj::mv(output);
             }
           }
-        }
-
-        if ((ctx.avail_in == 0 && ctx.avail_out != 0) || status == Z_STREAM_END) {
-          // If we're out of input to consume, and we have space in the output buffer, then we must
-          // have flushed the remaining message, so we're done pumping. Alternatively, if we found a
-          // BFINAL deflate block, then we know the stream is completely finished.
-          if (status == Z_STREAM_END) {
-            reset();
-          }
-          return kj::mv(output);
         }
       }
     }
@@ -3539,7 +3679,7 @@ private:
           // We must reset context on each message.
           compressor.reset();
         }
-        
+
         KJ_SWITCH_ONEOF(compressor.processMessage(message)) {
           KJ_CASE_ONEOF(error, ProtocolError) {
             KJ_FAIL_REQUIRE("Error compressing websocket message: ", error.description);
@@ -3679,9 +3819,13 @@ private:
         co_return;
       }
 
+      Mask mask(maskKeyGenerator);
+      if (!mask.isZero()) {
+        mask.apply(payload);
+      }
+
       kj::ArrayPtr<const byte> sendParts[2];
-      sendParts[0] = sendHeader.compose(true, false, opcode,
-                                        payload.size(), Mask(maskKeyGenerator));
+      sendParts[0] = sendHeader.compose(true, false, opcode, payload.size(), mask);
       sendParts[1] = payload;
       co_await stream->write(sendParts);
       KJ_IF_SOME(fulfiller, maybeFulfiller) {
@@ -3759,34 +3903,33 @@ kj::Own<WebSocket> newWebSocket(kj::Own<kj::AsyncIoStream> stream,
 }
 
 static kj::Promise<void> pumpWebSocketLoop(WebSocket& from, WebSocket& to) {
-  return from.receive().then([&from,&to](WebSocket::Message&& message) {
-    KJ_SWITCH_ONEOF(message) {
-      KJ_CASE_ONEOF(text, kj::String) {
-        return to.send(text)
-            .attach(kj::mv(text))
-            .then([&from,&to]() { return pumpWebSocketLoop(from, to); });
+  try {
+    while (true) {
+      auto message = co_await from.receive();
+      KJ_SWITCH_ONEOF(message) {
+        KJ_CASE_ONEOF(text, kj::String) {
+          co_await to.send(text);
+        }
+        KJ_CASE_ONEOF(data, kj::Array<byte>) {
+          co_await to.send(data);
+        }
+        KJ_CASE_ONEOF(close, WebSocket::Close) {
+          // Once a close has passed through, the pump is complete.
+          co_await to.close(close.code, close.reason);
+          co_return;
+        }
       }
-      KJ_CASE_ONEOF(data, kj::Array<byte>) {
-        return to.send(data)
-            .attach(kj::mv(data))
-            .then([&from,&to]() { return pumpWebSocketLoop(from, to); });
-      }
-      KJ_CASE_ONEOF(close, WebSocket::Close) {
-        // Once a close has passed through, the pump is complete.
-        return to.close(close.code, close.reason)
-            .attach(kj::mv(close));
-      }
+      // continue the loop
     }
-    KJ_UNREACHABLE;
-  }, [&to](kj::Exception&& e) -> kj::Promise<void> {
+  } catch (...) {
     // We don't know if it was a read or a write that threw. If it was a read that threw, we need
     // to send a disconnect on the destination. If it was the destination that threw, it
     // shouldn't hurt to disconnect() it again, but we'll catch and squelch any exceptions.
     kj::runCatchingExceptions([&to]() { to.disconnect(); });
 
     // In any case, this error broke the pump. We should propagate it out as the pump result.
-    return kj::mv(e);
-  });
+    throw;
+  }
 }
 
 kj::Promise<void> WebSocket::pumpTo(WebSocket& other) {
@@ -3849,29 +3992,31 @@ public:
 
   kj::Promise<void> send(kj::ArrayPtr<const byte> message) override {
     KJ_IF_SOME(s, state) {
-      return s.send(message).then([&, size = message.size()]() { transferredBytes += size; });
+      co_await s.send(message);
     } else {
-      return newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message))
-          .then([&, size = message.size()]() { transferredBytes += size; });
+      co_await newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message));
     }
+    transferredBytes += message.size();
   }
+
   kj::Promise<void> send(kj::ArrayPtr<const char> message) override {
     KJ_IF_SOME(s, state) {
-      return s.send(message).then([&, size = message.size()]() { transferredBytes += size; });
+      co_await s.send(message);
     } else {
-      return newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message))
-          .then([&, size = message.size()]() { transferredBytes += size; });
+      co_await newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message));
     }
+    transferredBytes += message.size();
   }
+
   kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
     KJ_IF_SOME(s, state) {
-      return s.close(code, reason)
-          .then([&, size = reason.size()]() { transferredBytes += (2 +size); });
+      co_await s.close(code, reason);
     } else {
-      return newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(ClosePtr { code, reason }))
-          .then([&, size = reason.size()]() { transferredBytes += (2 +size); });
+      co_await newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(ClosePtr { code, reason }));
     }
+    transferredBytes += reason.size() + 2;
   }
+
   void disconnect() override {
     KJ_IF_SOME(s, state) {
       s.disconnect();
@@ -3910,18 +4055,20 @@ public:
     }
   }
   kj::Promise<void> pumpTo(WebSocket& other) override {
-    auto onAbort = other.whenAborted()
-        .then([]() -> kj::Promise<void> {
+    auto onAbort = other.whenAborted().then([]() -> kj::Promise<void> {
       return KJ_EXCEPTION(DISCONNECTED, "WebSocket was aborted");
     });
 
+    return pumpToNoAbort(other).exclusiveJoin(kj::mv(onAbort));
+  }
+
+  kj::Promise<void> pumpToNoAbort(WebSocket& other) {
     KJ_IF_SOME(s, state) {
       auto before = other.receivedByteCount();
-      return s.pumpTo(other).attach(kj::defer([this, &other, before]() {
-        transferredBytes += other.receivedByteCount() - before;
-      })).exclusiveJoin(kj::mv(onAbort));
+      KJ_DEFER(transferredBytes += other.receivedByteCount() - before);
+      co_await s.pumpTo(other);
     } else {
-      return newAdaptedPromise<void, BlockedPumpTo>(*this, other).exclusiveJoin(kj::mv(onAbort));
+      co_await newAdaptedPromise<void, BlockedPumpTo>(*this, other);
     }
   }
 
@@ -6286,7 +6433,7 @@ public:
     auto parsed = Url::parse(url, Url::HTTP_PROXY_REQUEST, urlOptions);
     auto path = parsed.toString(Url::HTTP_REQUEST);
     auto headersCopy = headers.clone();
-    headersCopy.set(HttpHeaderId::HOST, parsed.host);
+    headersCopy.setPtr(HttpHeaderId::HOST, parsed.host);
     return getClient(parsed).request(method, path, headersCopy, expectedBodySize);
   }
 
@@ -6302,7 +6449,7 @@ public:
     auto parsed = Url::parse(url, Url::HTTP_PROXY_REQUEST, urlOptions);
     auto path = parsed.toString(Url::HTTP_REQUEST);
     auto headersCopy = headers.clone();
-    headersCopy.set(HttpHeaderId::HOST, parsed.host);
+    headersCopy.setPtr(HttpHeaderId::HOST, parsed.host);
     return getClient(parsed).openWebSocket(path, headersCopy);
   }
 
@@ -6471,11 +6618,11 @@ class ConcurrencyLimitingHttpClient final: public HttpClient {
 public:
   KJ_DISALLOW_COPY_AND_MOVE(ConcurrencyLimitingHttpClient);
   ConcurrencyLimitingHttpClient(
-      kj::HttpClient& inner, uint maxConcurrentRequests,
-      kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback)
+      kj::HttpClient& inner, ConcurrencyLimitingHttpClientSettings settings)
       : inner(inner),
-        maxConcurrentRequests(maxConcurrentRequests),
-        countChangedCallback(kj::mv(countChangedCallback)) {}
+        maxConcurrentRequests(settings.maxConcurrentRequests),
+        countChangedCallback(kj::mv(settings.countChangedCallback)),
+        releaseSlotOnHeadersReceived(settings.releaseSlotOnHeadersReceived) {}
 
   ~ConcurrencyLimitingHttpClient() noexcept {
     // Crash in this case because otherwise we'll have UAF later on.
@@ -6490,7 +6637,9 @@ public:
       auto counter = ConnectionCounter(*this);
       auto request = inner.request(method, url, headers, expectedBodySize);
       fireCountChanged();
-      auto promise = attachCounter(kj::mv(request.response), kj::mv(counter));
+      auto promise = releaseSlotOnHeadersReceived
+          ? releaseCounterOnHeaders(kj::mv(request.response), kj::mv(counter))
+          : attachCounter(kj::mv(request.response), kj::mv(counter));
       return { kj::mv(request.body), kj::mv(promise) };
     }
 
@@ -6505,7 +6654,10 @@ public:
                headersCopy = kj::mv(headersCopy),
                expectedBodySize](ConnectionCounter&& counter) mutable {
       auto req = inner.request(method, urlCopy, headersCopy, expectedBodySize);
-      return kj::tuple(kj::mv(req.body), attachCounter(kj::mv(req.response), kj::mv(counter)));
+      auto promise = releaseSlotOnHeadersReceived
+          ? releaseCounterOnHeaders(kj::mv(req.response), kj::mv(counter))
+          : attachCounter(kj::mv(req.response), kj::mv(counter));
+      return kj::tuple(kj::mv(req.body), kj::mv(promise));
     });
     auto split = combined.split();
     pendingRequests.push(kj::mv(paf.fulfiller));
@@ -6519,7 +6671,9 @@ public:
       auto counter = ConnectionCounter(*this);
       auto response = inner.openWebSocket(url, headers);
       fireCountChanged();
-      return attachCounter(kj::mv(response), kj::mv(counter));
+      return releaseSlotOnHeadersReceived
+          ? releaseCounterOnHeaders(kj::mv(response), kj::mv(counter))
+          : attachCounter(kj::mv(response), kj::mv(counter));
     }
 
     auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
@@ -6530,7 +6684,9 @@ public:
         .then([this,
                urlCopy = kj::mv(urlCopy),
                headersCopy = kj::mv(headersCopy)](ConnectionCounter&& counter) mutable {
-      return attachCounter(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter));
+      return releaseSlotOnHeadersReceived
+          ? releaseCounterOnHeaders(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter))
+          : attachCounter(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter));
     });
 
     pendingRequests.push(kj::mv(paf.fulfiller));
@@ -6544,7 +6700,9 @@ public:
       auto counter = ConnectionCounter(*this);
       auto response = inner.connect(host, headers, settings);
       fireCountChanged();
-      return attachCounter(kj::mv(response), kj::mv(counter));
+      return releaseSlotOnHeadersReceived
+          ? releaseCounterOnHeaders(kj::mv(response), kj::mv(counter))
+          : attachCounter(kj::mv(response), kj::mv(counter));
     }
 
     auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
@@ -6554,7 +6712,9 @@ public:
               (ConnectionCounter&& counter) mutable
                   -> kj::Tuple<kj::Promise<ConnectRequest::Status>,
                                kj::Promise<kj::Own<kj::AsyncIoStream>>> {
-      auto request = attachCounter(inner.connect(host, headers, settings), kj::mv(counter));
+      auto request = releaseSlotOnHeadersReceived
+          ? releaseCounterOnHeaders(inner.connect(host, headers, settings), kj::mv(counter))
+          : attachCounter(inner.connect(host, headers, settings), kj::mv(counter));
       return kj::tuple(kj::mv(request.status), kj::mv(request.connection));
     }).split();
 
@@ -6574,6 +6734,7 @@ private:
   uint maxConcurrentRequests;
   uint concurrentRequests = 0;
   kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback;
+  bool releaseSlotOnHeadersReceived;
 
   std::queue<kj::Own<kj::PromiseFulfiller<ConnectionCounter>>> pendingRequests;
   // TODO(someday): want maximum cap on queue size?
@@ -6672,15 +6833,55 @@ private:
     request.connection = request.connection.attach(kj::mv(counter));
     return kj::mv(request);
   }
+
+  // The following functions release the concurrency slot when headers are received, rather than
+  // when the response body is fully consumed. Used when releaseSlotOnHeadersReceived is true.
+
+  static kj::Promise<Response> releaseCounterOnHeaders(
+      kj::Promise<Response>&& promise,
+      ConnectionCounter&& counter) {
+    return promise.then([counter = kj::mv(counter)](Response&& response) mutable {
+      // Counter destroyed here when lambda exits, releasing the slot
+      return kj::mv(response);
+    });
+  }
+
+  static kj::Promise<WebSocketResponse> releaseCounterOnHeaders(
+      kj::Promise<WebSocketResponse>&& promise,
+      ConnectionCounter&& counter) {
+    return promise.then([counter = kj::mv(counter)](WebSocketResponse&& response) mutable {
+      // Counter destroyed here when lambda exits, releasing the slot
+      return kj::mv(response);
+    });
+  }
+
+  static ConnectRequest releaseCounterOnHeaders(
+      ConnectRequest&& request,
+      ConnectionCounter&& counter) {
+    // Release the slot when the status promise resolves (headers received)
+    request.status = request.status.then(
+        [counter = kj::mv(counter)](ConnectRequest::Status&& status) mutable {
+      // Counter destroyed here when lambda exits, releasing the slot
+      return kj::mv(status);
+    });
+    return kj::mv(request);
+  }
 };
 
 }
 
 kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
+    HttpClient& inner, ConcurrencyLimitingHttpClientSettings settings) {
+  return kj::heap<ConcurrencyLimitingHttpClient>(inner, kj::mv(settings));
+}
+
+kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
     HttpClient& inner, uint maxConcurrentRequests,
     kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback) {
-  return kj::heap<ConcurrencyLimitingHttpClient>(inner, maxConcurrentRequests,
-      kj::mv(countChangedCallback));
+  return newConcurrencyLimitingHttpClient(inner, {
+    .maxConcurrentRequests = maxConcurrentRequests,
+    .countChangedCallback = kj::mv(countChangedCallback)
+  });
 }
 
 // =======================================================================================
@@ -6727,7 +6928,7 @@ public:
     // `Upgrade: websocket` so that headers.isWebSocket() returns true on the service side.
     auto urlCopy = kj::str(url);
     auto headersCopy = kj::heap(headers.clone());
-    headersCopy->set(HttpHeaderId::UPGRADE, "websocket");
+    headersCopy->setPtr(HttpHeaderId::UPGRADE, "websocket");
     KJ_DASSERT(headersCopy->isWebSocket());
 
     auto paf = kj::newPromiseAndFulfiller<WebSocketResponse>();
@@ -6946,10 +7147,8 @@ private:
       return inner->send(message);
     }
     kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
-      return inner->close(code, reason)
-          .then([this]() {
-        return afterSendClosed();
-      });
+      co_await inner->close(code, reason);
+      co_await afterSendClosed();
     }
     void disconnect() override {
       inner->disconnect();
@@ -6962,18 +7161,15 @@ private:
       return inner->whenAborted();
     }
     kj::Promise<Message> receive(size_t maxSize) override {
-      return inner->receive(maxSize).then([this](Message&& message) -> kj::Promise<Message> {
-        if (message.is<WebSocket::Close>()) {
-          return afterReceiveClosed()
-              .then([message = kj::mv(message)]() mutable { return kj::mv(message); });
-        }
-        return kj::mv(message);
-      });
+      auto message = co_await inner->receive(maxSize);
+      if (message.is<WebSocket::Close>()) {
+        co_await afterReceiveClosed();
+      }
+      co_return message;
     }
     kj::Promise<void> pumpTo(WebSocket& other) override {
-      return inner->pumpTo(other).then([this]() {
-        return afterReceiveClosed();
-      });
+      co_await inner->pumpTo(other);
+      co_await afterReceiveClosed();
     }
     kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
       return other.pumpTo(*inner).then([this]() {
@@ -7001,10 +7197,9 @@ private:
         KJ_IF_SOME(t, completionTask) {
           auto result = kj::mv(t);
           completionTask = kj::none;
-          return result;
+          co_await result;
         }
       }
-      return kj::READY_NOW;
     }
 
     kj::Promise<void> afterReceiveClosed() {
@@ -7013,10 +7208,9 @@ private:
         KJ_IF_SOME(t, completionTask) {
           auto result = kj::mv(t);
           completionTask = kj::none;
-          return result;
+          co_await result;
         }
       }
-      return kj::READY_NOW;
     }
   };
 
@@ -7434,12 +7628,13 @@ public:
         "suspend() may only be called before the request body is consumed");
     KJ_DEFER(suspended = true);
     auto released = httpInput.releaseBuffer();
+    auto headers = httpInput.releaseHeaders();
     return {
       kj::mv(released.buffer),
       released.leftover,
       suspendable.method,
       suspendable.url,
-      suspendable.headers.cloneShallow(),
+      kj::mv(headers),
     };
   }
 
@@ -8272,7 +8467,7 @@ kj::Promise<void> HttpServerErrorHandler::handleClientProtocolError(
 
   HttpHeaderTable headerTable {};
   HttpHeaders headers(headerTable);
-  headers.set(HttpHeaderId::CONTENT_TYPE, "text/plain");
+  headers.setPtr(HttpHeaderId::CONTENT_TYPE, "text/plain");
 
   auto errorMessage = kj::str("ERROR: ", protocolError.description);
   auto body = response.send(protocolError.statusCode, protocolError.statusMessage,
@@ -8301,7 +8496,7 @@ kj::Promise<void> HttpServerErrorHandler::handleApplicationError(
 
     HttpHeaderTable headerTable {};
     HttpHeaders headers(headerTable);
-    headers.set(HttpHeaderId::CONTENT_TYPE, "text/plain");
+    headers.setPtr(HttpHeaderId::CONTENT_TYPE, "text/plain");
 
     kj::String errorMessage;
     kj::Own<AsyncOutputStream> body;
@@ -8335,7 +8530,7 @@ void HttpServerErrorHandler::handleListenLoopException(kj::Exception&& exception
 kj::Promise<void> HttpServerErrorHandler::handleNoResponse(kj::HttpService::Response& response) {
   HttpHeaderTable headerTable {};
   HttpHeaders headers(headerTable);
-  headers.set(HttpHeaderId::CONTENT_TYPE, "text/plain");
+  headers.setPtr(HttpHeaderId::CONTENT_TYPE, "text/plain");
 
   constexpr auto errorMessage = "ERROR: The HttpService did not generate a response."_kj;
   auto body = response.send(500, "Internal Server Error", headers, errorMessage.size());

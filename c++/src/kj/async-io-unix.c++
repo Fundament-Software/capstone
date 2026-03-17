@@ -160,14 +160,14 @@ public:
   }
 
   Promise<ReadResult> tryReadWithFds(void* buffer, size_t minBytes, size_t maxBytes,
-                                     AutoCloseFd* fdBuffer, size_t maxFds) override {
+                                     OwnFd* fdBuffer, size_t maxFds) override {
     return tryReadInternal(buffer, minBytes, maxBytes, fdBuffer, maxFds, {0,0});
   }
 
   Promise<ReadResult> tryReadWithStreams(
       void* buffer, size_t minBytes, size_t maxBytes,
       Own<AsyncCapabilityStream>* streamBuffer, size_t maxStreams) override {
-    auto fdBuffer = kj::heapArray<AutoCloseFd>(maxStreams);
+    auto fdBuffer = kj::heapArray<OwnFd>(maxStreams);
     auto promise = tryReadInternal(buffer, minBytes, maxBytes, fdBuffer.begin(), maxStreams, {0,0});
 
     return promise.then([this, fdBuffer = kj::mv(fdBuffer), streamBuffer]
@@ -416,7 +416,7 @@ private:
         KJ_FAIL_SYSCALL("pipe2()", error);
     }
 
-    AutoCloseFd pipeIn(pipeFds[0]), pipeOut(pipeFds[1]);
+    OwnFd pipeIn(pipeFds[0]), pipeOut(pipeFds[1]);
 
     return splicePumpLoop(input, pipeFds[0], pipeFds[1], readSoFar, limit, 0)
         .attach(kj::mv(pipeIn), kj::mv(pipeOut));
@@ -557,7 +557,7 @@ private:
   Maybe<Function<void(ArrayPtr<AncillaryMessage>)>> ancillaryMsgCallback;
 
   Promise<ReadResult> tryReadInternal(void* buffer, size_t minBytes, size_t maxBytes,
-                                      AutoCloseFd* fdBuffer, size_t maxFds,
+                                      OwnFd* fdBuffer, size_t maxFds,
                                       ReadResult alreadyRead) {
     // `alreadyRead` is the number of bytes we have already received via previous reads -- minBytes,
     // maxBytes, and buffer have already been adjusted to account for them, but this count must
@@ -669,9 +669,9 @@ private:
             auto len = kj::min(cmsg->cmsg_len, spaceLeft);
             auto data = arrayPtr(reinterpret_cast<int*>(CMSG_DATA(cmsg)),
                                  (len - CMSG_LEN(0)) / sizeof(int));
-            kj::Vector<kj::AutoCloseFd> trashFds;
+            kj::Vector<kj::OwnFd> trashFds;
             for (auto fd: data) {
-              kj::AutoCloseFd ownFd(fd);
+              kj::OwnFd ownFd(fd);
               if (nfds < maxFds) {
                 fdBuffer[nfds++] = kj::mv(ownFd);
               } else {
@@ -902,20 +902,20 @@ public:
     if (addrlen < other.addrlen) return true;
     if (addrlen > other.addrlen) return false;
 
-    return memcmp(&addr.generic, &other.addr.generic, addrlen) < 0;
+    // addrlen == other.addrlen at this point
+    return kj::asBytes(addr).first(addrlen) < kj::asBytes(other.addr).first(addrlen);
   }
 
   const struct sockaddr* getRaw() const { return &addr.generic; }
   socklen_t getRawSize() const { return addrlen; }
 
-  int socket(int type) const {
+  kj::OwnFd socket(int type) const {
     bool isStream = type == SOCK_STREAM;
 
-    int result;
 #if __linux__ && !__BIONIC__
     type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
 #endif
-    KJ_SYSCALL(result = ::socket(addr.generic.sa_family, type, 0));
+    auto result = KJ_SYSCALL_FD(::socket(addr.generic.sa_family, type, 0));
 
     if (isStream && (addr.generic.sa_family == AF_INET ||
                      addr.generic.sa_family == AF_INET6)) {
@@ -1236,7 +1236,7 @@ Promise<Array<SocketAddress>> SocketAddress::lookupHost(
       struct addrinfo hints;
       memset(&hints, 0, sizeof(hints));
       hints.ai_family = AF_UNSPEC;
-#if __BIONIC__
+#if __BIONIC__ || !defined(AI_V4MAPPED)
       // AI_V4MAPPED causes getaddrinfo() to fail on Bionic libc (Android).
       hints.ai_flags = AI_ADDRCONFIG;
 #else
@@ -1342,7 +1342,19 @@ public:
 #endif
 
     if (newFd >= 0) {
-      kj::AutoCloseFd ownFd(newFd);
+      kj::OwnFd ownFd(newFd);
+
+      if (addrlen == 0) {
+#if __APPLE__
+        // A bug in XNU (the macOS kernel) can cause accept() to return a socket but addrlen=0
+        // The socket is already dead and should be discarded
+        // https://github.com/apple-oss-distributions/xnu/blob/e3723e1f17661b24996789d8afc084c0c3303b26/bsd/kern/uipc_syscalls.c#L663-L691
+#else
+        KJ_LOG(ERROR, "accept() returned zero-size address?");
+#endif
+        return acceptImpl(authenticated);
+      }
+
       if (!filter.shouldAllow(reinterpret_cast<struct sockaddr*>(&addr), addrlen)) {
         // Ignore disallowed address.
         return acceptImpl(authenticated);
@@ -1357,8 +1369,10 @@ public:
               ownFd.get(), IPPROTO_TCP, TCP_NODELAY, (char*)&one, sizeof(one))) {
           case EOPNOTSUPP:
           case ENOPROTOOPT: // (returned for AF_UNIX in cygwin)
-#if __FreeBSD__
-          case EINVAL: // (returned for AF_UNIX in FreeBSD)
+#if __APPLE__ || __FreeBSD__
+          case EINVAL:
+            // On FreeBSD, EINVAL is returned for AF_UNIX sockets.
+            // On macOS, EINVAL may be returned for sockets that are already dead (due to a race with RST).
 #endif
             break;
           default:
@@ -1565,11 +1579,9 @@ public:
 
   Own<ConnectionReceiver> listen() override {
     auto makeReceiver = [&](SocketAddress& addr) {
-      int fd = addr.socket(SOCK_STREAM);
+      auto fd = addr.socket(SOCK_STREAM);
 
       {
-        KJ_ON_SCOPE_FAILURE(close(fd));
-
         // We always enable SO_REUSEADDR because having to take your server down for five minutes
         // before it can restart really sucks.
         int optval = 1;
@@ -1581,7 +1593,7 @@ public:
         KJ_SYSCALL(::listen(fd, SOMAXCONN));
       }
 
-      return lowLevel.wrapListenSocketFd(fd, filter, NEW_FD_FLAGS);
+      return lowLevel.wrapListenSocketFd(kj::mv(fd), filter, NEW_FD_FLAGS);
     };
 
     if (addrs.size() == 1) {
@@ -1598,11 +1610,9 @@ public:
           "in the future.", addrs[0].toString());
     }
 
-    int fd = addrs[0].socket(SOCK_DGRAM);
+    auto fd = addrs[0].socket(SOCK_DGRAM);
 
     {
-      KJ_ON_SCOPE_FAILURE(close(fd));
-
       // We always enable SO_REUSEADDR because having to take your server down for five minutes
       // before it can restart really sucks.
       int optval = 1;
@@ -1611,7 +1621,7 @@ public:
       addrs[0].bind(fd);
     }
 
-    return lowLevel.wrapDatagramSocketFd(fd, filter, NEW_FD_FLAGS);
+    return lowLevel.wrapDatagramSocketFd(kj::mv(fd), filter, NEW_FD_FLAGS);
   }
 
   Own<NetworkAddress> clone() override {
@@ -1644,9 +1654,9 @@ private:
       if (!addrs[0].allowedBy(filter)) {
         return KJ_EXCEPTION(FAILED, "connect() blocked by restrictPeers()");
       } else {
-        int fd = addrs[0].socket(SOCK_STREAM);
+        auto fd = addrs[0].socket(SOCK_STREAM);
         return lowLevel.wrapConnectingSocketFd(
-            fd, addrs[0].getRaw(), addrs[0].getRawSize(), NEW_FD_FLAGS);
+            kj::mv(fd), addrs[0].getRaw(), addrs[0].getRawSize(), NEW_FD_FLAGS);
       }
     }).then([&lowLevel,&filter,addrs,authenticated](Own<AsyncIoStream>&& stream)
         -> Promise<AuthenticatedStream> {
@@ -1893,10 +1903,6 @@ public:
         // when truncated. On other platforms (Linux) the length in cmsghdr will itself be
         // truncated to fit within the buffer.
 
-#if __APPLE__
-// On MacOS, `CMSG_SPACE(0)` triggers a bogus warning.
-#pragma GCC diagnostic ignored "-Wnull-pointer-arithmetic"
-#endif
         const byte* pos = reinterpret_cast<const byte*>(cmsg);
         size_t available = ancillaryBuffer.end() - pos;
         if (available < CMSG_SPACE(0)) {
@@ -1981,28 +1987,18 @@ public:
   }
 
   TwoWayPipe newTwoWayPipe() override {
-    int fds[2]{};
-    int type = SOCK_STREAM;
-#if __linux__ && !__BIONIC__
-    type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
-#endif
-    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+    auto socketpair = newOsSocketpair();
     return TwoWayPipe { {
-      lowLevel.wrapSocketFd(fds[0], NEW_FD_FLAGS),
-      lowLevel.wrapSocketFd(fds[1], NEW_FD_FLAGS)
+      lowLevel.wrapSocketFd(kj::mv(socketpair.fds[0]), NEW_FD_FLAGS),
+      lowLevel.wrapSocketFd(kj::mv(socketpair.fds[1]), NEW_FD_FLAGS)
     } };
   }
 
   CapabilityPipe newCapabilityPipe() override {
-    int fds[2]{};
-    int type = SOCK_STREAM;
-#if __linux__ && !__BIONIC__
-    type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
-#endif
-    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+    auto socketpair = newOsSocketpair();
     return CapabilityPipe { {
-      lowLevel.wrapUnixSocketFd(fds[0], NEW_FD_FLAGS),
-      lowLevel.wrapUnixSocketFd(fds[1], NEW_FD_FLAGS)
+      lowLevel.wrapUnixSocketFd(kj::mv(socketpair.fds[0]), NEW_FD_FLAGS),
+      lowLevel.wrapUnixSocketFd(kj::mv(socketpair.fds[1]), NEW_FD_FLAGS)
     } };
   }
 
@@ -2012,24 +2008,16 @@ public:
 
   PipeThread newPipeThread(
       Function<void(AsyncIoProvider&, AsyncIoStream&, WaitScope&)> startFunc) override {
-    int fds[2]{};
-    int type = SOCK_STREAM;
-#if __linux__ && !__BIONIC__
-    type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
-#endif
-    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+    auto socketpair = newOsSocketpair();
 
-    int threadFd = fds[1];
-    KJ_ON_SCOPE_FAILURE(close(threadFd));
-
-    auto pipe = lowLevel.wrapSocketFd(fds[0], NEW_FD_FLAGS);
-
-    auto thread = heap<Thread>([threadFd,startFunc=kj::mv(startFunc)]() mutable {
+    auto pipe = lowLevel.wrapSocketFd(kj::mv(socketpair.fds[0]), NEW_FD_FLAGS);
+    auto thread = heap<Thread>([threadFd=kj::mv(socketpair.fds[1]),startFunc=kj::mv(startFunc)]() mutable {
       UnixEventPort eventPort;
       EventLoop eventLoop(eventPort);
       WaitScope waitScope(eventLoop);
-      LowLevelAsyncIoProviderImpl lowLevel(eventPort);
-      auto stream = lowLevel.wrapSocketFd(threadFd, NEW_FD_FLAGS);
+      LowLevelAsyncIoProviderImpl lowLevelImpl(eventPort);
+      LowLevelAsyncIoProvider& lowLevel = lowLevelImpl;
+      auto stream = lowLevel.wrapSocketFd(kj::mv(threadFd), NEW_FD_FLAGS);
       AsyncIoProviderImpl ioProvider(lowLevel);
       startFunc(ioProvider, *stream, waitScope);
     });
@@ -2046,6 +2034,17 @@ private:
 
 }  // namespace
 
+Socketpair newOsSocketpair() {
+  LowLevelAsyncIoProvider::Fd socketpairFds[2]{};
+  int type = SOCK_STREAM;
+#if __linux__ && !__BIONIC__
+  type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
+#endif
+  KJ_SYSCALL(socketpair(AF_UNIX, type, 0, socketpairFds));
+  return Socketpair{{LowLevelAsyncIoProvider::OwnFd{socketpairFds[0]},
+                     LowLevelAsyncIoProvider::OwnFd{socketpairFds[1]}}};
+}
+
 Own<AsyncIoProvider> newAsyncIoProvider(LowLevelAsyncIoProvider& lowLevel) {
   return kj::heap<AsyncIoProviderImpl>(lowLevel);
 }
@@ -2054,16 +2053,18 @@ Own<LowLevelAsyncIoProvider> newLowLevelAsyncIoProvider(UnixEventPort& eventPort
   return kj::heap<LowLevelAsyncIoProviderImpl>(eventPort);
 }
 
-AsyncIoContext setupAsyncIo() {
+AsyncIoContext setupAsyncIo(kj::Maybe<EventLoopObserver&> observer) {
   struct BasicContext {
     UnixEventPort eventPort;
     EventLoop eventLoop;
     WaitScope waitScope;
 
-    BasicContext(): eventLoop(eventPort), waitScope(eventLoop) {}
+    BasicContext(kj::Maybe<EventLoopObserver&> observer)
+      : eventLoop(eventPort, observer),
+        waitScope(eventLoop) {}
   };
 
-  auto basicContext = heap<BasicContext>();
+  auto basicContext = heap<BasicContext>(observer);
   auto lowLevel = heap<LowLevelAsyncIoProviderImpl>(basicContext->eventPort);
   auto ioProvider = kj::heap<AsyncIoProviderImpl>(*lowLevel);
   auto& waitScope = basicContext->waitScope;

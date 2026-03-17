@@ -1,4 +1,14 @@
 load("@capnp-cpp//src/capnp:cc_capnp_library.bzl", "cc_capnp_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load(":configure.bzl", "capnp_configure")
+
+capnp_configure()
+
+exports_files([
+    "c++.capnp",
+])
 
 cc_library(
     name = "capnp",
@@ -47,6 +57,11 @@ cc_library(
         "serialize-packed.h",
         "serialize-text.h",
         "stream.capnp.h",
+        # This is just to make it avaible if `KJ_STD_COMPAT` is defined.
+        # This is an unfortunate hack, but if we would make `std-iterator.h`
+        # its own `cc_library()` we would have a circular dependency between
+        # `//src/capnp` and `//src/capnp/compat:std-iterator``.
+        "//src/capnp/compat:std-iterator.h",
     ],
     include_prefix = "capnp",
     visibility = ["//visibility:public"],
@@ -138,6 +153,10 @@ cc_binary(
     srcs = [
         "compiler/capnpc-c++.c++",
     ],
+    defines = select({
+        "//src/capnp:capnp_no_inline_accessors_true": ["CAPNP_NO_INLINE_ACCESSORS"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":capnpc",
@@ -204,14 +223,14 @@ cc_library(
     name = "capnp-test",
     srcs = ["test-util.c++"],
     hdrs = ["test-util.h"],
+    include_prefix = "capnp",
+    visibility = [":__subpackages__"],
     deps = [
         ":capnp-rpc",
         ":capnp_test",
         ":capnpc",
         "//src/kj:kj-test",
     ],
-    include_prefix = "capnp",
-    visibility = [":__subpackages__" ]
 )
 
 [cc_test(
@@ -224,7 +243,6 @@ cc_library(
     "canonicalize-test.c++",
     "common-test.c++",
     "capability-test.c++",
-    "compiler/evolution-test.c++",
     "compiler/lexer-test.c++",
     "compiler/type-id-test.c++",
     "dynamic-test.c++",
@@ -250,11 +268,11 @@ cc_library(
 cc_test(
     name = "endian-reverse-test",
     srcs = ["endian-reverse-test.c++"],
-    deps = [":capnp-test"],
     target_compatible_with = select({
         "@platforms//os:windows": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+    deps = [":capnp-test"],
 )
 
 cc_library(
@@ -273,6 +291,13 @@ cc_test(
     name = "fuzz-test",
     size = "large",
     srcs = ["fuzz-test.c++"],
-    deps = [":capnp-test"],
     tags = ["manual"],
+    deps = [":capnp-test"],
+)
+
+cc_test(
+    name = "compiler/evolution-test",
+    srcs = ["compiler/evolution-test.c++"],
+    deps = [":capnp-test"],
+    size = "large",
 )
