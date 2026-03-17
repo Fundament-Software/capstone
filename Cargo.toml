@@ -5,7 +5,7 @@ members = ["c++/src/capnp", "c++/src/kj"]
 [workspace.package]
 version = "1.2.0"
 edition = "2024"
-rust-version = "1.86.0"
+rust-version = "1.94.0"
 license = "MIT"
 repository = "https://github.com/fundament-software/capstone"
 documentation = "https://capnproto.org/"
@@ -17,3 +17,9 @@ eyre = "0.6"
 cc = "1.0"
 cxx-build = "1.0"
 kj-sys = { path = "c++/src/kj" }
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3

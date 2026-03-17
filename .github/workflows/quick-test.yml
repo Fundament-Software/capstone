@@ -141,7 +141,7 @@ jobs:
             target: 'Visual Studio 17 2022'
             arch: -A x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: test
         run: |
             cd c++ && bazel test --verbose_failures --test_output=errors -k //...
