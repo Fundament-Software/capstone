@@ -24,6 +24,11 @@
 #include "string.h"
 #include <stdint.h>
 
+// clang has dedicated builtins for crc32 on arm64, for GCC we fall back to ARM ACLE intrinsics.
+#if __ARM_FEATURE_CRC32 && !__clang__
+#include <arm_acle.h>
+#endif
+
 KJ_BEGIN_HEADER
 
 namespace kj {
@@ -107,6 +112,9 @@ struct HashCoder {
   uint operator*(ArrayPtr<T> arr) const;
   template <typename T, typename = decltype(instance<const HashCoder&>() * instance<const T&>())>
   uint operator*(const Array<T>& arr) const;
+  template <typename T, size_t smallSize,
+      typename = decltype(instance<const HashCoder&>() * instance<const T&>())>
+  uint operator*(const SmallArray<T, smallSize>& arr) const;
   template <typename T, typename = EnableIf<__is_enum(T)>>
   inline uint operator*(T e) const;
 
@@ -205,6 +213,10 @@ template <typename T, typename>
 inline uint HashCoder::operator*(const Array<T>& arr) const {
   return operator*(arr.asPtr());
 }
+template <typename T, size_t smallSize, typename>
+inline uint HashCoder::operator*(const SmallArray<T, smallSize>& arr) const {
+  return operator*(arr.asPtr());
+}
 
 template <typename T, typename>
 inline uint HashCoder::operator*(T e) const {
@@ -228,7 +240,11 @@ inline uint intHash32(uint32_t i) {
 #if __CRC32__
   return __builtin_ia32_crc32si(0, i);
 #elif __ARM_FEATURE_CRC32
+#ifdef __clang__
   return __builtin_arm_crc32w(0, i);
+#else
+  return __crc32w(0, i);
+#endif
 #else
   // Thomas Wang 32 bit integer hash function from https://gist.github.com/badboy/6267743
   // This page says it's public domain: http://burtleburtle.net/bob/hash/integer.html
@@ -257,7 +273,11 @@ inline uint intHash64(uint64_t i) {
 #if __CRC32__
   return __builtin_ia32_crc32di(0, i);
 #elif __ARM_FEATURE_CRC32
+#ifdef __clang__
   return __builtin_arm_crc32d(0, i);
+#else
+  return __crc32d(0, i);
+#endif
 #else
   // Thomas Wang hash6432shift() from https://gist.github.com/badboy/6267743
   // This page says it's public domain (inthash.c):

@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "common.h"
+#include <kj/common.h>
 #include <cstdint>
 
 KJ_BEGIN_HEADER
@@ -46,6 +46,7 @@ public:
   uint getSpecificity() const { return bitCount; }
 
   bool matches(const struct sockaddr* addr) const;
+  bool matches(StringPtr addr) const;
   bool matchesFamily(int family) const;
 
   String toString() const;

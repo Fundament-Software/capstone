@@ -98,9 +98,14 @@ public:
 
     text = kj::str(kj::repeat('_', contextDepth), file, ':', line, ": ", kj::mv(text));
 
+    bool hadSeenError = sawError;
     if (severity == LogSeverity::ERROR || severity == LogSeverity::FATAL) {
       fail();
       context.error(kj::str(text, "\nstack: ", stringifyStackTraceAddresses(trace), stringifyStackTrace(trace)));
+      if (!hadSeenError) {
+        context.warning("Test failed due to logging an unexpected ERROR (above). "
+            "Expected error logs must be captured via KJ_EXPECT_LOG() or an ExceptionCallback.");
+      }
     } else {
       context.warning(text);
     }
@@ -270,7 +275,7 @@ public:
           }
           auto end = readClock();
 
-          auto message = kj::str(name, " (", (end - start) / kj::MICROSECONDS, " μs)");
+          auto message = kj::str(name, " (", end - start, ")");
 
           if (currentFailed) {
             write(RED, "[ FAIL ]", message);

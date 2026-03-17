@@ -23,7 +23,61 @@
 #include <kj/one-of.h>
 #include <kj/debug.h>
 
+namespace {
+
+class Wrapper final: public capnp::ExplicitEndOutputStream {
+  public:
+  Wrapper(kj::Own<kj::AsyncOutputStream> inner, kj::Function<void()> uncleanEnd)
+      : state(State{kj::mv(inner), kj::mv(uncleanEnd)}) {}
+  ~Wrapper() noexcept(false) {
+    KJ_IF_SOME(s, state) {
+      s.uncleanEnd();
+    }
+  }
+
+  kj::Promise<void> end() override {
+    getInner();  // check end() only called once
+    state = kj::none;
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::byte> buffer) override {
+    return getInner().write(buffer);
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    return getInner().write(pieces);
+  }
+
+  kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
+      kj::AsyncInputStream& input, uint64_t amount) override {
+    return input.pumpTo(getInner(), amount);
+  }
+
+  kj::Promise<void> whenWriteDisconnected() override {
+    return getInner().whenWriteDisconnected();
+  }
+
+  private:
+  struct State {
+    kj::Own<kj::AsyncOutputStream> inner;
+    kj::Function<void()> uncleanEnd;
+  };
+  kj::Maybe<State> state;
+
+  kj::AsyncOutputStream& getInner() {
+    return *KJ_REQUIRE_NONNULL(state, "already called end()").inner;
+  }
+};
+
+}  // namespace
+
 namespace capnp {
+
+kj::Own<ExplicitEndOutputStream> ExplicitEndOutputStream::wrap(
+    kj::Own<kj::AsyncOutputStream> inner, kj::Function<void()> uncleanEnd) {
+  return kj::heap<Wrapper>(kj::mv(inner), kj::mv(uncleanEnd));
+}
 
 const uint MAX_BYTES_PER_WRITE = 1 << 16;
 
@@ -141,7 +195,7 @@ public:
     KJ_SWITCH_ONEOF(state) {
       KJ_CASE_ONEOF(redirected, Redirected) {
         // Ugh I guess we need to send a real end() request here.
-        return redirected.replacement.endRequest(MessageSize {2, 0}).send().ignoreResult();
+        return redirected.replacement.endRequest(MessageSize {2, 0}).sendIgnoringResult();
       }
       KJ_CASE_ONEOF(e, Ended) {
         // whatever
@@ -154,7 +208,7 @@ public:
       KJ_CASE_ONEOF(streaming, Streaming) {
         auto req = streaming.callback.endedRequest(MessageSize {4, 0});
         req.setByteCount(completed);
-        auto promise = req.send().ignoreResult();
+        auto promise = req.sendIgnoringResult();
         streaming.parent.returnStream(completed);
         state = Ended();
         return promise;
@@ -236,7 +290,7 @@ public:
 
         auto req = streaming.callback.endedRequest(MessageSize {4, 0});
         req.setByteCount(completed);
-        auto result = req.send().ignoreResult();
+        auto result = req.sendIgnoringResult();
         streaming.parent.returnStream(completed);
         state = Ended();
         return result;
@@ -437,7 +491,7 @@ public:
       }
       KJ_CASE_ONEOF(capnpStream, capnp::ByteStream::Client) {
         // Ugh I guess we need to send a real end() request here.
-        return capnpStream.endRequest(MessageSize {2, 0}).send().ignoreResult();
+        return capnpStream.endRequest(MessageSize {2, 0}).sendIgnoringResult();
       }
       KJ_CASE_ONEOF(b, Borrowed) {
         // Fine, ignore.
@@ -858,7 +912,7 @@ public:
     KJ_IF_SOME(o, optimized) {
       return o.directExplicitEnd();
     } else {
-      return inner.endRequest(MessageSize {2, 0}).send().ignoreResult();
+      return inner.endRequest(MessageSize {2, 0}).sendIgnoringResult();
     }
   }
 
@@ -921,7 +975,7 @@ public:
           });
         } else {
           // ughhhhhhhhhh, we need to split the pieces.
-          return splitAndWrite(pieces, kjStream.limit,
+          return splitAndWrite(pieces, limit,
               [kjStream,limit](kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) mutable {
             return kjStream.stream.write(pieces).then([kjStream,limit]() mutable {
               kjStream.lender.returnStream(limit);

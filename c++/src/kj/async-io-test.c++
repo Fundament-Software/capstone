@@ -36,6 +36,7 @@
 #include <kj/time.h>
 #include <sys/types.h>
 #include <kj/filesystem.h>
+
 #if _WIN32
 #include <ws2tcpip.h>
 #include "windows-sanity.h"
@@ -378,7 +379,11 @@ bool systemSupportsAddress(StringPtr addr, StringPtr service = nullptr) {
   struct addrinfo hints;
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = 0;
+#if !defined(AI_V4MAPPED)
+  hints.ai_flags = AI_ADDRCONFIG;
+#else
   hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG;
+#endif
   hints.ai_protocol = 0;
   hints.ai_canonname = nullptr;
   hints.ai_addr = nullptr;
@@ -525,6 +530,104 @@ TEST(AsyncIo, InMemoryCapabilityPipe) {
 }
 
 #if !_WIN32 && !__CYGWIN__
+TEST(AsyncIo, InMemoryCapabilityPipeFds) {
+  // Test passing file descirptors over an in-memory capability pipe.
+  //
+  // This is identical to `TEST(AsyncIo, InMemoryCapabilityPipe)` above except we use sendFd() and
+  // receiveFd().
+
+  auto io = setupAsyncIo();
+
+  int socketFds[2]{};
+  KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM, 0, socketFds));
+  kj::OwnFd socketClient(socketFds[0]);
+  kj::OwnFd sokcetServer(socketFds[1]);
+
+  auto pipe2 = newCapabilityPipe();
+  char receiveBuffer1[4]{};
+  char receiveBuffer2[4]{};
+
+  // Expect to receive an FD, then read "foo" from it, then write "bar" to it.
+  Own<AsyncCapabilityStream> receivedStream;
+  auto promise = pipe2.ends[1]->receiveFd()
+      .then([&](OwnFd fd) {
+    receivedStream = io.lowLevelProvider->wrapUnixSocketFd(kj::mv(fd));
+    return receivedStream->tryRead(receiveBuffer2, 3, 4);
+  }).then([&](size_t n) {
+    EXPECT_EQ(3u, n);
+    return receivedStream->write("bar"_kjb).then([&receiveBuffer2,n]() {
+      return heapString(receiveBuffer2, n);
+    });
+  });
+
+  // Send an FD, then write "foo" to the other end of the sent stream, then receive "bar"
+  // from it.
+  auto clientStream = io.lowLevelProvider->wrapSocketFd(kj::mv(socketClient));
+  kj::String result = pipe2.ends[0]->sendFd(kj::mv(sokcetServer))
+      .then([&]() {
+    return clientStream->write("foo"_kjb);
+  }).then([&]() {
+    return clientStream->tryRead(receiveBuffer1, 3, 4);
+  }).then([&](size_t n) {
+    EXPECT_EQ(3u, n);
+    return heapString(receiveBuffer1, n);
+  }).wait(io.waitScope);
+
+  kj::String result2 = promise.wait(io.waitScope);
+
+  EXPECT_EQ("bar", result);
+  EXPECT_EQ("foo", result2);
+}
+
+TEST(AsyncIo, InMemoryCapabilityPipeFdsReverse) {
+  // Same as above, except we do sendFd() first, then receiveFd(). This hits `BlockedWrite` instead
+  // of `BlockedRead`. At one time there was a bug in that code that mishandled the file
+  // descriptors.
+
+  auto io = setupAsyncIo();
+
+  int socketFds[2]{};
+  KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM, 0, socketFds));
+  kj::OwnFd socketClient(socketFds[0]);
+  kj::OwnFd sokcetServer(socketFds[1]);
+
+  auto pipe2 = newCapabilityPipe();
+  char receiveBuffer1[4]{};
+  char receiveBuffer2[4]{};
+
+  // Send an FD, then write "foo" to the other end of the sent stream, then receive "bar"
+  // from it.
+  auto clientStream = io.lowLevelProvider->wrapSocketFd(kj::mv(socketClient));
+  auto promise = pipe2.ends[0]->sendFd(kj::mv(sokcetServer))
+      .then([&]() {
+    return clientStream->write("foo"_kjb);
+  }).then([&]() {
+    return clientStream->tryRead(receiveBuffer1, 3, 4);
+  }).then([&](size_t n) {
+    EXPECT_EQ(3u, n);
+    return heapString(receiveBuffer1, n);
+  });
+
+  // Expect to receive an FD, then read "foo" from it, then write "bar" to it.
+  Own<AsyncCapabilityStream> receivedStream;
+  auto promise2 = pipe2.ends[1]->receiveFd()
+      .then([&](OwnFd fd) {
+    receivedStream = io.lowLevelProvider->wrapUnixSocketFd(kj::mv(fd));
+    return receivedStream->tryRead(receiveBuffer2, 3, 4);
+  }).then([&](size_t n) {
+    EXPECT_EQ(3u, n);
+    return receivedStream->write("bar"_kjb).then([&receiveBuffer2,n]() {
+      return heapString(receiveBuffer2, n);
+    });
+  });
+
+  kj::String result = promise.wait(io.waitScope);
+  kj::String result2 = promise2.wait(io.waitScope);
+
+  EXPECT_EQ("bar", result);
+  EXPECT_EQ("foo", result2);
+}
+
 TEST(AsyncIo, CapabilityPipe) {
   auto ioContext = setupAsyncIo();
 
@@ -617,7 +720,7 @@ TEST(AsyncIo, CapabilityPipeMultiStreamMessage) {
   streams.add(kj::mv(pipe3.ends[0]));
 
   ArrayPtr<const byte> secondBuf = "bar"_kjb;
-  pipe.ends[0]->writeWithStreams("foo"_kjb, arrayPtr(&secondBuf, 1), streams.finish())
+  pipe.ends[0]->writeWithStreams("foo"_kjb, arrayPtr(secondBuf), streams.finish())
       .wait(ioContext.waitScope);
 
   char receiveBuffer[7]{};
@@ -650,21 +753,21 @@ TEST(AsyncIo, ScmRightsTruncatedOdd) {
 
   int pipeFds[2]{};
   KJ_SYSCALL(miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in1(pipeFds[0]);
-  kj::AutoCloseFd out1(pipeFds[1]);
+  kj::OwnFd in1(pipeFds[0]);
+  kj::OwnFd out1(pipeFds[1]);
 
   KJ_SYSCALL(miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in2(pipeFds[0]);
-  kj::AutoCloseFd out2(pipeFds[1]);
+  kj::OwnFd in2(pipeFds[0]);
+  kj::OwnFd out2(pipeFds[1]);
 
   {
-    AutoCloseFd sendFds[2] = { kj::mv(out1), kj::mv(out2) };
+    OwnFd sendFds[2] = { kj::mv(out1), kj::mv(out2) };
     capPipe.ends[0]->writeWithFds("foo"_kjb, nullptr, sendFds).wait(io.waitScope);
   }
 
   {
     char buffer[4]{};
-    AutoCloseFd fdBuffer[1];
+    OwnFd fdBuffer[1];
     auto result = capPipe.ends[1]->tryReadWithFds(buffer, 3, 3, fdBuffer, 1).wait(io.waitScope);
     KJ_ASSERT(result.capCount == 1);
     kj::FdOutputStream(fdBuffer[0].get()).write("bar"_kjb);
@@ -722,25 +825,25 @@ TEST(AsyncIo, ScmRightsTruncatedEven) {
 
   int pipeFds[2]{};
   KJ_SYSCALL(miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in1(pipeFds[0]);
-  kj::AutoCloseFd out1(pipeFds[1]);
+  kj::OwnFd in1(pipeFds[0]);
+  kj::OwnFd out1(pipeFds[1]);
 
   KJ_SYSCALL(miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in2(pipeFds[0]);
-  kj::AutoCloseFd out2(pipeFds[1]);
+  kj::OwnFd in2(pipeFds[0]);
+  kj::OwnFd out2(pipeFds[1]);
 
   KJ_SYSCALL(miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in3(pipeFds[0]);
-  kj::AutoCloseFd out3(pipeFds[1]);
+  kj::OwnFd in3(pipeFds[0]);
+  kj::OwnFd out3(pipeFds[1]);
 
   {
-    AutoCloseFd sendFds[3] = { kj::mv(out1), kj::mv(out2), kj::mv(out3) };
+    OwnFd sendFds[3] = { kj::mv(out1), kj::mv(out2), kj::mv(out3) };
     capPipe.ends[0]->writeWithFds("foo"_kjb, nullptr, sendFds).wait(io.waitScope);
   }
 
   {
     char buffer[4]{};
-    AutoCloseFd fdBuffer[2];
+    OwnFd fdBuffer[2];
     auto result = capPipe.ends[1]->tryReadWithFds(buffer, 3, 3, fdBuffer, 2).wait(io.waitScope);
     KJ_ASSERT(result.capCount == 2);
     kj::FdOutputStream(fdBuffer[0].get()).write("bar"_kjb);
@@ -860,9 +963,7 @@ bool isMsgTruncBroken() {
   // Detect if the kernel fails to set MSG_TRUNC on recvmsg(). This seems to be the case at least
   // when running an arm64 binary under qemu.
 
-  int fd;
-  KJ_SYSCALL(fd = socket(AF_INET, SOCK_DGRAM, 0));
-  KJ_DEFER(close(fd));
+  auto fd = KJ_SYSCALL_FD(socket(AF_INET, SOCK_DGRAM, 0));
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -1070,9 +1171,7 @@ TEST(AsyncIo, AbstractUnixSocket) {
   Own<ConnectionReceiver> listener = addr->listen();
   // chdir proves no filesystem dependence. Test fails for regular unix socket
   // but passes for abstract unix socket.
-  int originalDirFd;
-  KJ_SYSCALL(originalDirFd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  KJ_DEFER(close(originalDirFd));
+  auto originalDirFd = KJ_SYSCALL_FD(open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   KJ_SYSCALL(chdir("/"));
   KJ_DEFER(KJ_SYSCALL(fchdir(originalDirFd)));
 
@@ -1132,6 +1231,41 @@ KJ_TEST("CIDR parsing") {
     KJ_EXPECT(CidrRange("0.0.0.0/0").matches(&addr));
     KJ_EXPECT(CidrRange("::/0").matches(&addr));
   }
+}
+
+KJ_TEST("CidrRange::matches") {
+  KJ_EXPECT(CidrRange("1.2.255.255/18").matches("1.2.223.255"));
+  KJ_EXPECT(!CidrRange("1.2.255.255/19").matches("1.2.223.255"));
+  KJ_EXPECT(CidrRange("1.2.0.0/16").matches("1.2.223.255"));
+  KJ_EXPECT(!CidrRange("1.3.0.0/16").matches("1.2.223.255"));
+  KJ_EXPECT(CidrRange("1.2.223.255/32").matches("1.2.223.255"));
+  KJ_EXPECT(!CidrRange("192.168.1.1/32").matches("192.168.1.2"));
+  KJ_EXPECT(CidrRange("0.0.0.0/0").matches("1.2.223.255"));
+  KJ_EXPECT(CidrRange("0.0.0.0/0").matches("255.255.255.255"));
+  KJ_EXPECT(!CidrRange("::/0").matches("1.2.223.255"));
+
+  KJ_EXPECT(CidrRange("0102:03ff::/24").matches("0102:0304:0506:0708:090a:0b0c:0d0e:0f10"));
+  KJ_EXPECT(!CidrRange("0102:02ff::/24").matches("0102:0304:0506:0708:090a:0b0c:0d0e:0f10"));
+  KJ_EXPECT(CidrRange("0102:02ff::/23").matches("0102:0304:0506:0708:090a:0b0c:0d0e:0f10"));
+  KJ_EXPECT(CidrRange("0102:0304:0506:0708:090a:0b0c:0d0e:0f10/128")
+      .matches("0102:0304:0506:0708:090a:0b0c:0d0e:0f10"));
+  KJ_EXPECT(CidrRange("::1/128").matches("::1"));
+  KJ_EXPECT(!CidrRange("::1/128").matches("::2"));
+  KJ_EXPECT(CidrRange("::/0").matches("0102:0304:0506:0708:090a:0b0c:0d0e:0f10"));
+  KJ_EXPECT(CidrRange("::/0").matches("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"));
+  KJ_EXPECT(!CidrRange("0.0.0.0/0").matches("0102:0304:0506:0708:090a:0b0c:0d0e:0f10"));
+
+  KJ_EXPECT(CidrRange("1.2.255.255/18").matches("::ffff:1.2.223.255"));
+  KJ_EXPECT(!CidrRange("1.2.255.255/19").matches("::ffff:1.2.223.255"));
+  KJ_EXPECT(CidrRange("1.2.0.0/16").matches("::ffff:1.2.223.255"));
+  KJ_EXPECT(!CidrRange("1.3.0.0/16").matches("::ffff:1.2.223.255"));
+  KJ_EXPECT(CidrRange("1.2.223.255/32").matches("::ffff:1.2.223.255"));
+  KJ_EXPECT(CidrRange("0.0.0.0/0").matches("::ffff:1.2.223.255"));
+  KJ_EXPECT(CidrRange("::/0").matches("::ffff:1.2.223.255"));
+
+  KJ_EXPECT_THROW_MESSAGE("Invalid IP address", CidrRange("0.0.0.0/0").matches("not-an-ip"));
+  KJ_EXPECT_THROW_MESSAGE("Invalid IP address", CidrRange("0.0.0.0/0").matches(""));
+  KJ_EXPECT_THROW_MESSAGE("Invalid IP address", CidrRange("0.0.0.0/0").matches("1.2.3.4/24"));
 }
 
 bool allowed4(_::NetworkFilter& filter, StringPtr addrStr) {
@@ -3475,6 +3609,282 @@ KJ_TEST("pump file to socket") {
   auto fs = kj::newDiskFilesystem();
   doTest(fs->getCurrent().createTemporary());
 }
+
+KJ_TEST("Calling abortRead() while tryRead() is in progress") {
+  // This is a stream that will only permit one call to tryRead() to be in progress at any one time
+  // Any tryRead calls won't ever complete
+  class NonConcurrentStream final: public kj::AsyncInputStream {
+  public:
+    virtual kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+      numConcurrentCalls++;
+      KJ_DEFER(numConcurrentCalls--);
+      co_await (kj::Promise<void>) kj::NEVER_DONE;
+      co_return 0;
+    }
+
+    uint numConcurrentCalls = 0;
+  };
+
+  EventLoop eventLoop;
+  WaitScope ws(eventLoop);
+
+  {
+    auto nonConcurrentStream = kj::heap<NonConcurrentStream>();
+
+    auto pipe = kj::newOneWayPipe();
+    auto pumpTask = nonConcurrentStream->pumpTo(*pipe.out).ignoreResult();
+    auto readTask = pipe.in->readAllBytes().ignoreResult();
+
+    // Assert that pumpTask and readTask are stuck
+    KJ_EXPECT(!pumpTask.poll(ws));
+    KJ_EXPECT(!readTask.poll(ws));
+
+    // Close the read end of the pipe (will cause an abortRead())
+    pipe.in = nullptr;
+
+    // abortRead() shouldn't invoke tryRead() again because our stream can't handle it
+    // See HttpFixedLengthEntityInputReader and HttpChunkedEntityInputReader for real examples of
+    // such streams.
+    KJ_EXPECT(nonConcurrentStream->numConcurrentCalls == 0);
+  }
+}
+
+KJ_TEST("Calling abortRead() after tryRead() raised exception") {
+  // This is a stream that will raise an exception on any read attempt.
+  // It will also flag if it is called again after raising the exception.
+  class ExceptionStream final: public kj::AsyncInputStream {
+  public:
+    virtual kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+      numCalls++;
+      KJ_FAIL_REQUIRE("This stream never works");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code"
+      // clang-18 thinks this line is unnecessary
+      co_return 0;
+#pragma clang diagnostic pop
+    }
+
+    uint numCalls = 0;
+  };
+
+  EventLoop eventLoop;
+  WaitScope ws(eventLoop);
+
+  {
+    auto exceptionStream = kj::heap<ExceptionStream>();
+
+    auto pipe = kj::newOneWayPipe();
+    auto pumpTask = exceptionStream->pumpTo(*pipe.out).ignoreResult();
+    auto readTask = pipe.in->readAllBytes().ignoreResult();
+
+    // Assert that pumpTask and readTask made progress
+    KJ_EXPECT(pumpTask.poll(ws));
+    KJ_EXPECT(readTask.poll(ws));
+
+    // Close the read end of the pipe (will cause an abortRead())
+    pipe.in = nullptr;
+
+    // abortRead() shouldn't invoke tryRead() again because our stream can't handle it
+    // See HttpFixedLengthEntityInputReader and HttpChunkedEntityInputReader for real examples of
+    // such streams.
+    KJ_EXPECT(exceptionStream->numCalls == 1);
+  }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// accept() with aborted connection - IPv4 listener
+// ---------------------------------------------------------------------------------------------
+// Test accept() behavior when connections are aborted (send RST) before being accepted.
+// Creates an aborted IPv4 connection followed by a valid one, then verifies proper handling.
+//
+// On Unix platforms, accept() typically returns the aborted connection, which fails on first
+// read (throws "Connection reset by peer" or returns 0 bytes). The test then calls accept()
+// again to get the valid connection. Some platforms may filter out aborted connections.
+
+#if !_WIN32
+KJ_TEST("accept() with aborted connection - IPv4") {
+  // -- async-io boilerplate ---------------------------------------------------
+  auto io = kj::setupAsyncIo();
+  auto& net = io.provider->getNetwork();
+
+  auto listenerAddr = net.parseAddress("127.0.0.1", 0).wait(io.waitScope);
+  auto listener = listenerAddr->listen();
+  uint16_t port = listener->getPort();
+
+  // Create a connection that will be aborted (sends RST packet)
+  int s = ::socket(AF_INET, SOCK_STREAM, 0);
+  KJ_ASSERT(s >= 0);
+
+  // Configure socket to send RST on close instead of FIN
+  struct linger lg = {1, 0};
+  KJ_SYSCALL(setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)));
+
+  sockaddr_in a {};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(port);
+  a.sin_addr.s_addr = htonl(0x7f000001);
+  KJ_SYSCALL(::connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)));
+
+  // Close immediately to send RST packet
+  KJ_SYSCALL(::close(s));
+
+  // Allow aborted connection to reach accept queue first
+  io.provider->getTimer().afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+
+  // Create a valid connection that should work
+  auto clientP = net.parseAddress("127.0.0.1", port)
+      .then([](Own<NetworkAddress> addr) { return addr->connect(); });
+  // Accept first connection - this should be the aborted one
+  auto firstConnection = listener->accept().wait(io.waitScope);
+
+  char buffer[16];
+  bool firstConnectionAborted = false;
+  
+  // Test if first connection is aborted by attempting to read
+  auto maybeException = kj::runCatchingExceptions([&]() {
+    firstConnection->tryRead(buffer, 1, sizeof(buffer))
+      .then([&firstConnectionAborted](uint64_t bytesRead) { 
+        if (bytesRead == 0) {
+          firstConnectionAborted = true;
+        }  
+      })
+      .exclusiveJoin(io.provider->getTimer().afterDelay(20 * kj::MILLISECONDS))
+      .wait(io.waitScope);
+  });
+  KJ_IF_SOME(e, maybeException) {
+    // Read failed with exception (connection was aborted)
+    if (e.getType() == kj::Exception::Type::DISCONNECTED) {
+      // Read failed with disconnected exception (connection was aborted)
+      firstConnectionAborted = true;
+    } else {
+      kj::throwFatalException(kj::mv(e));
+    }
+  }
+
+  kj::Own<AsyncIoStream> serverCon;
+  if (firstConnectionAborted) {
+    // First connection was aborted as expected - accept the second (valid) connection
+    serverCon = listener->accept().wait(io.waitScope);
+  } else {
+    serverCon = kj::mv(firstConnection);
+  }
+  // Verify we have a working connection
+  auto clientCon = clientP.wait(io.waitScope);
+
+  // Test data transfer on the valid connection
+  auto writePromise = clientCon->write(kj::StringPtr("hello").asBytes());
+  auto readPromise2 = serverCon->read(kj::arrayPtr(reinterpret_cast<kj::byte*>(buffer), sizeof(buffer)), 5);
+
+  writePromise.wait(io.waitScope);
+  auto amount = readPromise2.wait(io.waitScope);
+  KJ_ASSERT(amount == 5);
+  KJ_ASSERT(memcmp(buffer, "hello", 5) == 0);
+}
+#endif  // !_WIN32
+
+// ---------------------------------------------------------------------------------------------
+// accept() with aborted connection - dual-stack IPv4/IPv6 listener
+// ---------------------------------------------------------------------------------------------
+// Test accept() behavior with aborted cross-protocol connections on dual-stack listeners.
+// Creates an aborted IPv4 connection to an IPv6 listener, followed by a valid IPv6 connection.
+//
+// Expected behavior:
+// - Darwin/macOS: When IPv4 connects to IPv6 listener and gets aborted, accept() returns
+//   a socket with addrlen=0. KJ's accept loop detects this Darwin quirk and discards the
+//   socket automatically, so first accept() returns the valid connection.
+// - Linux/other Unix: accept() returns the aborted connection, which fails on first
+//   read (throws exception or returns 0 bytes). Test then calls accept() again for the
+//   valid connection.
+//
+// This test specifically exercises the Darwin addrlen==0 bug workaround in KJ's accept loop.
+
+#if !_WIN32
+KJ_TEST("accept() with aborted connection - dual-stack IPv4/IPv6") {
+  if (!systemSupportsAddress("::")) {
+    KJ_LOG(WARNING, "system does not support ipv6; skipping test");
+    return;
+  }
+  
+  char buffer[16];
+  // -- async-io boilerplate ---------------------------------------------------
+  auto io = kj::setupAsyncIo();
+  auto& net = io.provider->getNetwork();
+
+  auto listenerAddr = net.parseAddress("::", 0).wait(io.waitScope);
+  auto listener = listenerAddr->listen();
+  uint16_t port = listener->getPort();
+
+  // Create IPv4 connection that will be aborted (sends RST packet)
+  int s = ::socket(AF_INET, SOCK_STREAM, 0);
+  KJ_ASSERT(s >= 0);
+
+  // Configure socket to send RST on close instead of FIN
+  struct linger lg = {1, 0};
+  KJ_SYSCALL(setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)));
+
+  sockaddr_in a {};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(port);
+  a.sin_addr.s_addr = htonl(0x7f000001);
+  KJ_SYSCALL(::connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)));
+
+  // Close immediately to send RST packet
+  KJ_SYSCALL(::close(s));
+
+  // Allow aborted connection to reach accept queue first
+  io.provider->getTimer().afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+  
+  
+  // Create valid IPv6 connection
+  auto clientP = net.parseAddress("::1", port)
+      .then([](Own<NetworkAddress> addr) { return addr->connect(); });
+  // Accept connection - on macOS with addrlen==0 bug, aborted connection is filtered
+  auto serverCon = listener->accept().wait(io.waitScope);
+
+  // Test if the accepted connection is valid by attempting to read
+  // On macOS, the addrlen==0 bug means the aborted connection is filtered out,
+  // so the first accept() returns the valid connection.
+  // On other platforms, we may get the aborted connection first.
+  bool connectionAborted = false;
+  
+  auto maybeException = kj::runCatchingExceptions([&]() {
+    serverCon->tryRead(buffer, 1, sizeof(buffer))
+      .then([&connectionAborted](uint64_t bytesRead) { 
+        if (bytesRead == 0) {
+          connectionAborted = true;
+        }  
+      })
+      .exclusiveJoin(io.provider->getTimer().afterDelay(20 * kj::MILLISECONDS))
+      .wait(io.waitScope);
+    
+  });
+  KJ_IF_SOME(e, maybeException) {
+    if (e.getType() == kj::Exception::Type::DISCONNECTED) {
+      // Read failed with disconnected exception (connection was aborted)
+      connectionAborted = true;
+    } else {
+      kj::throwFatalException(kj::mv(e));
+    }
+  }
+  
+  if (connectionAborted) {
+    // First connection was aborted - accept the second (valid) connection
+    serverCon = listener->accept().wait(io.waitScope);
+  }
+  
+  auto clientCon = clientP.wait(io.waitScope);
+
+  // Test data transfer on the valid connection
+  auto writePromise = clientCon->write(kj::StringPtr("hello").asBytes());
+  auto readPromise = serverCon->read(kj::arrayPtr(reinterpret_cast<kj::byte*>(buffer), sizeof(buffer)), 5);
+
+  writePromise.wait(io.waitScope);
+  auto amount = readPromise.wait(io.waitScope);
+  KJ_ASSERT(amount == 5);
+  KJ_ASSERT(memcmp(buffer, "hello", 5) == 0);
+}
+#endif  // !_WIN32
 
 }  // namespace
 }  // namespace kj

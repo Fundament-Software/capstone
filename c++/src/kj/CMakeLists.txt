@@ -3,7 +3,6 @@
 
 set(kj_sources_lite
   array.c++
-  cidr.c++
   list.c++
   common.c++
   debug.c++
@@ -39,7 +38,6 @@ else()
 endif()
 
 set(kj_headers
-  cidr.h
   common.h
   units.h
   memory.h
@@ -79,11 +77,26 @@ set(kj-std_headers
 )
 add_library(kj ${kj_sources})
 add_library(CapnProto::kj ALIAS kj)
-target_compile_features(kj PUBLIC cxx_std_20)
+target_compile_features(kj PUBLIC cxx_std_23)
 
 if(UNIX AND NOT ANDROID)
   target_link_libraries(kj PUBLIC pthread)
 endif()
+
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("#include <atomic>
+int main() {
+  std::atomic<uint8_t> w1;
+  std::atomic<uint16_t> w2;
+  std::atomic<uint32_t> w4;
+  std::atomic<uint64_t> w8;
+  return ++w1 + ++w2 + ++w4 + ++w8;
+}" CAPNP_BUILDS_WITHOUT_LIBATOMIC)
+
+if(NOT CAPNP_BUILDS_WITHOUT_LIBATOMIC)
+  target_link_libraries(kj PUBLIC atomic)
+endif()
+
 #make sure the lite flag propagates to all users (internal + external) of this library
 target_compile_definitions(kj PUBLIC ${CAPNP_LITE_FLAG})
 #make sure external consumers don't need to manually set the include dirs
@@ -124,11 +137,13 @@ set(kj-async_sources
   async-io-win32.c++
   async-io.c++
   async-io-unix.c++
+  cidr.c++
   timer.c++
 )
 set(kj-async_headers
   async-prelude.h
   async.h
+  async-coroutine-alloc.h
   async-inl.h
   async-unix.h
   async-win32.h
@@ -204,6 +219,9 @@ if(WITH_OPENSSL)
 
     target_compile_definitions(kj-tls PRIVATE KJ_HAS_OPENSSL)
     target_link_libraries(kj-tls PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+      target_link_libraries(kj-tls PUBLIC crypt32)
+    endif()
 
     # Ensure the library has a version set to match autotools build
     set_target_properties(kj-tls PROPERTIES VERSION ${VERSION})
@@ -246,6 +264,7 @@ if(BUILD_TESTING)
     string-test.c++
     table-test.c++
     map-test.c++
+    maybe-test.c++
     exception-test.c++
     # this test overrides symbolizer and has to be linked separately
     # exception-override-symbolizer-test.c++
@@ -267,6 +286,7 @@ if(BUILD_TESTING)
       async-test.c++
       async-xthread-test.c++
       async-coroutine-test.c++
+      async-coroutine-alloc-test.c++
       async-unix-test.c++
       async-unix-xthread-test.c++
       async-win32-test.c++

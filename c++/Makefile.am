@@ -169,6 +169,7 @@ includekj_HEADERS =                                            \
   src/kj/filesystem.h                                          \
   src/kj/async-prelude.h                                       \
   src/kj/async.h                                               \
+  src/kj/async-coroutine-alloc.h                               \
   src/kj/async-inl.h                                           \
   src/kj/time.h                                                \
   src/kj/timer.h                                               \
@@ -265,7 +266,6 @@ endif
 libkj_la_LIBADD = $(PTHREAD_LIBS)
 libkj_la_LDFLAGS = -release $(SO_VERSION) -no-undefined
 libkj_la_SOURCES=                                              \
-  src/kj/cidr.c++                                              \
   src/kj/common.c++                                            \
   src/kj/units.c++                                             \
   src/kj/memory.c++                                            \
@@ -307,6 +307,7 @@ libkj_async_la_SOURCES=                                        \
   src/kj/async-io.c++                                          \
   src/kj/async-io-unix.c++                                     \
   src/kj/async-io-win32.c++                                    \
+  src/kj/cidr.c++                                              \
   src/kj/timer.c++
 
 if BUILD_KJ_GZIP
@@ -516,6 +517,7 @@ heavy_tests =                                                  \
   src/kj/async-test.c++                                        \
   src/kj/async-xthread-test.c++                                \
   src/kj/async-coroutine-test.c++                              \
+  src/kj/async-coroutine-alloc-test.c++                        \
   src/kj/async-unix-test.c++                                   \
   src/kj/async-unix-xthread-test.c++                           \
   src/kj/async-win32-test.c++                                  \
@@ -574,6 +576,7 @@ capnp_test_SOURCES =                                           \
   src/kj/string-tree-test.c++                                  \
   src/kj/table-test.c++                                        \
   src/kj/map-test.c++                                          \
+  src/kj/maybe-test.c++                                        \
   src/kj/encoding-test.c++                                     \
   src/kj/exception-test.c++                                    \
   src/kj/debug-test.c++                                        \

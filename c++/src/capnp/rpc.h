@@ -22,11 +22,15 @@
 #pragma once
 
 #include <capnp/capability.h>
+#include <kj/time.h>
 #include "rpc-prelude.h"
 
 CAPNP_BEGIN_HEADER
 
-namespace kj { class AutoCloseFd; }
+namespace kj {
+  class OwnFd;
+  using AutoCloseFd = OwnFd;
+}
 
 namespace capnp {
 
@@ -213,13 +217,13 @@ public:
   // Get the message body, to be interpreted by the caller.  (The standard RPC implementation
   // interprets it as a Message as defined in rpc.capnp.)
 
-  virtual kj::ArrayPtr<kj::AutoCloseFd> getAttachedFds() { return nullptr; }
+  virtual kj::ArrayPtr<kj::OwnFd> getAttachedFds() { return nullptr; }
   // If the transport supports attached file descriptors and some were attached to this message,
   // returns them. Otherwise returns an empty array. It is intended that the caller will move the
   // FDs out of this table when they are consumed, possibly leaving behind a null slot. Callers
   // should be careful to check if an FD was already consumed by comparing the slot with `nullptr`.
   // (We don't use Maybe here because moving from a Maybe doesn't make it null, so it would only
-  // add confusion. Moving from an AutoCloseFd does in fact make it null.)
+  // add confusion. Moving from an OwnFd does in fact make it null.)
 
   virtual size_t sizeInWords() = 0;
   // Get the total size of the message, for flow control purposes. Although the caller could
@@ -284,6 +288,24 @@ public:
   // for individual streams. Keep in mind, though, that in situations where the other end of the
   // connection is merely proxying capabilities from a variety of final destinations across a
   // variety of networks, no single window will be appropriate for all streams.
+
+  static kj::Own<RpcFlowController> newAdaptiveController(
+      size_t initialWindowSize,
+      const kj::MonotonicClock& clock = kj::systemPreciseMonotonicClock());
+  // Constructs a flow controller that dynamically adjusts its window size based on observed
+  // bandwidth and round-trip time, similar to BBR-style congestion control. The window is set to
+  // the estimated bandwidth-delay product (BDP) multiplied by a growth factor, so that the sender
+  // always pushes slightly more than the estimated capacity -- naturally probing for increased
+  // bandwidth.
+  //
+  // The algorithm works in two phases:
+  // - Startup: The window doubles each RTT, enabling rapid discovery of available bandwidth.
+  //   Startup ends when the window stops growing meaningfully for several consecutive RTT rounds.
+  // - Steady state: The window grows by at most 5/4 per RTT and shrinks by at most 7/8 per
+  //   RTT, providing stability.
+  //
+  // `initialWindowSize` is used before any bandwidth estimate is available. 256kB is a reasonable
+  // default. `clock` is used to measure send/ack timestamps for BDP estimation.
 
   static constexpr size_t DEFAULT_WINDOW_SIZE = 65536;
   // The window size used by the default implementation of Connection::newStream().

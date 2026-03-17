@@ -260,8 +260,8 @@ template <typename To, typename From>
 Array<To> coerceTo(Array<From>&& array) {
   static_assert(sizeof(To) == sizeof(From), "incompatible coercion");
   Array<wchar_t> result;
-  memcpy(&result, &array, sizeof(array));
-  memset(&array, 0, sizeof(array));
+  memcpy((void*)&result, &array, sizeof(array));
+  memset((void*)&array, 0, sizeof(array));
   return result;
 }
 
@@ -371,9 +371,12 @@ static Maybe<uint> tryFromOctDigit(char c) {
 }  // namespace
 
 String encodeHex(ArrayPtr<const byte> input) {
-  return strArray(KJ_MAP(b, input) {
-    return heapArray<char>({HEX_DIGITS[b/16], HEX_DIGITS[b%16]});
-  }, "");
+  auto result = heapString(input.size() * 2);
+  for (auto i: kj::indices(input)) {
+    result[i*2] = HEX_DIGITS[input[i] / 16];
+    result[i*2+1] = HEX_DIGITS[input[i] % 16];
+  }
+  return result;
 }
 
 EncodingResult<Array<byte>> decodeHex(ArrayPtr<const char> text) {
@@ -543,16 +546,16 @@ String encodeCEscapeImpl(ArrayPtr<const byte> bytes, bool isBinary) {
 
   for (byte b: bytes) {
     switch (b) {
-      case '\a': escaped.addAll(StringPtr("\\a")); break;
-      case '\b': escaped.addAll(StringPtr("\\b")); break;
-      case '\f': escaped.addAll(StringPtr("\\f")); break;
-      case '\n': escaped.addAll(StringPtr("\\n")); break;
-      case '\r': escaped.addAll(StringPtr("\\r")); break;
-      case '\t': escaped.addAll(StringPtr("\\t")); break;
-      case '\v': escaped.addAll(StringPtr("\\v")); break;
-      case '\'': escaped.addAll(StringPtr("\\\'")); break;
-      case '\"': escaped.addAll(StringPtr("\\\"")); break;
-      case '\\': escaped.addAll(StringPtr("\\\\")); break;
+      case '\a': escaped.addAll("\\a"_kj); break;
+      case '\b': escaped.addAll("\\b"_kj); break;
+      case '\f': escaped.addAll("\\f"_kj); break;
+      case '\n': escaped.addAll("\\n"_kj); break;
+      case '\r': escaped.addAll("\\r"_kj); break;
+      case '\t': escaped.addAll("\\t"_kj); break;
+      case '\v': escaped.addAll("\\v"_kj); break;
+      case '\'': escaped.addAll("\\\'"_kj); break;
+      case '\"': escaped.addAll("\\\""_kj); break;
+      case '\\': escaped.addAll("\\\\"_kj); break;
       default:
         if (b < 0x20 || b == 0x7f || (isBinary && b > 0x7f)) {
           // Use octal escape, not hex, because hex escapes technically have no length limit and
@@ -650,7 +653,7 @@ EncodingResult<Array<byte>> decodeBinaryCEscape(ArrayPtr<const char> text, bool 
               break;
             }
           }
-          auto utf = decodeUtf16(arrayPtr(&value, 1));
+          auto utf = decodeUtf16(arrayPtr(value));
           if (utf.hadErrors) hadErrors = true;
           result.addAll(utf.asBytes());
           break;
@@ -670,7 +673,7 @@ EncodingResult<Array<byte>> decodeBinaryCEscape(ArrayPtr<const char> text, bool 
               break;
             }
           }
-          auto utf = decodeUtf32(arrayPtr(&value, 1));
+          auto utf = decodeUtf32(arrayPtr(value));
           if (utf.hadErrors) hadErrors = true;
           result.addAll(utf.asBytes());
           break;

@@ -789,7 +789,7 @@ struct TestListOfAny {
 }
 
 interface TestInterface {
-  foo @0 (i :UInt32, j :Bool) -> (x :Text);
+  foo @0 (i :UInt32, j :Bool, expectedCallCount :Int32 = -1) -> (x :Text);
   bar @1 () -> ();
   baz @2 (s: TestAllTypes);
 
@@ -871,7 +871,7 @@ interface TestMoreStuff extends(TestCallOrder) {
   hold @3 (cap :TestInterface) -> ();
   # Returns immediately but holds on to the capability.
 
-  callHeld @4 () -> (s: Text);
+  callHeld @4 (expectedCallCount :Int32 = -1) -> (s: Text);
   # Calls the capability previously held using `hold` (and keeps holding it).
 
   getHeld @5 () -> (cap :TestInterface);
@@ -897,10 +897,11 @@ interface TestMoreStuff extends(TestCallOrder) {
   getEnormousString @11 () -> (str :Text);
   # Attempts to return an 100MB string. Should always fail.
 
-  writeToFd @13 (fdCap1 :TestInterface, fdCap2 :TestInterface)
+  writeToFd @13 (fill :List(UInt8), fdCap1 :TestInterface, fdCap2 :TestInterface)
              -> (fdCap3 :TestInterface, secondFdPresent :Bool);
   # Expects fdCap1 and fdCap2 wrap socket file descriptors. Writes "foo" to the first and "bar" to
-  # the second. Also creates a socketpair, writes "baz" to one end, and returns the other end.
+  # the second. Also creates a socketpair, writes "baz" to one end, and returns the other end. The
+  # message may be padded to ensure that we  correctlyprocess fd passing with fragmented messages.
 
   throwException @14 ();
   throwRemoteException @15 ();
@@ -951,11 +952,25 @@ interface TestAuthenticatedBootstrap(VatId) {
 
 struct TestSturdyRefHostId {
   host @0 :Text;
+
+  unique @1 :Bool = false;
+  # Set true (in rpc-test) to open a new connection even if one already exists.
 }
 
-struct TestThirdPartyCompletion {}
-struct TestThirdPartyToAwait {}
-struct TestThirdPartyToContact {}
+struct TestThirdPartyCompletion {
+  token @0 :UInt64;
+}
+struct TestThirdPartyToAwait {
+  token @0 :UInt64;
+}
+struct TestThirdPartyToContact {
+  path @0 :TestSturdyRefHostId;
+  token @1 :UInt64;
+
+  sentBy @2 :Text;
+  # Host who sent this, used to verify we didn't just forward by copying the contact, we used
+  # forwardThirdPartyToContact() to rewrite it.
+}
 struct TestJoinResult {}
 
 struct TestNameAnnotation $Cxx.name("RenamedStruct") {

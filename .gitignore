@@ -84,6 +84,7 @@
 /dockcross
 
 # bazel output
+/c++/MODULE.bazel.lock
 bazel-*
 
 # generic build output

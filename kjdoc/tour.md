@@ -151,6 +151,16 @@ Passing a `kj::Array<T>` implies an ownership transfer. If you merely want to pa
 
 Both `kj::Array` and `kj::ArrayPtr` contain a number of useful methods, like `slice()`. Be sure to check out the class definitions for more details.
 
+`KJ_MAP` applies a function to every element of an array or container, returning an `Array` of the results, with nice syntax:
+
+```c++
+StringPtr foo = "abcd";
+Array<char> bar = KJ_MAP(c, foo) -> char { return c + 1; };
+KJ_ASSERT(str(bar) == "bcde");
+```
+
+The trailing return type (e.g. `-> char`) is optional but good practice for readability. `KJ_MAP` also works with `kj::Maybe` -- see [Maybes](#maybes).
+
 ## Strings
 
 A `kj::String` is a segment of text. By convention, this text is expected to be Unicode encoded in UTF-8. But, `kj::String` itself is not Unicode-aware; it is merely an array of `char`s.
@@ -210,33 +220,42 @@ When constructing very large, complex strings -- for example, when writing a cod
 
 `kj::Maybe<T>` is either `nullptr`, or contains a `T`. In KJ-based code, nullable values should always be expressed using `kj::Maybe`. Primitive pointers should never be null. Use `kj::Maybe<T&>` instead of `T*` to express that the pointer/reference can be null.
 
-In order to dereference a `kj::Maybe`, you must use the `KJ_IF_MAYBE` macro, which behaves like an `if` statement.
+In order to dereference a `kj::Maybe`, you must use the `KJ_IF_SOME` macro, which behaves like an `if` statement.
 
 ```c++
 kj::Maybe<int> maybeI = 123;
 kj::Maybe<int> maybeJ = nullptr;
 
-KJ_IF_MAYBE(i, maybeI) {
+KJ_IF_SOME(i, maybeI) {
   // This block will execute, with `i` being a
-  // pointer into `maybeI`'s value. In a better world,
-  // `i` would be a reference rather than a pointer,
-  // but we couldn't find a way to trick the compiler
-  // into that.
-  KJ_ASSERT(*i == 123);
+  // reference to `maybeI`'s value.
+  KJ_ASSERT(i == 123);
 } else {
   KJ_FAIL_ASSERT("can't get here");
 }
 
-KJ_IF_MAYBE(j, maybeJ) {
+KJ_IF_SOME(j, maybeJ) {
   KJ_FAIL_ASSERT("can't get here");
 } else {
   // This block will execute.
 }
 ```
 
-Note that `KJ_IF_MAYBE` forces you to think about the null case. This differs from `std::optional`, which can be dereferenced using `*`, resulting in undefined behavior if the value is null.
+Note that `KJ_IF_SOME` forces you to think about the null case. This differs from `std::optional`, which can be dereferenced using `*`, resulting in undefined behavior if the value is null.
 
 Similarly, `map()` and `orDefault()` allow transforming and retrieving the stored value in a safe manner without complex control flows.
+
+`KJ_MAP` (primarily used for mapping over arrays -- see [Arrays](#arrays)) also works with `kj::Maybe<T>`. When applied to a `Maybe`, it returns a `Maybe<Result>` instead of an `Array<Result>`:
+
+```c++
+Maybe<int> m = 42;
+Maybe<int> doubled = KJ_MAP(x, m) -> int { return x * 2; };
+KJ_ASSERT(KJ_ASSERT_NONNULL(doubled) == 84);
+
+Maybe<int> empty = kj::none;
+Maybe<int> result = KJ_MAP(x, empty) -> int { return x + 1; };
+KJ_ASSERT(result == kj::none);  // callback was not called
+```
 
 Performance nuts will be interested to know that `kj::Maybe<T&>` and `kj::Maybe<Own<T>>` are both optimized such that they take no more space than their underlying pointer type, using a literal null pointer to indicate nullness. For other types of `T`, `kj::Maybe<T>` must maintain an extra boolean and so is somewhat larger than `T`.
 
@@ -249,8 +268,7 @@ void handle(kj::OneOf<int, kj::String> value) {
   KJ_SWITCH_ONEOF(value) {
     KJ_CASE_ONEOF(i, int) {
       // Note that `i` is an lvalue reference to the content
-      // of the OneOf. This differs from `KJ_IF_MAYBE` where
-      // the variable is a pointer.
+      // of the OneOf, similar to `KJ_IF_SOME`.
       handleInt(i);
     }
     KJ_CASE_ONEOF(s, kj::String) {
@@ -375,8 +393,13 @@ KJ_DBG("hi", foo, bar, baz.qux)
 KJ includes special variants of its assertion macros that convert traditional C API error conventions into exceptions.
 
 ```c++
-int fd;
-KJ_SYSCALL(fd = open(filename, O_RDONLY), "couldn't open the document", filename);
+// For a syscall returning a file descriptor, use KJ_SYSCALL_FD.
+kj::OwnFd fd = KJ_SYSCALL_FD(
+    open(filename, O_RDONLY), "couldn't open the document", filename);
+
+// For a syscall returning anything else, use KJ_SYSCALL.
+ssize_t n;
+KJ_SYSCALL(n = read(fd, buffer, sizeof(buffer)));
 ```
 
 This macro evaluates the first parameter, which is expected to be a system call. If it returns a negative value, indicating an error, then an exception is thrown. The exception description incorporates a description of the error code communicated by `errno`, as well as the other parameters passed to the macro (stringified in the same manner as other assertion/logging macros do).
@@ -395,6 +418,9 @@ KJ_SYSCALL_HANDLE_ERRORS(fd = open(filename, O_RDONLY)) {
     // Some other error. The error code (from errno) is in a local variable `error`.
     // `KJ_FAIL_SYSCALL` expects its second parameter to be this integer error code.
     KJ_FAIL_SYSCALL("open()", error, "couldn't open the document", filename);
+} else {
+  // The `else` clause runs if the system call succeeded.
+  return kj::OwnFd(fd);
 }
 ```
 
@@ -420,18 +446,30 @@ kj::Exception e = ...;
 kj::throwFatalException(kj::mv(e));
 
 // Run some code catching exceptions.
-kj::Maybe<kj::Exception> maybeException = kj::runCatchingExceptions([&]() {
+KJ_TRY {
   doSomething();
-});
-KJ_IF_MAYBE(e, maybeException) {
+} KJ_CATCH(e) {
   // handle exception
 }
 ```
 
 These wrappers perform some extra bookkeeping:
-* `kj::runCatchingExceptions()` will catch any kind of exception, whether it derives from `kj::Exception` or not, and will do its best to convert it into a `kj::Exception`.
+* `KJ_CATCH()` will catch any kind of exception, whether it derives from `kj::Exception` or not, and will do its best to convert it into a `kj::Exception`.
 * `kj::throwFatalException()` and `kj::throwRecoverableException()` invoke the thread's current `kj::ExceptionCallback` to throw the exception, allowing apps to customize how exceptions are handled. The default `ExceptionCallback` makes sure to throw the exception in such a way that it can be understood and caught by code looking for `std::exception`, such as the C++ library's standard termination handler.
-* These helpers also work, to some extent, even when compiled with `-fno-exceptions` -- see below. (Note that "fatal" vs. "recoverable" exceptions are only different in this case; when exceptions are enabled, they are handled the same.)
+
+There is also an older utility, `kj::runCatchingExceptions()`, which performs the same exception conversion as `KJ_TRY` / `KJ_CATCH`.
+
+```c++
+// Run some code catching exceptions.
+kj::Maybe<kj::Exception> maybeException = kj::runCatchingExceptions([&]() {
+  doSomething();
+});
+KJ_IF_SOME(e, maybeException) {
+  // handle exception
+}
+```
+
+* Code which does not use `KJ_TRY` / `KJ_CATCH`, but limits itself to `kj::runCatchingExceptions()` and `kj::throwFatalException()` / `kj::throwRecoverableException()` will work, to some extent, even when compiled with `-fno-exceptions` -- see below. (Note that "fatal" vs. "recoverable" exceptions are only different in this case; when exceptions are enabled, they are handled the same.)
 
 ### Supporting `-fno-exceptions`
 
@@ -883,9 +921,9 @@ As mentioned above, `.then()` and similar functions consume the promise on which
 ```c++
 kj::Promise<int> promise = ...;
 kj::ForkedPromise<int> forked = promise.fork();
-kj::Promise<int> branch1 = promise.addBranch();
-kj::Promise<int> branch2 = promise.addBranch();
-kj::Promise<int> branch3 = promise.addBranch();
+kj::Promise<int> branch1 = forked.addBranch();
+kj::Promise<int> branch2 = forked.addBranch();
+kj::Promise<int> branch3 = forked.addBranch();
 ```
 
 A forked promise can have any number of "branches" which represent different consumers waiting for the same result.
@@ -1022,7 +1060,7 @@ Although most complex KJ applications use async I/O, sometimes you want somethin
 
 `kj/io.h` provides some more basic, synchronous streaming interfaces, like `kj::InputStream` and `kj::OutputStream`. Implementations are provided on top of file descriptors and Windows `HANDLE`s.
 
-Additionally, the important utility class `kj::AutoCloseFd` (and `kj::AutoCloseHandle` for Windows) can be found here. This is an RAII wrapper around a file descriptor (or `HANDLE`), which you will likely want to use any time you are manipulating raw file descriptors (or `HANDLE`s) in KJ code.
+Additionally, the important utility class `kj::OwnFd` (and `kj::AutoCloseHandle` for Windows) can be found here. This is an RAII wrapper around a file descriptor (or `HANDLE`), which you will likely want to use any time you are manipulating raw file descriptors (or `HANDLE`s) in KJ code.
 
 ### Filesystem
 

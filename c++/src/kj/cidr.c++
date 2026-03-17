@@ -39,9 +39,6 @@
 #else
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#endif
-
-#if __FreeBSD__
 #include <netinet/in.h>
 #endif
 
@@ -145,6 +142,24 @@ bool CidrRange::matches(const struct sockaddr* addr) const {
 
   return bitCount == 128 ||
       bits[bitCount / 8] == (otherBits[bitCount / 8] & (0xff00 >> (bitCount % 8)));
+}
+
+bool CidrRange::matches(StringPtr addr) const {
+  struct sockaddr_storage ss;
+  memset(&ss, 0, sizeof(ss));
+
+  auto* sin = reinterpret_cast<struct sockaddr_in*>(&ss);
+  auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(&ss);
+
+  if (inet_pton(AF_INET, addr.cStr(), &sin->sin_addr) == 1) {
+    ss.ss_family = AF_INET;
+  } else if (inet_pton(AF_INET6, addr.cStr(), &sin6->sin6_addr) == 1) {
+    ss.ss_family = AF_INET6;
+  } else {
+    KJ_FAIL_REQUIRE("Invalid IP address", addr);
+  }
+
+  return matches(reinterpret_cast<struct sockaddr*>(&ss));
 }
 
 bool CidrRange::matchesFamily(int family) const {

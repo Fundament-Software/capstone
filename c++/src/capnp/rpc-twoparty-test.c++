@@ -426,12 +426,12 @@ TEST(TwoPartyNetwork, HugeMessage) {
     req.initA(100000000);  // 100 MB
 
     KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("larger than our single-message size limit",
-        req.send().ignoreResult().wait(ioContext.waitScope));
+        req.sendIgnoringResult().wait(ioContext.waitScope));
   }
 
   // Oversized response fails.
   KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("larger than our single-message size limit",
-      client.getEnormousStringRequest().send().ignoreResult().wait(ioContext.waitScope));
+      client.getEnormousStringRequest().sendIgnoringResult().wait(ioContext.waitScope));
 
   // Connection is still up.
   {
@@ -505,39 +505,45 @@ KJ_TEST("send FD over RPC") {
 
   auto cap = client.bootstrap().castAs<test::TestMoreStuff>();
 
-  int pipeFds[2]{};
-  KJ_SYSCALL(kj::miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in1(pipeFds[0]);
-  kj::AutoCloseFd out1(pipeFds[1]);
-  KJ_SYSCALL(kj::miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in2(pipeFds[0]);
-  kj::AutoCloseFd out2(pipeFds[1]);
+  // Check with a number of message sizes. Large messages that bust receive buffer limits
+  // must not discard any of the file descriptors we have received with message fragments
+  for (size_t fillSize : {1024 * 1024, 65536, 8192, 0}) {
+    int pipeFds[2]{};
+    KJ_SYSCALL(kj::miniposix::pipe(pipeFds));
+    kj::OwnFd in1(pipeFds[0]);
+    kj::OwnFd out1(pipeFds[1]);
+    KJ_SYSCALL(kj::miniposix::pipe(pipeFds));
+    kj::OwnFd in2(pipeFds[0]);
+    kj::OwnFd out2(pipeFds[1]);
 
-  capnp::RemotePromise<test::TestMoreStuff::WriteToFdResults> promise = nullptr;
-  {
-    auto req = cap.writeToFdRequest();
+    capnp::RemotePromise<test::TestMoreStuff::WriteToFdResults> promise = nullptr;
+    {
+      auto req = cap.writeToFdRequest();
 
-    // Order reversal intentional, just trying to mix things up.
-    req.setFdCap1(kj::heap<TestFdCap>(kj::mv(out2)));
-    req.setFdCap2(kj::heap<TestFdCap>(kj::mv(out1)));
+      req.initFill(fillSize);
 
-    promise = req.send();
+      // Order reversal intentional, just trying to mix things up.
+      req.setFdCap1(kj::heap<TestFdCap>(kj::mv(out2)));
+      req.setFdCap2(kj::heap<TestFdCap>(kj::mv(out1)));
+
+      promise = req.send();
+    }
+
+    int in3 = KJ_ASSERT_NONNULL(promise.getFdCap3().getFd().wait(io.waitScope));
+    KJ_EXPECT(io.lowLevelProvider->wrapInputFd(kj::mv(in3))->readAllText().wait(io.waitScope)
+              == "baz");
+
+    {
+      auto promise2 = kj::mv(promise);  // make sure the PipelineHook also goes out of scope
+      auto response = promise2.wait(io.waitScope);
+      KJ_EXPECT(response.getSecondFdPresent());
+    }
+
+    KJ_EXPECT(io.lowLevelProvider->wrapInputFd(kj::mv(in1))->readAllText().wait(io.waitScope)
+              == "bar");
+    KJ_EXPECT(io.lowLevelProvider->wrapInputFd(kj::mv(in2))->readAllText().wait(io.waitScope)
+              == "foo");
   }
-
-  int in3 = KJ_ASSERT_NONNULL(promise.getFdCap3().getFd().wait(io.waitScope));
-  KJ_EXPECT(io.lowLevelProvider->wrapInputFd(kj::mv(in3))->readAllText().wait(io.waitScope)
-            == "baz");
-
-  {
-    auto promise2 = kj::mv(promise);  // make sure the PipelineHook also goes out of scope
-    auto response = promise2.wait(io.waitScope);
-    KJ_EXPECT(response.getSecondFdPresent());
-  }
-
-  KJ_EXPECT(io.lowLevelProvider->wrapInputFd(kj::mv(in1))->readAllText().wait(io.waitScope)
-            == "bar");
-  KJ_EXPECT(io.lowLevelProvider->wrapInputFd(kj::mv(in2))->readAllText().wait(io.waitScope)
-            == "foo");
 }
 
 KJ_TEST("FD per message limit") {
@@ -554,11 +560,11 @@ KJ_TEST("FD per message limit") {
 
   int pipeFds[2]{};
   KJ_SYSCALL(kj::miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in1(pipeFds[0]);
-  kj::AutoCloseFd out1(pipeFds[1]);
+  kj::OwnFd in1(pipeFds[0]);
+  kj::OwnFd out1(pipeFds[1]);
   KJ_SYSCALL(kj::miniposix::pipe(pipeFds));
-  kj::AutoCloseFd in2(pipeFds[0]);
-  kj::AutoCloseFd out2(pipeFds[1]);
+  kj::OwnFd in2(pipeFds[0]);
+  kj::OwnFd out2(pipeFds[1]);
 
   capnp::RemotePromise<test::TestMoreStuff::WriteToFdResults> promise = nullptr;
   {
@@ -595,9 +601,6 @@ public:
   MockSndbufStream(kj::Own<AsyncIoStream> inner, size_t& window, size_t& written)
       : inner(kj::mv(inner)), window(window), written(written) {}
 
-  kj::Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
-    return inner->read(buffer, minBytes, maxBytes);
-  }
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     return inner->tryRead(buffer, minBytes, maxBytes);
   }

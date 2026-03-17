@@ -39,7 +39,8 @@ class AutoCloseHandle;
 class UnixEventPort;
 #endif
 
-class AutoCloseFd;
+class OwnFd;
+using AutoCloseFd = OwnFd;
 class NetworkAddress;
 class AsyncOutputStream;
 class AsyncIoStream;
@@ -55,10 +56,18 @@ class AsyncInputStream: private AsyncObject {
   // Asynchronous equivalent of InputStream (from io.h).
 
 public:
-  virtual Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes);
-  virtual Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) = 0;
+  Promise<size_t> read(ArrayPtr<byte> buffer, size_t minBytes);
+  // Reads at least `minBytes` from the stream.
+  // Throws an exception if there is not enough data.
 
-  Promise<void> read(void* buffer, size_t bytes);
+  virtual Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) = 0;
+  // Read at least `minBytes` from the stream. Performs partial read if there is not enough data.
+  // Returns total number of bytes read. Return value less than `minBytes` indicates EOF.
+
+  Promise<void> read(ArrayPtr<byte> buffer) {
+    // Reads a complete buffer from the stream. Throws an exception if there is not enough data.
+    return read(buffer, buffer.size()).ignoreResult();
+  }
 
   virtual Maybe<uint64_t> tryGetLength();
   // Get the remaining number of bytes that will be produced by this stream, if known.
@@ -137,6 +146,14 @@ public:
   //
   // Unlike most other asynchronous stream methods, it is safe to call whenWriteDisconnected()
   // multiple times without canceling the previous promises.
+
+  virtual void abortWrite(kj::Exception&& exception) {}
+  // Communicates to the stream that it should stop accepting writes and should fail any
+  // pending writes with the given exception. This is intended to be used when the stream is
+  // being shutdown due to an error or explicit cancelation. The default implementation, however,
+  // does nothing for backwards compatibilty. Existing implementations of AsyncOutputStream that
+  // want to support this method should override it, existing implementations that don't need it
+  // can just ignore it.
 };
 
 class AsyncIoStream: public AsyncInputStream, public AsyncOutputStream {
@@ -239,7 +256,7 @@ public:
                                      ArrayPtr<const int> fds) = 0;
   Promise<void> writeWithFds(ArrayPtr<const byte> data,
                              ArrayPtr<const ArrayPtr<const byte>> moreData,
-                             ArrayPtr<const AutoCloseFd> fds);
+                             ArrayPtr<const OwnFd> fds);
   // Write some data to the stream with some file descriptors attached to it.
   //
   // The maximum number of FDs that can be sent at a time is usually subject to an OS-imposed
@@ -252,7 +269,7 @@ public:
   };
 
   virtual Promise<ReadResult> tryReadWithFds(void* buffer, size_t minBytes, size_t maxBytes,
-                                             AutoCloseFd* fdBuffer, size_t maxFds) = 0;
+                                             OwnFd* fdBuffer, size_t maxFds) = 0;
   // Read data from the stream that may have file descriptors attached. Any attached descriptors
   // will be placed in `fdBuffer`. If multiple bundles of FDs are encountered in the course of
   // reading the amount of data requested by minBytes/maxBytes, then they will be concatenated. If
@@ -281,8 +298,8 @@ public:
   Promise<void> sendStream(Own<AsyncCapabilityStream> stream);
   // Transfer a single stream.
 
-  Promise<AutoCloseFd> receiveFd();
-  Promise<Maybe<AutoCloseFd>> tryReceiveFd();
+  Promise<OwnFd> receiveFd();
+  Promise<Maybe<OwnFd>> tryReceiveFd();
   Promise<void> sendFd(int fd);
   // Transfer a single raw file descriptor.
 };
@@ -353,6 +370,7 @@ Tee newTee(Own<AsyncInputStream> input, uint64_t limit = kj::maxValue);
 // It is recommended that you use a more conservative value for `limit` than the default.
 
 Own<AsyncOutputStream> newPromisedStream(Promise<Own<AsyncOutputStream>> promise);
+Own<AsyncInputStream> newPromisedStream(Promise<Own<AsyncInputStream>> promise);
 Own<AsyncIoStream> newPromisedStream(Promise<Own<AsyncIoStream>> promise);
 // Constructs an Async*Stream which waits for a promise to resolve, then forwards all calls to the
 // promised stream.
@@ -835,9 +853,13 @@ public:
   // On Windows, the `fd` parameter to each of these methods must be a SOCKET, and must have the
   // flag WSA_FLAG_OVERLAPPED (which socket() uses by default, but WSASocket() wants you to specify
   // explicitly).
+  //
+  // TODO(cleanup): This alias was created when `kj::OwnFd` was called `kj::AutoCloseFd`. Later
+  //   `AutoCloseFd` itself was renamed `OwnFd`, which means this alias now shadows `kj::OwnFd`,
+  //   which is a little weird.
 #else
   typedef int Fd;
-  typedef AutoCloseFd OwnFd;
+  typedef kj::OwnFd OwnFd;
   // On Unix, any arbitrary file descriptor is supported.
 #endif
 
@@ -917,9 +939,19 @@ public:
   Own<ConnectionReceiver> wrapListenSocketFd(OwnFd&& fd, uint flags = 0);
   Own<DatagramPort> wrapDatagramSocketFd(OwnFd&& fd, NetworkFilter& filter, uint flags = 0);
   Own<DatagramPort> wrapDatagramSocketFd(OwnFd&& fd, uint flags = 0);
-  // Convenience wrappers which transfer ownership via AutoCloseFd (Unix) or AutoCloseHandle
+  // Convenience wrappers which transfer ownership via OwnFd (Unix) or AutoCloseHandle
   // (Windows). TAKE_OWNERSHIP will be implicitly added to `flags`.
 };
+
+template <typename T> struct Socketpair_ { T fds[2]; };
+using Socketpair = Socketpair_<LowLevelAsyncIoProvider::OwnFd>;
+// We use a template to work around the fact that LowLevelAsyncIoProvider::OwnFd
+// is an incomplete type, without having to include the io.h header.
+
+Socketpair newOsSocketpair();
+// Creates a socket pair, using socketpair(2) on Unix-like systems.
+// On Windows, which doesn't have a built-in socketpair(), a loopback
+// TCP connection is used.
 
 Own<AsyncIoProvider> newAsyncIoProvider(LowLevelAsyncIoProvider& lowLevel);
 // Make a new AsyncIoProvider wrapping a `LowLevelAsyncIoProvider`.
@@ -946,7 +978,7 @@ struct AsyncIoContext {
 #endif
 };
 
-AsyncIoContext setupAsyncIo();
+AsyncIoContext setupAsyncIo(kj::Maybe<EventLoopObserver&> observer = kj::none);
 // Convenience method which sets up the current thread with everything it needs to do async I/O.
 // The returned objects contain an `EventLoop` which is wrapping an appropriate `EventPort` for
 // doing I/O on the host system, so everything is ready for the thread to start making async calls
