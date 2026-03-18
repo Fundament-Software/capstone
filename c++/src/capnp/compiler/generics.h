@@ -71,7 +71,7 @@ class BrandedDecl {
 
 public:
   inline BrandedDecl(Resolver::ResolvedDecl decl,
-                     kj::Own<BrandScope>&& brand,
+                     kj::Rc<BrandScope>&& brand,
                      Expression::Reader source)
       : brand(kj::mv(brand)), source(source) {
     // `source`, is the expression which specified this branded decl. It is provided so that errors
@@ -139,13 +139,24 @@ public:
   kj::String toString();
   kj::String toDebugString();
 
+  kj::Maybe<uint64_t> getGenericTypeId() {
+    // If this declaration points to a type, gets its type ID. Keep in mind that this
+    // drops the brand, that is, if the type is the result of applying a generic to
+    // some type parameters, this returns only the ID of the underlying generic type,
+    // which loses information about the type parameters.
+    if (body.is<Resolver::ResolvedDecl>()) {
+      return body.get<Resolver::ResolvedDecl>().id;
+    }
+    return kj::none;
+  }
+
 private:
   Resolver::ResolveResult body;
-  kj::Own<BrandScope> brand;  // null if parameter
+  kj::Rc<BrandScope> brand;  // null if parameter
   Expression::Reader source;
 };
 
-class BrandScope: public kj::Refcounted {
+class BrandScope final: public kj::Refcounted {
   // Tracks the brand parameter bindings affecting the scope specified by some expression. For
   // example, if we are interpreting the type expression "Foo(Text).Bar", we would start with the
   // current scope's BrandScope, create a new child BrandScope representing "Foo", add the "(Text)"
@@ -165,10 +176,10 @@ public:
   bool isGeneric();
   // Returns true if this scope or any parent scope is a generic (has brand parameters).
 
-  kj::Own<BrandScope> push(uint64_t typeId, uint paramCount);
+  kj::Rc<BrandScope> push(uint64_t typeId, uint paramCount);
   // Creates a new child scope with the given type ID and number of brand parameters.
 
-  kj::Maybe<kj::Own<BrandScope>> setParams(
+  kj::Maybe<kj::Rc<BrandScope>> setParams(
       kj::Array<BrandedDecl> params, Declaration::Which genericType, Expression::Reader source);
   // Create a new BrandScope representing the same scope, but with parameters filled in.
   //
@@ -178,7 +189,7 @@ public:
   // Returns null if an error occurred that prevented creating the BrandScope; the error will have
   // been reported to the ErrorReporter.
 
-  kj::Own<BrandScope> pop(uint64_t newLeafId);
+  kj::Rc<BrandScope> pop(uint64_t newLeafId);
   // Return the parent scope.
 
   kj::Maybe<BrandedDecl> lookupParameter(Resolver& resolver, uint64_t scopeId, uint index);
@@ -229,13 +240,13 @@ public:
 
 private:
   ErrorReporter& errorReporter;
-  kj::Maybe<kj::Own<BrandScope>> parent;
+  kj::Maybe<kj::Rc<BrandScope>> parent;
   uint64_t leafId;                     // zero = this is the root
   uint leafParamCount;                 // number of generic parameters on this leaf
   bool inherited;
   kj::Array<BrandedDecl> params;
 
-  BrandScope(kj::Own<BrandScope> parent, uint64_t leafId, uint leafParamCount)
+  BrandScope(kj::Rc<BrandScope> parent, uint64_t leafId, uint leafParamCount)
       : errorReporter(parent->errorReporter),
         parent(kj::mv(parent)), leafId(leafId), leafParamCount(leafParamCount),
         inherited(false) {}
@@ -244,20 +255,20 @@ private:
         leafId(base.leafId), leafParamCount(base.leafParamCount),
         inherited(false), params(kj::mv(params)) {
     KJ_IF_SOME(p, base.parent) {
-      parent = kj::addRef(*p);
+      parent = p.addRef();
     }
   }
   BrandScope(ErrorReporter& errorReporter, uint64_t scopeId)
       : errorReporter(errorReporter), leafId(scopeId), leafParamCount(0), inherited(false) {}
 
-  kj::Own<BrandScope> evaluateBrand(
+  kj::Rc<BrandScope> evaluateBrand(
       Resolver& resolver, Resolver::ResolvedDecl decl,
       List<schema::Brand::Scope>::Reader brand, uint index = 0);
 
   BrandedDecl decompileType(Resolver& resolver, schema::Type::Reader type);
 
   template <typename T, typename... Params>
-  friend kj::Own<T> kj::refcounted(Params&&... params);
+  friend kj::Rc<T> kj::rc(Params&&... params);
   friend class BrandedDecl;
 };
 
@@ -278,7 +289,7 @@ void BrandScope::compile(InitBrandFunc&& initBrand) {
       levels.add(ptr);
     }
     KJ_IF_SOME(p, ptr->parent) {
-      ptr = p;
+      ptr = p.get();
     } else {
       break;
     }

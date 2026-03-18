@@ -36,8 +36,9 @@ KJ_BEGIN_HEADER
 #if __linux__
 // Default to epoll on Linux.
 #define KJ_USE_EPOLL 1
-#elif __APPLE__ || __FreeBSD__ || __OpenBSD__ || __NetBSD__ || __DragonFly__
-// MacOS and BSDs prefer kqueue() for event notification.
+#elif __APPLE__ || __FreeBSD__ || __NetBSD__ || __DragonFly__
+// MacOS and most BSDs prefer kqueue() for event notification.
+// (Note that OpenBSD's kqueue(2) doesn't support user event filters yet)
 #define KJ_USE_KQUEUE 1
 #endif
 #endif
@@ -63,7 +64,7 @@ struct timespec;
 
 namespace kj {
 
-class UnixEventPort: public EventPort, private TimerImpl::SleepHooks {
+class UnixEventPort final: public EventPort, private TimerImpl::SleepHooks {
   // An EventPort implementation which can wait for events on file descriptors as well as signals.
   // This API only makes sense on Unix.
   //
@@ -259,9 +260,9 @@ private:
 
 #if KJ_USE_EPOLL
   sigset_t originalMask;
-  AutoCloseFd epollFd;
-  AutoCloseFd eventFd;   // Used for cross-thread wakeups.
-  kj::Maybe<AutoCloseFd> timerFd;   // Used if preparePollableFdForSleep() is ever called.
+  OwnFd epollFd;
+  OwnFd eventFd;   // Used for cross-thread wakeups.
+  kj::Maybe<OwnFd> timerFd;   // Used if preparePollableFdForSleep() is ever called.
 
   bool sleeping = false;  // Was preparePollableFdForSleep() called?
   bool runnable = false;  // Last value passed to setRunnable().
@@ -269,7 +270,7 @@ private:
 
   bool processEpollEvents(struct epoll_event events[], int n);
 #elif KJ_USE_KQUEUE
-  AutoCloseFd kqueueFd;
+  OwnFd kqueueFd;
 
   bool doKqueueWait(struct timespec* timeout);
 #else
@@ -279,8 +280,8 @@ private:
   FdObserver** observersTail = &observersHead;
 
 #if KJ_USE_PIPE_FOR_WAKEUP
-  AutoCloseFd wakePipeIn;
-  AutoCloseFd wakePipeOut;
+  OwnFd wakePipeIn;
+  OwnFd wakePipeOut;
 #else
   unsigned long long threadId;  // actually pthread_t
 #endif

@@ -79,8 +79,13 @@ namespace kj {
   MACRO(MSEARCH) \
   MACRO(NOTIFY) \
   MACRO(SUBSCRIBE) \
-  MACRO(UNSUBSCRIBE)
-  /* UPnP */
+  MACRO(UNSUBSCRIBE) \
+  /* UPnP */ \
+  \
+  MACRO(QUERY) \
+  /* https://www.ietf.org/archive/id/draft-ietf-httpbis-safe-method-w-body-05.html */ \
+  MACRO(BAN) \
+  /* Non-standard method name requested by a Cloudflare customer. */
 
 enum class HttpMethod {
   // Enum of known HTTP methods.
@@ -203,7 +208,7 @@ class HttpHeaderTable {
   //
   //     // Get http://example.com.
   //     HttpHeaders headers(table);
-  //     headers.set(accept, "text/html");
+  //     headers.setPtr(accept, "text/html");
   //     auto response = client->send(kj::HttpMethod::GET, "http://example.com", headers)
   //         .wait(waitScope);
   //     auto msg = kj::str("Response content type: ", response.headers.get(contentType));
@@ -329,7 +334,11 @@ public:
   // `func2(name, value)` for each header that does not. All calls to func1() precede all calls to
   // func2().
 
+  KJ_DEPRECATED("Use setPtr()")
   void set(HttpHeaderId id, kj::StringPtr value);
+  void setPtr(HttpHeaderId id, kj::StringPtr value);
+  void setPtr(HttpHeaderId id, kj::String&& value) = delete;
+
   void set(HttpHeaderId id, kj::String&& value);
   // Sets a header value, overwriting the existing value.
   //
@@ -339,8 +348,18 @@ public:
   //   HttpHeaders object is destroyed. This allows string literals to be passed without making a
   //   copy, but complicates the use of dynamic values. Hint: Consider using `takeOwnership()`.
 
+  KJ_DEPRECATED("Use addPtrPtr()")
   void add(kj::StringPtr name, kj::StringPtr value);
+  void addPtrPtr(kj::StringPtr name, kj::StringPtr value);
+  void addPtrPtr(kj::StringPtr name, kj::String&& value) = delete;
+  void addPtrPtr(kj::String&& name, kj::StringPtr value) = delete;
+  void addPtrPtr(kj::String&& name, kj::String&& value) = delete;
+
+  KJ_DEPRECATED("Use addPtr()")
   void add(kj::StringPtr name, kj::String&& value);
+  void addPtr(kj::StringPtr name, kj::String&& value);
+  void addPtr(kj::String&& name, kj::String&& value) = delete;
+
   void add(kj::String&& name, kj::String&& value);
   // Append a header. `name` will be looked up in the header table, but if it's not mapped, the
   // header will be added to the list of unmapped headers.
@@ -667,7 +686,7 @@ public:
 
   typedef kj::OneOf<kj::String, kj::Array<byte>, Close> Message;
 
-  static constexpr size_t SUGGESTED_MAX_MESSAGE_SIZE = 1u << 20;  // 1MB
+  static constexpr size_t SUGGESTED_MAX_MESSAGE_SIZE = 32u << 20;  // 32MB
 
   virtual kj::Promise<Message> receive(size_t maxSize = SUGGESTED_MAX_MESSAGE_SIZE) = 0;
   // Read one message from the WebSocket and return it. Can only call once at a time. Do not call
@@ -1116,13 +1135,29 @@ kj::Own<HttpClient> newHttpClient(const HttpHeaderTable& responseHeaderTable,
 // subsequent requests will fail. If a response takes a long time, it blocks subsequent responses.
 // If a WebSocket is opened successfully, all subsequent requests fail.
 
+struct ConcurrencyLimitingHttpClientSettings {
+  uint maxConcurrentRequests;
+  // Maximum number of concurrent requests allowed. Additional requests are queued.
+
+  kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback;
+  // Called when a new connection is opened or enqueued and when an open connection is closed,
+  // passing the number of open and pending connections.
+
+  bool releaseSlotOnHeadersReceived = false;
+  // If true, the concurrency slot is released as soon as response headers are received, rather
+  // than when the response body is fully consumed. This allows more concurrent connections while
+  // still limiting the rate at which new requests can be made (since the slot is held until the
+  // origin responds with headers).
+};
+
+kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
+    HttpClient& inner, ConcurrencyLimitingHttpClientSettings settings);
+// Creates an HttpClient that is limited to a maximum number of concurrent requests.
+
 kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
     HttpClient& inner, uint maxConcurrentRequests,
     kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback);
-// Creates an HttpClient that is limited to a maximum number of concurrent requests.  Additional
-// requests are queued, to be opened only after an open request completes.  `countChangedCallback`
-// is called when a new connection is opened or enqueued and when an open connection is closed,
-// passing the number of open and pending connections.
+// Deprecated: Use the overload that takes ConcurrencyLimitingHttpClientSettings instead.
 
 kj::Own<HttpClient> newHttpClient(HttpService& service);
 kj::Own<HttpService> newHttpService(HttpClient& client);

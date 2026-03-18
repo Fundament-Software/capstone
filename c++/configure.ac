@@ -65,7 +65,7 @@ AC_ARG_ENABLE([reflection], [
 AC_PROG_CC
 AC_PROG_CXX
 AC_LANG([C++])
-AX_CXX_COMPILE_STDCXX_20
+AX_CXX_COMPILE_STDCXX_23
 
 AS_CASE("${host_os}", *mingw*, [
     # We don't use pthreads on MinGW.
@@ -112,6 +112,39 @@ AS_IF([test "$lite_mode" = "yes"], [
 AC_SUBST([CAPNP_LITE_FLAG])
 
 AC_SEARCH_LIBS(sched_yield, rt)
+
+# Check if we need to link against libatomic for atomic operations.
+# On some architectures (e.g., armel, mipsel, powerpc), GCC requires linking
+# with libatomic to support certain atomic operations.
+AC_MSG_CHECKING([if libatomic is needed])
+AC_LINK_IFELSE([
+  AC_LANG_PROGRAM(
+    [[#include <atomic>
+      #include <cstdint>]],
+    [[std::atomic<std::int64_t> a{0};
+      a.fetch_add(1, std::memory_order_relaxed);
+      return 0;]])
+], [
+  AC_MSG_RESULT([no])
+], [
+  # Linking failed, try with -latomic
+  SAVED_LIBS="$LIBS"
+  LIBS="$LIBS -latomic"
+  AC_LINK_IFELSE([
+    AC_LANG_PROGRAM(
+      [[#include <atomic>
+        #include <cstdint>]],
+      [[std::atomic<std::int64_t> a{0};
+        a.fetch_add(1, std::memory_order_relaxed);
+        return 0;]])
+  ], [
+    AC_MSG_RESULT([yes])
+  ], [
+    AC_MSG_RESULT([no, but linking still fails])
+    LIBS="$SAVED_LIBS"
+    AC_MSG_ERROR([Cannot link program using atomic operations. Please ensure your compiler and system support C++ atomics.])
+  ])
+])
 
 # Users will need to use the same -stdlib as us so we'd better let pkg-config know about it.
 STDLIB_FLAG=`echo "$CXX $CXXFLAGS" | grep -o ' [[-]]stdlib=[[^ ]]*'`

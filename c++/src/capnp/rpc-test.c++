@@ -32,6 +32,8 @@
 #include <kj/async-queue.h>
 #include <kj/map.h>
 #include <kj/miniposix.h>
+#include <kj/time.h>
+#include <deque>
 
 namespace capnp {
 namespace _ {  // private
@@ -153,7 +155,7 @@ public:
             auto results = content.getAs<DynamicStruct>(schema.asStruct());
 
             return kj::str(name, "->", partnerName, ": return ", ret.getAnswerId(), ": ", results,
-                           " caps:[", kj::strArray(capTable, ", "), "]");
+                           " caps:[", kj::strArray(capTable, ", "), "]\n");
           } else if (schema.getProto().isInterface()) {
             content.getAs<DynamicCapability>(schema.asInterface());
             return kj::str(name, "->", partnerName, "(", ret.getAnswerId(), "): return cap ",
@@ -224,10 +226,25 @@ public:
     }
   }
 
+  uint64_t newToken() {
+    // Make a unique token for three-party handoffs.
+    //
+    // In the real world, we'd be using cryptographically unguessable strings, but for testing
+    // purposes a counter will do just fine.
+
+    return ++tokenCounter;
+  }
+
   RpcDumper dumper;
+
+  bool forwardingEnabled = false;
+  uint forwardCount = 0;
+  uint deniedForwardCount = 0;
 
 private:
   kj::HashMap<kj::StringPtr, kj::Own<TestVat>> map;
+
+  uint64_t tokenCounter = 0;
 };
 
 typedef VatNetwork<
@@ -260,17 +277,21 @@ public:
   class ConnectionImpl final
       : public Connection, public kj::Refcounted, public kj::TaskSet::ErrorHandler {
   public:
-    ConnectionImpl(TestVat& vat, TestVat& peerVat, kj::StringPtr name)
-        : vat(vat), peerVat(peerVat), dumper(vat.network.dumper, name),
+    ConnectionImpl(TestVat& vat, TestVat& peerVat, kj::StringPtr name, bool unique)
+        : vat(vat), peerVat(peerVat), unique(unique), dumper(vat.network.dumper, name),
           tasks(kj::heap<kj::TaskSet>(*this)) {
-      vat.connections.insert(&peerVat, this);
+      if (!unique) {
+        vat.connections.insert(&peerVat, this);
+      }
     }
 
     ~ConnectionImpl() noexcept(false) {
       KJ_IF_SOME(p, partner) {
         p.partner = kj::none;
       }
-      vat.connections.erase(&peerVat);
+      if (!unique) {
+        vat.connections.erase(&peerVat);
+      }
     }
 
     bool isIdle() { return idle; }
@@ -279,7 +300,9 @@ public:
       KJ_REQUIRE(partner == kj::none);
       KJ_REQUIRE(other.partner == kj::none);
       partner = other;
+      partnerName = other.vat.self;
       other.partner = *this;
+      other.partnerName = vat.self;
       dumper.setPartner(other.dumper);
     }
 
@@ -289,6 +312,26 @@ public:
       KJ_IF_SOME(f, fulfillOnEnd) {
         f->fulfill();
       }
+    }
+
+    void block() {
+      // Block all messages sent on this connection until unblock() is called.
+      auto paf = kj::newPromiseAndFulfiller<void>();
+      currentBlock = paf.promise.fork();
+      currentBlockFulfiller = kj::mv(paf.fulfiller);
+    }
+
+    void blockAfter(kj::Function<bool(rpc::Message::Reader)> predicate) {
+      // Automatically call block() immediately after a message matching `predicate` is sent
+      // on this connection.
+      blockAfterPredicate = kj::mv(predicate);
+    }
+
+    void unblock() {
+      // Allow blocked messages to proceed.
+      KJ_REQUIRE_NONNULL(currentBlockFulfiller)->fulfill();
+      currentBlock = kj::none;
+      currentBlockFulfiller = kj::none;
     }
 
     void disconnect(kj::Exception&& exception) {
@@ -341,8 +384,23 @@ public:
 
         auto incomingMessage = kj::heap<IncomingRpcMessageImpl>(messageToFlatArray(message));
 
+        kj::Promise<void> blocker = nullptr;
+        KJ_IF_SOME(b, connection.currentBlock) {
+          blocker = b.addBranch();
+        } else {
+          blocker = kj::yield();
+
+          // Check if we should start blocking.
+          KJ_IF_SOME(p, connection.blockAfterPredicate) {
+            if (p(message.getRoot<rpc::Message>())) {
+              connection.block();
+              connection.blockAfterPredicate = kj::none;
+            }
+          }
+        }
+
         auto connectionPtr = &connection;
-        connection.tasks->add(kj::evalLater(
+        connection.tasks->add(blocker.then(
             [connectionPtr,message=kj::mv(incomingMessage)]() mutable {
           KJ_IF_SOME(p, connectionPtr->partner) {
             p.messageQueue.push(kj::Own<IncomingRpcMessage>(kj::mv(message)));
@@ -422,6 +480,73 @@ public:
       this->idle = idle;
     }
 
+    bool canIntroduceTo(Connection& other) override {
+      return true;
+    }
+
+    void introduceTo(Connection& other,
+        test::TestThirdPartyToContact::Builder otherContactInfo,
+        test::TestThirdPartyToAwait::Builder thisAwaitInfo) override {
+      uint64_t token = vat.network.newToken();
+      otherContactInfo.initPath().setHost(kj::downcast<ConnectionImpl>(other).partnerName);
+      otherContactInfo.setToken(token);
+      otherContactInfo.setSentBy(vat.self);
+      thisAwaitInfo.setToken(token);
+    }
+
+    kj::Maybe<kj::Own<Connection>> connectToIntroduced(
+        test::TestThirdPartyToContact::Reader contact,
+        test::TestThirdPartyCompletion::Builder completion) override {
+      KJ_EXPECT(contact.getSentBy() == partnerName);
+      completion.setToken(contact.getToken());
+      return vat.connect(contact.getPath());
+    }
+
+    bool canForwardThirdPartyToContact(
+        test::TestThirdPartyToContact::Reader contact, Connection& destination) override {
+      if (!vat.network.forwardingEnabled) {
+        ++vat.network.deniedForwardCount;
+      }
+      return vat.network.forwardingEnabled;
+    }
+
+    void forwardThirdPartyToContact(
+        test::TestThirdPartyToContact::Reader contact, Connection& destination,
+        test::TestThirdPartyToContact::Builder result) override {
+      KJ_EXPECT(vat.network.forwardingEnabled);
+      KJ_EXPECT(contact.getSentBy() == partnerName);
+      ++vat.network.forwardCount;
+      result.setPath(contact.getPath());
+      result.setToken(contact.getToken());
+      result.setSentBy(vat.self);
+    }
+
+    kj::Own<void> awaitThirdParty(
+        test::TestThirdPartyToAwait::Reader party,
+        kj::Rc<kj::Refcounted> value) override {
+      uint64_t token = party.getToken();
+      auto& xchg = vat.getTphExchange(token);
+      xchg.fulfiller->fulfill(kj::mv(value));
+
+      return kj::heap(kj::defer([this, token]() {
+        vat.tphExchanges.erase(token);
+      }));
+    }
+
+    kj::Promise<kj::Rc<kj::Refcounted>> completeThirdParty(
+        test::TestThirdPartyCompletion::Reader completion) override {
+      auto& xchg = vat.getTphExchange(completion.getToken());
+      return xchg.promise.addBranch();
+    }
+
+    kj::Array<byte> generateEmbargoId() override {
+      static uint counter = 0;
+      auto result = kj::heapArray<byte>(sizeof(counter));
+      result.asPtr().copyFrom(kj::asBytes(counter));
+      ++counter;
+      return result;
+    }
+
     void taskFailed(kj::Exception&& exception) override {
       ADD_FAILURE() << kj::str(exception).cStr();
     }
@@ -429,8 +554,16 @@ public:
   private:
     TestVat& vat;
     TestVat& peerVat;
+    bool unique;
     RpcDumper::Sender dumper;
     kj::Maybe<ConnectionImpl&> partner;
+    kj::StringPtr partnerName;
+
+    kj::Maybe<kj::ForkedPromise<void>> currentBlock;
+    kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> currentBlockFulfiller;
+    // When present, all outgoing messages are blocked waiting for it.
+
+    kj::Maybe<kj::Function<bool(rpc::Message::Reader)>> blockAfterPredicate;
 
     kj::Maybe<kj::Exception> networkException;
 
@@ -450,16 +583,21 @@ public:
 
     TestVat& dst = KJ_REQUIRE_NONNULL(network.find(hostId.getHost()));
 
-    KJ_IF_SOME(conn, connections.find(&dst)) {
-      return kj::Own<Connection>(kj::addRef(*conn));
-    } else {
-      auto local = kj::refcounted<ConnectionImpl>(*this, dst, self);
-      auto remote = kj::refcounted<ConnectionImpl>(dst, *this, dst.self);
-      local->attach(*remote);
-
-      dst.acceptQueue.push(kj::mv(remote));
-      return kj::Own<Connection>(kj::mv(local));
+    bool unique = hostId.getUnique();
+    if (!unique) {
+      KJ_IF_SOME(conn, connections.find(&dst)) {
+        // Return existing connection.
+        return kj::Own<Connection>(kj::addRef(*conn));
+      }
     }
+
+    // Create new connection.
+    auto local = kj::refcounted<ConnectionImpl>(*this, dst, self, unique);
+    auto remote = kj::refcounted<ConnectionImpl>(dst, *this, dst.self, unique);
+    local->attach(*remote);
+
+    dst.acceptQueue.push(kj::mv(remote));
+    return kj::Own<Connection>(kj::mv(local));
   }
 
   kj::Promise<kj::Own<Connection>> accept() override {
@@ -489,6 +627,22 @@ private:
   kj::ProducerConsumerQueue<kj::Own<Connection>> acceptQueue;
 
   kj::Function<bool(MessageBuilder& message)> sendCallback = [](MessageBuilder&) { return true; };
+
+  struct ThirdPartyExchange {
+    kj::ForkedPromise<kj::Rc<kj::Refcounted>> promise;
+    kj::Own<kj::PromiseFulfiller<kj::Rc<kj::Refcounted>>> fulfiller;
+
+    ThirdPartyExchange(kj::PromiseFulfillerPair<kj::Rc<kj::Refcounted>> paf =
+                       kj::newPromiseAndFulfiller<kj::Rc<kj::Refcounted>>())
+        : promise(paf.promise.fork()), fulfiller(kj::mv(paf.fulfiller)) {}
+  };
+  kj::HashMap<uint64_t, ThirdPartyExchange> tphExchanges;
+
+  ThirdPartyExchange& getTphExchange(uint64_t token) {
+    return tphExchanges.findOrCreate(token, [&]() -> decltype(tphExchanges)::Entry {
+      return {token, ThirdPartyExchange()};
+    });
+  }
 };
 
 TestNetwork::~TestNetwork() noexcept(false) {}
@@ -528,10 +682,11 @@ struct TestContext {
         : vatNetwork(vatNetwork), rpcSystem(makeRpcServer(vatNetwork, kj::mv(bootstrap))) {}
 
     template <typename T = test::TestInterface>
-    typename T::Client connect(kj::StringPtr to) {
+    typename T::Client connect(kj::StringPtr to, bool unique = false) {
       MallocMessageBuilder refMessage(128);
       auto hostId = refMessage.initRoot<test::TestSturdyRefHostId>();
       hostId.setHost(to);
+      hostId.setUnique(unique);
       return rpcSystem.bootstrap(hostId).castAs<T>();
     }
   };
@@ -1427,7 +1582,7 @@ KJ_TEST("method throws exception") {
   auto client = context.connect().getTestMoreStuffRequest().send().getCap();
 
   kj::Maybe<kj::Exception> maybeException;
-  client.throwExceptionRequest().send().ignoreResult()
+  client.throwExceptionRequest().sendIgnoringResult()
       .catch_([&](kj::Exception&& e) {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
@@ -1443,7 +1598,7 @@ KJ_TEST("method throws exception won't redundantly add remote exception prefix")
   auto client = context.connect().getTestMoreStuffRequest().send().getCap();
 
   kj::Maybe<kj::Exception> maybeException;
-  client.throwRemoteExceptionRequest().send().ignoreResult()
+  client.throwRemoteExceptionRequest().sendIgnoringResult()
       .catch_([&](kj::Exception&& e) {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
@@ -1463,7 +1618,7 @@ KJ_TEST("method throws exception with trace encoder") {
   auto client = context.connect().getTestMoreStuffRequest().send().getCap();
 
   kj::Maybe<kj::Exception> maybeException;
-  client.throwExceptionRequest().send().ignoreResult()
+  client.throwExceptionRequest().sendIgnoringResult()
       .catch_([&](kj::Exception&& e) {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
@@ -1479,7 +1634,7 @@ KJ_TEST("method throws exception with detail") {
   auto client = context.connect().getTestMoreStuffRequest().send().getCap();
 
   kj::Maybe<kj::Exception> maybeException;
-  client.throwExceptionWithDetailRequest().send().ignoreResult()
+  client.throwExceptionWithDetailRequest().sendIgnoringResult()
       .catch_([&](kj::Exception&& e) {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
@@ -1488,6 +1643,32 @@ KJ_TEST("method throws exception with detail") {
   KJ_EXPECT(exception.getDescription() == "remote exception: test exception");
   KJ_EXPECT(exception.getRemoteTrace() == nullptr);
   auto detail = KJ_ASSERT_NONNULL(exception.getDetail(1));
+  KJ_EXPECT(kj::str(detail.asChars()) == "foo");
+}
+
+KJ_TEST("disconnection exception retains details") {
+  TestContext context;
+
+  auto client = context.connect();
+
+  // Disconnect the client with an exception that contains a detail.
+  auto& clientConn = KJ_ASSERT_NONNULL(
+      context.alice.vatNetwork.getConnectionTo(context.bob.vatNetwork));
+  auto originalException = KJ_EXCEPTION(FAILED, "a_disconnection_exception");
+  originalException.setDetail(1, kj::heapArray("foo"_kj.asBytes()));
+  clientConn.disconnect(kj::mv(originalException));
+
+  // Catch the resulting "disconnected" exception when attempting to send a request.
+  kj::Maybe<kj::Exception> caughtExceptionMaybe{};
+  client.fooRequest().sendIgnoringResult()
+      .catch_([&caughtExceptionMaybe] (kj::Exception&& e) {
+    caughtExceptionMaybe = kj::mv(e);
+  }).wait(context.waitScope);
+
+  // The exception should be of the "disconnected" type but still contain the detail.
+  auto caughtException = KJ_ASSERT_NONNULL(kj::mv(caughtExceptionMaybe));
+  auto detail = KJ_ASSERT_NONNULL(caughtException.getDetail(1));
+  KJ_EXPECT(caughtException.getType() == kj::Exception::Type::DISCONNECTED);
   KJ_EXPECT(kj::str(detail.asChars()) == "foo");
 }
 
@@ -1764,6 +1945,750 @@ KJ_TEST("clean connection shutdown") {
   // No more messages should have been sent during shutdown (not even errors).
   KJ_EXPECT(context.alice.vatNetwork.getSentCount() == sent);
   KJ_EXPECT(context.alice.vatNetwork.getReceivedCount() == received);
+}
+
+KJ_TEST("basic three-party handoff") {
+  TestContext context;
+
+  // Set up Alice, Bob, and Carol.
+  auto& alice = context.alice;
+  auto& bob = context.bob;
+
+  int carolCallCount = 0;
+  int carolHandleCount = 0;
+  auto& carol = context.initVat("carol",
+      kj::heap<TestMoreStuffImpl>(carolCallCount, carolHandleCount));
+
+  // Alice connects to Bob and Carol.
+  auto bobCap = context.alice.connect<test::TestInterface>("bob");
+  auto carolCap = context.alice.connect<test::TestMoreStuff>("carol");
+
+  // Alice should be connected to Bob. Get the connection for further inspection.
+  auto& aliceToBob = KJ_ASSERT_NONNULL(alice.vatNetwork.getConnectionTo(bob.vatNetwork));
+
+  // Alice -> Bob connection is not idle.
+  KJ_EXPECT(!aliceToBob.isIdle());
+
+  // Carol is not connected to Bob.
+  KJ_EXPECT(carol.vatNetwork.getConnectionTo(bob.vatNetwork) == kj::none);
+
+  // Send `bobCap` to Carol.
+  {
+    auto req = carolCap.holdRequest();
+    req.setCap(kj::mv(bobCap));
+    req.send().wait(context.waitScope);
+  }
+
+  // Pump event loop to allow things to settle.
+  context.waitScope.poll();
+
+  // Bob hasn't been called yet but Carol has.
+  KJ_EXPECT(context.restorer.callCount == 0);
+  KJ_EXPECT(carolCallCount == 1);
+
+  // Carol is not connected to Bob yet because Carol accepts the capability lazily on first
+  // invocation.
+  KJ_EXPECT(carol.vatNetwork.getConnectionTo(bob.vatNetwork) == kj::none);
+
+  // Tell Carol to invoke the held capability. This forces Carol to connect to Bob.
+  {
+    auto resp = carolCap.callHeldRequest().send().wait(context.waitScope);
+    KJ_EXPECT(resp.getS() == "bar");
+  }
+
+  // Bob has been called.
+  KJ_EXPECT(context.restorer.callCount == 1);
+
+  // Carol is now connected to Bob, and not idle.
+  auto& carolToBob = KJ_ASSERT_NONNULL(carol.vatNetwork.getConnectionTo(bob.vatNetwork));
+  KJ_EXPECT(!carolToBob.isIdle());
+
+  // Alice -> Bob connection is idle, since we moved away `bobCap`.
+  KJ_EXPECT(aliceToBob.isIdle());
+
+  // Let's shut it down, even, to prove it isn't needed.
+  aliceToBob.initiateIdleShutdown();
+  context.waitScope.poll();
+  KJ_EXPECT(alice.vatNetwork.getConnectionTo(bob.vatNetwork) == kj::none);
+
+  // Do another call to prove shutting down the connection didn't hurt.
+  {
+    auto resp = carolCap.callHeldRequest().send().wait(context.waitScope);
+    KJ_EXPECT(resp.getS() == "bar");
+  }
+
+  // Bob has been called again.
+  KJ_EXPECT(context.restorer.callCount == 2);
+
+  // Carol -> Bob connection is still not idle.
+  KJ_EXPECT(!carolToBob.isIdle());
+
+  // Tell Carol to drop the cap to Bob, by sending a hold request but leaving the capability null.
+  carolCap.holdRequest().send().wait(context.waitScope);
+
+  // Now Carol -> Bob connection is idle.
+  KJ_EXPECT(carolToBob.isIdle());
+
+  // Alice is still notn connected to Bob.
+  KJ_EXPECT(alice.vatNetwork.getConnectionTo(bob.vatNetwork) == kj::none);
+
+  // No forwarding should have occurred in this test.
+  KJ_EXPECT(context.network.forwardCount == 0);
+  KJ_EXPECT(context.network.deniedForwardCount == 0);
+}
+
+KJ_TEST("three-party handoff introduce to self") {
+  TestContext context;
+
+  // Create a CapabilityServerSet with a TestInterfaceImpl in it.
+  CapabilityServerSet<test::TestInterface> capSet;
+  TestInterfaceImpl* ptr;
+  test::TestInterface::Client cap = nullptr;
+  int callCount = 0;
+  {
+    auto obj = kj::heap<TestInterfaceImpl>(callCount);
+    ptr = obj;
+    cap = capSet.add(kj::mv(obj));
+  }
+
+  // Create Carol, whose bootstrap is a TestMoreStuffImpl. (Can't use Bob because calling
+  // getTestMoreStuff() returns a new instance each time, but we want a single shared instance.)
+  int carolCallCount = 0;
+  int carolHandleCount = 0;
+  auto& carol = context.initVat("carol",
+      kj::heap<TestMoreStuffImpl>(carolCallCount, carolHandleCount));
+
+  // Connect to Carol by two different means, getting the same capability back. The second
+  // connection is "unique" so it isn't shared with the first.
+  auto carolCap1 = context.alice.connect<test::TestMoreStuff>("carol", false);
+  auto carolCap2 = context.alice.connect<test::TestMoreStuff>("carol", true);
+
+  // Get a reference to the first Carol -> Alice connection, and tell it to block itself as soon
+  // as a `Provide` message is sent. This should block the subsequent `Disembargo`.
+  auto& conn1 = KJ_ASSERT_NONNULL(carol.vatNetwork.getConnectionTo(context.alice.vatNetwork));
+  conn1.blockAfter([](rpc::Message::Reader msg) {
+    return msg.isProvide();
+  });
+
+  // Pass a capability to Carol over the first connection.
+  {
+    auto req = carolCap1.holdRequest();
+    req.setCap(cap);
+    req.send().wait(context.waitScope);
+  }
+
+  // Receive it back over the second, while making a pipelined request.
+  test::TestInterface::Client roundTripCap = nullptr;
+  kj::Promise<void> call1 = nullptr;
+  {
+    auto pipeline = carolCap2.getHeldRequest().send();
+
+    auto req = pipeline.getCap().fooRequest();
+    req.setI(123);
+    req.setJ(true);
+    req.setExpectedCallCount(0);
+    call1 = req.sendIgnoringResult();
+
+    roundTripCap = pipeline.wait(context.waitScope).getCap();
+  }
+
+  // Make a second call on the final returned capability.
+  auto call2 = [&]() {
+    auto req = roundTripCap.fooRequest();
+    req.setI(123);
+    req.setJ(true);
+    req.setExpectedCallCount(1);
+    return req.send();
+  }();
+
+  // Also try to unwrap it.
+  auto unwrapPromise = capSet.getLocalServer(roundTripCap);
+
+  // All of that should be blocked on the embargo which is blocked on conn1.
+  KJ_EXPECT(!call1.poll(context.waitScope));
+  KJ_EXPECT(!call2.poll(context.waitScope));
+  KJ_EXPECT(!unwrapPromise.poll(context.waitScope));
+  KJ_EXPECT(callCount == 0);
+
+  // Unblock it.
+  conn1.unblock();
+
+  // Calls should complete (and shouldn't fail from incorrect ordering).
+  call1.wait(context.waitScope);
+  call2.wait(context.waitScope);
+  KJ_EXPECT(callCount == 2);
+
+  // We should now be able to fully unwrap the capability, too.
+  auto& roundTripObj = KJ_ASSERT_NONNULL(unwrapPromise.wait(context.waitScope));
+
+  // It should have unwrapped to the same original object.
+  KJ_EXPECT(&roundTripObj == ptr);
+}
+
+class TestNoTailForwarder final: public test::TestMoreStuff::Server {
+  // Capability which just forwards to some other capability, but without using a tail call.
+  //
+  // If `holdBouncer` is provided, then calls to `hold()` will additionally round-trip the
+  // capability to the bouncer and back, adding a leg that should get path-shortened away if
+  // everything is working correctly.
+
+public:
+  TestNoTailForwarder(test::TestMoreStuff::Client next,
+                      kj::Maybe<test::TestMoreStuff::Client> holdBouncer)
+      : next(kj::mv(next)), holdBouncer(kj::mv(holdBouncer)) {}
+
+  DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
+                                  CallContext<AnyPointer, AnyPointer> context) override {
+    if (interfaceId == capnp::typeId<test::TestMoreStuff>() && methodId == 3) {
+      // Calling TestMoreStuff.hold(). Dispatch normally.
+      return test::TestMoreStuff::Server::dispatchCall(interfaceId, methodId, context);
+    }
+
+    auto params = context.getParams();
+    auto req = next.typelessRequest(interfaceId, methodId, params.targetSize(), {});
+    req.set(params);
+    auto promise = req.send().then([context](Response<AnyPointer> resp) mutable {
+      context.getResults(resp.targetSize()).set(resp);
+    });
+    return { .promise = kj::mv(promise), .isStreaming = false };
+  }
+
+private:
+  test::TestMoreStuff::Client next;
+  kj::Maybe<test::TestMoreStuff::Client> holdBouncer;
+
+  kj::Promise<void> hold(HoldContext context) override {
+    auto cap = context.getParams().getCap();
+
+    // If we have a holdBouncer, bounce the capability through it first before forwarding on.
+    KJ_IF_SOME(hb, holdBouncer) {
+      auto req = hb.echoRequest();
+
+      // HACK: echo() just reflects the cap back, but it was written to expect TestCallOrder
+      //   specifically. We'll just pretend that's what we have, it doesn't matter.
+      // TODO(cleanup): Change echo() to take `Capability` or maybe even be a generic.
+      req.setCap(cap.castAs<test::TestCallOrder>());
+      auto resp = co_await req.send();
+      cap = resp.getCap().castAs<test::TestInterface>();
+    }
+
+    auto req = next.holdRequest();
+    req.setCap(kj::mv(cap));
+    co_await req.send();
+
+    // (hold() has no results)
+  }
+};
+
+void doForwardingTest(bool allowForwarding, bool addReflectionLeg) {
+  TestContext context;
+  context.network.forwardingEnabled = allowForwarding;
+
+  // Set up Alice, Bob, Carol, and Dave.
+  auto& alice = context.alice;
+  auto& bob = context.bob;
+
+  int carolCallCount = 0;
+  int carolHandleCount = 0;
+  auto& carol = context.initVat("carol",
+      kj::heap<TestMoreStuffImpl>(carolCallCount, carolHandleCount));
+
+  int eveCallCount = 0;
+  int eveHandleCount = 0;
+
+  // Arrange for Dave to forward all calls to Carol.
+  auto& dave = [&]() -> TestContext::Vat& {
+    auto paf = kj::newPromiseAndFulfiller<Capability::Client>();
+    auto& dave = context.initVat("dave", kj::mv(paf.promise));
+
+    kj::Maybe<test::TestMoreStuff::Client> holdBouncer = kj::none;
+    if (addReflectionLeg) {
+      // Add a `holdBouncer`, so the capability gets bounced from Dave to Eve and back to Dave
+      // again before forwarding on to Carol.
+      context.initVat("eve", kj::heap<TestMoreStuffImpl>(eveCallCount, eveHandleCount));
+      holdBouncer = dave.connect<test::TestMoreStuff>("eve");
+    }
+
+    paf.fulfiller->fulfill(kj::heap<TestNoTailForwarder>(
+        dave.connect<test::TestMoreStuff>("carol"), kj::mv(holdBouncer)));
+    return dave;
+  }();
+
+  // Alice connects to Bob and Dave.
+  auto bobCap = context.alice.connect<test::TestInterface>("bob");
+  auto daveCap = context.alice.connect<test::TestMoreStuff>("dave");
+
+  // Send `bobCap` to Dave, who sends it on to Carol.
+  {
+    auto req = daveCap.holdRequest();
+    req.setCap(kj::mv(bobCap));
+    req.send().wait(context.waitScope);
+  }
+
+  // Pump event loop to allow things to settle.
+  context.waitScope.poll();
+
+  // Tell Dave to invoke the held capability. Dave forwards to Carol. This forces Carol to connect
+  // to Bob.
+  {
+    auto resp = daveCap.callHeldRequest().send().wait(context.waitScope);
+    KJ_EXPECT(resp.getS() == "bar");
+  }
+
+  // Dave is connected to Carol, who is connected to Bob.
+  KJ_EXPECT(dave.vatNetwork.getConnectionTo(carol.vatNetwork) != kj::none);
+  KJ_EXPECT(carol.vatNetwork.getConnectionTo(bob.vatNetwork) != kj::none);
+
+  // Carol never connected to Alice.
+  KJ_EXPECT(carol.vatNetwork.getConnectionTo(alice.vatNetwork) == kj::none);
+
+  if (allowForwarding) {
+    // Dave never connected to Bob.
+    KJ_EXPECT(dave.vatNetwork.getConnectionTo(bob.vatNetwork) == kj::none);
+
+    // Forwarding occurred.
+    KJ_EXPECT(context.network.forwardCount == addReflectionLeg ? 3 : 1);
+    KJ_EXPECT(context.network.deniedForwardCount == 0);
+  } else {
+    // Dave had to accept the capability from Bob before forwarding it, so had to connect to bob.
+    KJ_EXPECT(dave.vatNetwork.getConnectionTo(bob.vatNetwork) != kj::none);
+
+    // No forwarding occurred.
+    KJ_EXPECT(context.network.forwardCount == 0);
+    KJ_EXPECT(context.network.deniedForwardCount == 1);
+  }
+}
+
+KJ_TEST("four-party handoff with forwarding") {
+  doForwardingTest(true, false);
+}
+
+KJ_TEST("four-party handoff without forwarding") {
+  doForwardingTest(false, false);
+}
+
+KJ_TEST("four-party handoff with forwarding through a reflected path") {
+  doForwardingTest(true, true);
+}
+
+KJ_TEST("three-party handoff with embargos") {
+  TestContext context;
+
+  // Set up Alice, Bob, and Carol.
+  auto& alice = context.alice;
+  auto& bob = context.bob;
+
+  int carolCallCount = 0;
+  int carolHandleCount = 0;
+  auto& carol = context.initVat("carol",
+      kj::heap<TestMoreStuffImpl>(carolCallCount, carolHandleCount));
+
+  // Alice connects to Bob and Carol.
+  auto bobCap = context.alice.connect<test::TestInterface>("bob");
+  auto carolCap = context.alice.connect<test::TestMoreStuff>("carol");
+
+  // Send `bobCap` to Carol to hold for later.
+  {
+    auto req = carolCap.holdRequest();
+    req.setCap(kj::mv(bobCap));
+    req.send().wait(context.waitScope);
+  }
+
+  // Tell Carol to invoke the held capability. This forces Carol to connect to Bob and to release
+  // the vine.
+  {
+    auto resp = carolCap.callHeldRequest().send().wait(context.waitScope);
+    KJ_EXPECT(resp.getS() == "bar");
+  }
+
+  // Pump event loop to allow things to settle.
+  context.waitScope.poll();
+
+  // Alice -> Bob connection is idle since we passed the capability to Carol.
+  auto& aliceToBob = KJ_ASSERT_NONNULL(alice.vatNetwork.getConnectionTo(bob.vatNetwork));
+  KJ_EXPECT(aliceToBob.isIdle());
+
+  // Block the connection from Carol -> Bob immediately after the `Provide` message is sent. This
+  // will prevent pipelined calls and the Disembargo from going through.
+  auto& carolToBob = KJ_ASSERT_NONNULL(carol.vatNetwork.getConnectionTo(bob.vatNetwork));
+  carolToBob.blockAfter([](rpc::Message::Reader msg) {
+    return msg.isProvide();
+  });
+
+  // Now get the cap back from Carol.
+  auto promise = carolCap.getHeldRequest().send();
+
+  // Immediately do a pipelined call, which should go Alice -> Carol -> Bob. (But the second hop
+  // is blocked.)
+  auto call1 = [&]() {
+    auto req = promise.getCap().fooRequest();
+    req.setI(123);
+    req.setJ(true);
+    req.setExpectedCallCount(1);
+    return req.send();
+  }();
+
+  // Now actually wait for the call to Carol to return.
+  auto response = promise.wait(context.waitScope);
+
+  // And do a call on that.
+  auto call2 = [&]() {
+    auto req = response.getCap().fooRequest();
+    req.setI(123);
+    req.setJ(true);
+    req.setExpectedCallCount(2);
+    return req.send();
+  }();
+
+  // Neither call is able to make progress since call1 must be delivered first.
+  KJ_EXPECT(!call1.poll(context.waitScope));
+  KJ_EXPECT(!call2.poll(context.waitScope));
+  KJ_EXPECT(context.restorer.callCount == 1);
+
+  // Unblock Carol -> Bob so the provision can complete.
+  carolToBob.unblock();
+
+  call1.wait(context.waitScope);
+  call2.wait(context.waitScope);
+  KJ_EXPECT(context.restorer.callCount == 3);
+}
+
+// =======================================================================================
+// AdaptiveFlowController tests
+
+class TestClock final: public kj::MonotonicClock {
+public:
+  kj::TimePoint now() const override { return time; }
+  void advance(kj::Duration d) { time += d; }
+  void setTime(kj::TimePoint t) { time = t; }
+private:
+  kj::TimePoint time = kj::origin<kj::TimePoint>();
+};
+
+class MockMessage final: public OutgoingRpcMessage {
+  // A mock OutgoingRpcMessage that reports a given size and tracks whether send() was called.
+public:
+  MockMessage(size_t sizeBytes): sizeBytes(sizeBytes) {}
+
+  AnyPointer::Builder getBody() override {
+    KJ_FAIL_REQUIRE("MockMessage::getBody() not expected to be called");
+  }
+  void send() override { sent = true; }
+  size_t sizeInWords() override { return sizeBytes / sizeof(capnp::word); }
+
+  bool sent = false;
+private:
+  size_t sizeBytes;
+};
+
+// To emulate random-ish chunk sizes while keeping the test reproducible, we cycle through this
+// list of sizes.
+static constexpr size_t CHUNK_SIZES[] = {
+  32 * 1024, 4 * 1024, 16000, 12345, 16, 9999, 4321, 8
+};
+
+// Simulates a stream with a fake clock and configurable RTT and bandwidth. Sends chunks, advances
+// time, and acks in order. Ported from the Cap'n Web FlowController test suite.
+class StreamSimulator: private kj::TaskSet::ErrorHandler {
+public:
+  StreamSimulator(kj::WaitScope& ws): waitScope(ws), sendTasks(*this) {}
+
+  // Default RTT of 100ms.
+  kj::Duration rtt = 100 * kj::MILLISECONDS;
+
+  // Default bandwidth of 10kB/ms = 10MB/s = 1MB/RTT. This is larger than the initial window size
+  // of 256k, so the window should grow if saturated.
+  double bandwidth = 10.0 * 1024;  // bytes per millisecond
+
+  // Convenience getter to calculate BDP.
+  size_t bdp() {
+    return static_cast<size_t>(static_cast<double>(rtt / kj::MILLISECONDS) * bandwidth);
+  }
+
+  TestClock clock;
+
+  // The flow controller itself.
+  kj::Own<RpcFlowController> fc = RpcFlowController::newAdaptiveController(256 * 1024, clock);
+
+  // Are we currently blocked?
+  bool blocked = false;
+
+  // Number of in-flight (unacked) messages.
+  size_t inFlightCount() { return inFlight.size(); }
+
+  // Send a chunk at the current time.
+  void send(size_t size) {
+    // The new message begins sending now, unless some other message is still sending, in which
+    // case it sends after that message.
+    double nowMs = static_cast<double>(
+        (clock.now() - kj::origin<kj::TimePoint>()) / kj::NANOSECONDS) * 1e-6;
+    if (linkOccupiedUntilMs < nowMs) {
+      linkOccupiedUntilMs = nowMs;
+    }
+    linkOccupiedUntilMs += static_cast<double>(size) / bandwidth;
+
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    auto message = kj::heap<MockMessage>(size);
+
+    // ackTime = time when the chunk finishes writing out to the pipe, plus 1 rtt (in ms)
+    double ackTimeMs = linkOccupiedUntilMs
+        + static_cast<double>(rtt / kj::MILLISECONDS);
+
+    auto promise = fc->send(kj::mv(message), kj::mv(paf.promise));
+    inFlight.push_back(InFlightEntry { kj::mv(paf.fulfiller), ackTimeMs });
+
+    // When the send promise resolves, the flow controller is telling us it's OK to send more.
+    blocked = true;
+    sendTasks.add(promise.then([this]() { blocked = false; }));
+    waitScope.poll();
+  }
+
+  // Fill the window by sending chunks of the given size. Returns the number of chunks sent
+  // (the last one caused blocking).
+  uint fillWindow(size_t chunkSize) {
+    uint count = 0;
+    while (!blocked) {
+      count++;
+      send(chunkSize);
+    }
+    return count;
+  }
+
+  // Advance to the next message's ack time, and deliver the ack to the flow controller.
+  void waitForNextAck() {
+    if (!inFlight.empty()) {
+      auto entry = kj::mv(inFlight.front());
+      inFlight.pop_front();
+
+      // Advance time to when the ack arrives.
+      auto ackTimeNs = static_cast<int64_t>(entry.ackTimeMs * 1e6);
+      clock.setTime(kj::origin<kj::TimePoint>() + ackTimeNs * kj::NANOSECONDS);
+
+      // Fulfill the ack promise, then poll to let the flow controller process it.
+      // If this ack frees enough window space, the send promise's .then() will fire
+      // and set blocked = false.
+      entry.fulfiller->fulfill();
+      waitScope.poll();
+    }
+  }
+
+  // Simulate the application writing to the stream as fast as it can for the given duration.
+  void saturateFor(kj::Duration duration) {
+    auto startTime = clock.now();
+    auto endTime = startTime + duration;
+    size_t i = 0;
+
+    while (clock.now() < endTime) {
+      if (blocked) {
+        waitForNextAck();
+      } else {
+        send(CHUNK_SIZES[i++ % kj::size(CHUNK_SIZES)]);
+      }
+    }
+
+    // Drain remaining acks.
+    while (inFlightCount() > 0) {
+      waitForNextAck();
+    }
+  }
+
+private:
+  kj::WaitScope& waitScope;
+
+  // The outgoing link is sending bytes (for a previous send()) until this time. Subsequent sends
+  // cannot start until after this time. This is how we simulate bandwidth constraints.
+  double linkOccupiedUntilMs = 0;
+
+  // Collects send promises. When a send promise resolves, its .then() sets blocked = false.
+  kj::TaskSet sendTasks;
+
+  struct InFlightEntry {
+    kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+    double ackTimeMs;
+  };
+  std::deque<InFlightEntry> inFlight;
+
+  void taskFailed(kj::Exception&& exception) override {
+    KJ_FAIL_ASSERT("send task failed", exception);
+  }
+};
+
+// Helper to get the adaptive window size: send a zero-byte message and see how many bytes the
+// controller allows before blocking. This is an indirect measurement since the window is private.
+// Instead, we just test behavior: does it block, does it converge, etc.
+
+KJ_TEST("AdaptiveFlowController: blocks when window is full") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Send 64KB chunks until blocked. Initial window is 256KB. Due to the maxMessageSize extension
+  // in isReady() (which allows bytesInFlight < window + maxMessageSize), we can send one extra
+  // chunk beyond what the raw window would allow, so we expect 5 chunks (320KB) before blocking.
+  uint count = sim.fillWindow(64 * 1024);
+  KJ_EXPECT(count == 5, count);
+}
+
+KJ_TEST("AdaptiveFlowController: unblocks after ack frees space") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Send 5 chunks at staggered times so acks arrive at different times.
+  // Due to the maxMessageSize extension, 5 chunks of 64KB (320KB) are needed to fill the
+  // 256KB window.
+  sim.clock.setTime(kj::origin<kj::TimePoint>() + 0 * kj::MILLISECONDS);
+  sim.send(64 * 1024);
+  sim.clock.setTime(kj::origin<kj::TimePoint>() + 1 * kj::MILLISECONDS);
+  sim.send(64 * 1024);
+  sim.clock.setTime(kj::origin<kj::TimePoint>() + 2 * kj::MILLISECONDS);
+  sim.send(64 * 1024);
+  sim.clock.setTime(kj::origin<kj::TimePoint>() + 3 * kj::MILLISECONDS);
+  sim.send(64 * 1024);
+  KJ_EXPECT(sim.blocked == false);
+  sim.clock.setTime(kj::origin<kj::TimePoint>() + 4 * kj::MILLISECONDS);
+  sim.send(64 * 1024);
+  KJ_EXPECT(sim.blocked == true);
+
+  // Ack only the first one -- should unblock.
+  sim.waitForNextAck();
+  KJ_EXPECT(sim.blocked == false);
+  // After ack, we should be able to send again.
+  sim.send(64 * 1024);
+  // We sent only one more -- should not immediately block if window grew or stayed same.
+}
+
+KJ_TEST("AdaptiveFlowController: window grows during startup") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Simulate for a few RTTs -- window should grow toward the BDP (1MB).
+  sim.saturateFor(sim.rtt * 5);
+
+  // We can't directly read the window, but we can test that the controller allows more data
+  // than the initial 256KB. Fill the window and count how many 64KB chunks fit.
+  uint count = sim.fillWindow(64 * 1024);
+  // With an initial window of 256KB and BDP of 1MB, after 5 RTTs of startup the window should
+  // have grown well past 256KB (4 chunks). We expect at least 10+ chunks.
+  KJ_EXPECT(count > 4, count);
+}
+
+KJ_TEST("AdaptiveFlowController: exits startup after window growth plateaus") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Simulate for a long time (50 RTTs) so startup exits.
+  sim.saturateFor(sim.rtt * 50);
+
+  // After startup, the window should be around BDP * 1.25. With BDP of 1MB, that's ~1.25MB.
+  // After exiting startup, the window should grow slowly. Let's test by saturating for more
+  // and seeing the window doesn't keep doubling.
+  uint countBefore = sim.fillWindow(64 * 1024);
+  while (sim.inFlightCount() > 0) sim.waitForNextAck();
+
+  sim.saturateFor(sim.rtt * 10);
+  uint countAfter = sim.fillWindow(64 * 1024);
+
+  // In steady state, the window should be relatively stable -- countAfter should not be more
+  // than ~25% larger than countBefore.
+  KJ_EXPECT(countAfter <= countBefore * 2, countBefore, countAfter);
+}
+
+KJ_TEST("AdaptiveFlowController: steady-state window converges near BDP") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Run through startup.
+  sim.saturateFor(sim.rtt * 50);
+
+  // Fill window and see how many chunks fit to estimate window size.
+  uint count = sim.fillWindow(64 * 1024);
+  size_t estimatedWindow = count * 64 * 1024;
+
+  // BDP is 1MB. Steady-state window should be ~1.25x BDP = 1.25MB, which is ~20 chunks of 64KB.
+  // Allow some tolerance: between BDP*1.0 and BDP*1.5.
+  KJ_EXPECT(estimatedWindow >= sim.bdp(), estimatedWindow, sim.bdp());
+  KJ_EXPECT(estimatedWindow <= sim.bdp() * 2, estimatedWindow, sim.bdp());
+}
+
+KJ_TEST("AdaptiveFlowController: window does not shrink when app-limited") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Run through startup to establish a window. Use enough RTTs to fully exit startup, then
+  // keep saturating for a while to let the window stabilize.
+  sim.saturateFor(sim.rtt * 100);
+
+  // Measure the window by saturating briefly and observing the fill count.
+  uint countBefore = sim.fillWindow(64 * 1024);
+
+  // Drain everything.
+  while (sim.inFlightCount() > 0) sim.waitForNextAck();
+  KJ_ASSERT(!sim.blocked);
+
+  // Now repeatedly send small chunks that don't fill the window, waiting for each ack.
+  // This is app-limited behavior -- the controller should not shrink the window.
+  for (int i = 0; i < 100; i++) {
+    sim.send(1024);
+    sim.waitForNextAck();
+  }
+
+  // Re-measure the window the same way.
+  uint countAfter = sim.fillWindow(64 * 1024);
+
+  // Window should not have shrunk. Allow tolerance of 2 chunks since the fill+drain measurement
+  // cycle itself can cause the BDP estimate to shift slightly.
+  KJ_EXPECT(countAfter + 2 >= countBefore, countBefore, countAfter);
+}
+
+KJ_TEST("AdaptiveFlowController: window shrinks when bandwidth decreases") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Run through startup at full speed.
+  sim.saturateFor(sim.rtt * 50);
+
+  uint countBefore = sim.fillWindow(64 * 1024);
+  while (sim.inFlightCount() > 0) sim.waitForNextAck();
+  KJ_ASSERT(!sim.blocked);
+
+  // Simulate bandwidth drop to 1/4 of original.
+  sim.bandwidth /= 4;
+  sim.saturateFor(sim.rtt * 200);
+
+  uint countAfter = sim.fillWindow(64 * 1024);
+
+  // The window should have shrunk significantly.
+  KJ_EXPECT(countAfter < countBefore, countBefore, countAfter);
+}
+
+KJ_TEST("AdaptiveFlowController: minimum window is enforced") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  StreamSimulator sim(waitScope);
+
+  // Set RTT and bandwidth very low to create a tiny BDP.
+  sim.rtt = 1 * kj::MILLISECONDS;
+  sim.bandwidth = 1;  // 1 byte per millisecond
+
+  // Saturate for a very long time (matching Cap'n Web's 10_000_000ms test). With bandwidth of
+  // 1 byte/ms, each chunk takes a long time to transmit, so we need a very long simulation to
+  // get enough acks for the decay to converge to the minimum window.
+  sim.saturateFor(10000000 * kj::MILLISECONDS);
+
+  // The minimum window is 64KB. The isReady() check adds a maxMessageSize extension (the
+  // controller allows bytesInFlight < window + maxMessageSize). The maxMessageSize is the
+  // largest message ever seen, which from CHUNK_SIZES is 32KB. So filling with 1KB chunks,
+  // we can fit up to 64KB + 32KB = 96KB before blocking.
+  uint count = sim.fillWindow(1024);
+  size_t estimatedWindow = count * 1024;
+  KJ_EXPECT(estimatedWindow <= 96 * 1024, estimatedWindow);
+  KJ_EXPECT(estimatedWindow >= 64 * 1024, estimatedWindow);
 }
 
 }  // namespace

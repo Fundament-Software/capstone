@@ -243,17 +243,6 @@ struct MainBuilder::Impl {
 
   Arena arena;
 
-  struct CharArrayCompare {
-    inline bool operator()(const ArrayPtr<const char>& a, const ArrayPtr<const char>& b) const {
-      int cmp = memcmp(a.begin(), b.begin(), min(a.size(), b.size()));
-      if (cmp == 0) {
-        return a.size() < b.size();
-      } else {
-        return cmp < 0;
-      }
-    }
-  };
-
   struct Option {
     ArrayPtr<OptionName> names;
     bool hasArg;
@@ -268,7 +257,7 @@ struct MainBuilder::Impl {
   class OptionDisplayOrder;
 
   std::map<char, Option*> shortOptions;
-  std::map<ArrayPtr<const char>, Option*, CharArrayCompare> longOptions;
+  std::map<ArrayPtr<const char>, Option*> longOptions;
 
   struct SubCommand {
     Function<MainFunc()> func;
@@ -516,7 +505,7 @@ void MainBuilder::MainImpl::operator()(StringPtr programName, ArrayPtr<const Str
             // Run the sub-command with "--help" as the argument.
             MainFunc subMain = iter->second.func();
             StringPtr dummyArg = "--help";
-            subMain(str(programName, ' ', params[i + 1]), arrayPtr(&dummyArg, 1));
+            subMain(str(programName, ' ', params[i + 1]), arrayPtr(dummyArg));
             return;
           } else if (params[i + 1] == "help") {
             uint count = 0;
@@ -698,25 +687,25 @@ void MainBuilder::MainImpl::printHelp(StringPtr programName) {
       }
     }
   } else {
-    text.addAll(StringPtr(" <command> [<arg>...]"));
+    text.addAll(" <command> [<arg>...]"_kj);
   }
-  text.addAll(StringPtr("\n\n"));
+  text.addAll("\n\n"_kj);
 
   wrapText(text, "", impl->briefDescription);
 
   if (!impl->subCommands.empty()) {
-    text.addAll(StringPtr("\nCommands:\n"));
+    text.addAll("\nCommands:\n"_kj);
     size_t maxLen = 0;
     for (auto& command: impl->subCommands) {
       maxLen = kj::max(maxLen, command.first.size());
     }
     for (auto& command: impl->subCommands) {
-      text.addAll(StringPtr("  "));
+      text.addAll("  "_kj);
       text.addAll(command.first);
       for (size_t i = command.first.size(); i < maxLen; i++) {
         text.add(' ');
       }
-      text.addAll(StringPtr("  "));
+      text.addAll("  "_kj);
       text.addAll(command.second.helpText);
       text.add('\n');
     }
@@ -725,16 +714,16 @@ void MainBuilder::MainImpl::printHelp(StringPtr programName) {
   }
 
   if (!sortedOptions.empty()) {
-    text.addAll(StringPtr("\nOptions:\n"));
+    text.addAll("\nOptions:\n"_kj);
 
     for (auto opt: sortedOptions) {
-      text.addAll(StringPtr("    "));
+      text.addAll("    "_kj);
       bool isFirst = true;
       for (auto& name: opt->names) {
         if (isFirst) {
           isFirst = false;
         } else {
-          text.addAll(StringPtr(", "));
+          text.addAll(", "_kj);
         }
         if (name.isLong) {
           text.addAll(str("--", name.longName));
@@ -752,7 +741,7 @@ void MainBuilder::MainImpl::printHelp(StringPtr programName) {
       wrapText(text, "        ", opt->helpText);
     }
 
-    text.addAll(StringPtr("    --help\n        Display this help text and exit.\n"));
+    text.addAll("    --help\n        Display this help text and exit.\n"_kj);
   }
 
   if (impl->extendedDescription.size() > 0) {

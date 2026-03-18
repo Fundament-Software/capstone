@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <stdint.h>  // for uintptr_t
 #include "memory.h"
 #include "array.h"
 #include "string.h"
@@ -72,19 +73,19 @@ public:
   Exception(Type type, const char* file, int line, String description = nullptr) noexcept;
   Exception(Type type, String file, int line, String description = nullptr) noexcept;
   Exception(const Exception& other) noexcept;
-  Exception(Exception&& other) = default;
+  Exception(Exception&& other) noexcept = default;
   ~Exception() noexcept;
 
-  const char* getFile() const { return file; }
-  int getLine() const { return line; }
-  Type getType() const { return type; }
-  StringPtr getDescription() const { return description; }
-  ArrayPtr<void* const> getStackTrace() const { return arrayPtr(trace, traceCount); }
+  const char* getFile() const { return storage->file; }
+  int getLine() const { return storage->line; }
+  Type getType() const { return storage->type; }
+  StringPtr getDescription() const { return storage->description; }
+  ArrayPtr<void* const> getStackTrace() const { return arrayPtr(storage->trace, storage->traceCount); }
 
-  void setDescription(kj::String&& desc) { description = kj::mv(desc); }
+  void setDescription(kj::String&& desc) { storage->description = kj::mv(desc); }
 
-  StringPtr getRemoteTrace() const { return remoteTrace; }
-  void setRemoteTrace(kj::String&& value) { remoteTrace = kj::mv(value); }
+  StringPtr getRemoteTrace() const { return storage->remoteTrace; }
+  void setRemoteTrace(kj::String&& value) { storage->remoteTrace = kj::mv(value); }
   // Additional stack trace data originating from a remote server. If present, then
   // `getStackTrace()` only traces up until entry into the RPC system, and the remote trace
   // contains any trace information returned over the wire. This string is human-readable but the
@@ -104,7 +105,7 @@ public:
   };
 
   inline Maybe<const Context&> getContext() const {
-    KJ_IF_SOME(c, context) {
+    KJ_IF_SOME(c, storage->context) {
       return *c;
     } else {
       return kj::none;
@@ -158,34 +159,82 @@ public:
   // KJ / Cap'n Proto. In particular, Cloudflare Workers commonly has to convert a JavaScript
   // exception to KJ and back. The exception is serialized using V8 serialization.
 
+  bool isMovedAway() const { return storage == nullptr; }
+  // When exception is moved away from, accessing any of its data will throw.
+
 private:
-  String ownFile;
-  const char* file;
-  int line;
-  Type type;
-  String description;
-  Maybe<Own<Context>> context;
-  String remoteTrace;
-  void* trace[32];
-  uint traceCount;
+  struct Storage {
+    String ownFile;
+    const char* file;
+    int line;
+    Type type;
+    String description;
+    Maybe<Own<Context>> context;
+    String remoteTrace;
+    void* trace[32];
+    uint traceCount = 0;
 
-  bool isFullTrace = false;
-  // Is `trace` a full trace to the top of the stack (or as close as we could get before we ran
-  // out of space)? If this is false, then `trace` is instead a partial trace covering just the
-  // frames between where the exception was thrown and where it was caught.
-  //
-  // extendTrace() transitions this to true, and truncateCommonTrace() changes it back to false.
-  //
-  // In theory, an exception should only hold a full trace when it is in the process of being
-  // thrown via the C++ exception handling mechanism -- extendTrace() is called before the throw
-  // and truncateCommonTrace() after it is caught. Note that when exceptions propagate through
-  // async promises, the trace is extended one frame at a time instead, so isFullTrace should
-  // remain false.
+    bool isFullTrace = false;
+    // Is `trace` a full trace to the top of the stack (or as close as we could get before we ran
+    // out of space)? If this is false, then `trace` is instead a partial trace covering just the
+    // frames between where the exception was thrown and where it was caught.
+    //
+    // extendTrace() transitions this to true, and truncateCommonTrace() changes it back to false.
+    //
+    // In theory, an exception should only hold a full trace when it is in the process of being
+    // thrown via the C++ exception handling mechanism -- extendTrace() is called before the throw
+    // and truncateCommonTrace() after it is caught. Note that when exceptions propagate through
+    // async promises, the trace is extended one frame at a time instead, so isFullTrace should
+    // remain false.
 
-  kj::Vector<Detail> details;
+    kj::Vector<Detail> details;
+  };
+
+  kj::Own<Storage> storage = kj::heap<Storage>();
+  // It is very important for sizeof(kj::Exception) to be small, since it is used in result types
+  // everywhere. Encapsulate all storage in a heap-allocated object.
+
+  explicit Exception(kj::None): storage() {}
 
   friend class ExceptionImpl;
+  friend struct MaybeTraits<Exception>;
 };
+
+// MaybeTraits specialization for Exception.
+// Exception uses storage == nullptr as the "none" state.
+template <>
+struct MaybeTraits<Exception> {
+  // Niche optimization: storage == nullptr is the "none" state
+  // NOTE: Uses placement new directly instead of kj::ctor() because Exception(kj::none)
+  // is private and MaybeTraits<Exception> is a friend of Exception.
+  static void initNone(Exception* ptr) noexcept {
+    new (ptr, _::PlacementNew()) Exception(kj::none);
+  }
+  static bool isNone(const Exception& e) noexcept { return e.storage == nullptr; }
+
+  static constexpr bool noneIsMoveSafe = true;
+};
+
+#if __GNUC__
+#define KJ_RETURN_ADDRESS() __builtin_return_address(0)
+#elif _MSC_VER
+#define KJ_RETURN_ADDRESS() _ReturnAddress()
+#else
+  #error "please implement for your compiler"
+#endif
+// KJ_RETURN_ADDRESS() returns a pointer to the code location within the current function's caller
+// where execution will resume when the current function returns.
+
+#define KJ_CALLING_ADDRESS() \
+    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(KJ_RETURN_ADDRESS()) - 1)
+// KJ_CALLING_ADDRESS() returns a pointer to the code that called the current function, suitable
+// for passing to Exception::addTrace().
+//
+// (It actually returns a pointer to the byte before the return address -- which may not be on an
+// instruction boundary, but addr2line still maps it to the caller source location.)
+//
+// Functions that the compiler decides to inline may return locations in the caller's caller,
+// etc.; if this is not desired, the function invoking the macro should be marked KJ_NOINLINE.
 
 struct CanceledException { };
 // This exception is thrown to force-unwind a stack in order to immediately cancel whatever that
@@ -310,6 +359,222 @@ KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignor
 
 // =======================================================================================
 
+// KJ_TRY / KJ_CATCH macros
+//
+// Convenient macros for exception handling that automatically coerce all catchable exceptions to
+// kj::Exception. These can replace both raw `try {} catch(...) { getCaughtExceptionAsKj() }` and
+// `runCatchingExceptions()` usage.
+//
+//   KJ_TRY {
+//     // code that may throw
+//   } KJ_CATCH(e) {
+//     // code that handles the exception `e`
+//     kj::throwFatalException(kj::mv(e));  // Optional: rethrow like so
+//   }
+//
+// KJ_TRY: Semantically equivalent to `try`. The user-provided code block following this macro
+// literally is a `try` block.
+//
+// KJ_CATCH(name): The parameter is a user-chosen name. `name` will be a `kj::Exception&` in the
+// catch handler's code block. If you want to catch an exception but don't need the exception
+// details, you can name the exception `_` to suppress the unused variable warning, or suffix it
+// with `[[maybe_unused]]`. You are free to move the exception away, if you want, e.g. to rethrow
+// it. As a reminder, if you want to rethrow the exception, you must use
+// `kj::throwFatalException()`, and not a naked `throw`, to ensure the exception's attached stack
+// trace is accurate.
+//
+// The user-provided code block following `KJ_CATCH(e)` IS NOT A TRUE CATCH HANDLER! In particular,
+// this means:
+// - YOU CANNOT RETHROW the current exception with `throw`, because there is none.
+// - You can jump into the "catch handler" blocks with `goto`, but that would be inadvisable.
+// - It doesn't have to be a braced block -- it can be just a semi-colon, like `KJ_CATCH(_);`.
+//
+// Advantages over raw try/catch:
+// - Automatically coerces all exceptions (including std::exceptions) to kj::Exception -- no need to
+//   `catch (...)` and call `kj::getCaughtExceptionAsKj()`.
+// - You can `co_await` inside the catch handlers!
+//
+// Advantages over runCatchingExceptions():
+// - No need for lambda wrapping: The potentially-throwy code block runs inline with the function
+//   body, meaning you can `co_await` in it if you're in a coroutine, `return` from the enclosing
+//   function, `break` an outer loop, etc.
+//
+// TODO(soon): Does KJ_CATCH need to do anything to adjust stack traces in the caught exceptions?
+//
+// MIGRATION GUIDE:
+//
+// Raw `try/catch(...)` blocks which immediately call `getCaughtExceptionAsKj()` can be mechanically
+// converted to `KJ_TRY / KJ_CATCH(e)` without putting any thought into the matter. This is because
+// `KJ_TRY / KJ_CATCH` is simply syntax sugar for immediately calling `getCaughtexceptionAsKj()` in
+// the catch handler. That is, the following are completely equivalent:
+//
+//   try {
+//     // code that may throw
+//   } catch (...) {
+//     auto e = kj::getCaughtexceptionAsKj();  // first line of catch handler
+//     // code that handles the exception `e`
+//   }
+//
+//   KJ_TRY {
+//     // code that may throw
+//   } KJ_CATCH(e) {
+//     // code that handles the exception `e`
+//   }
+//
+// Raw `try/catch(...)` blocks which DO NOT call, or do not immediately call,
+// `getCaughtExceptionAsKj()`, require a bit more thought. This is because such blocks will catch
+// KJ's special "uncatchable" exceptions, such as `CanceledException`, which are used to implement
+// features such as fiber cancellation. This means that any code in a `catch(...)` block which
+// appears before `getCaughtExceptionAsKj()` (if it appears at all) will run during fiber
+// cancellation. If such blocks do not ultimately rethrow their exception with a naked `throw`
+// statement, then they are almost certainly buggy, and will suppress fiber cancellation and similar
+// features. They should probably be converted to `KJ_TRY / KJ_CATCH`.
+//
+//   try {
+//     // code that may throw
+//   } catch (...) {
+//     // squelch all exceptions -- PROBABLY BUGGY, tread carefully
+//   }
+//
+// For raw `try/catch(...)` blocks which do not call `getCaughtExceptionAsKj()`, but DO rethrow
+// their exception  with a naked `throw`, it may be best to leave them alone, unless you know for
+// sure the code block should not run during events like fiber cancellation. That said, there is
+// also an alternative KJ utility you could convert them to: `KJ_ON_SCOPE_FAILURE`. That is, the
+// following are equivalent:
+//
+//   try {
+//     // code that may throw
+//   } catch (...) {
+//     // unconditional cleanup code
+//     throw;
+//   }
+//
+//   {
+//     KJ_ON_SCOPE_FAILURE(/* unconditional cleanup code */);
+//     // code that may throw
+//   }
+//
+// `KJ_ON_SCOPE_FAILURE` has slightly more overhead than `try/catch` (it saves the current exception
+// count on construction), and wraps your code block in a macro, so it is most appropriate in
+// non-hot path code with one-liner cleanup actions.
+//
+// Some raw `try/catch(...)` blocks store their caught exception in a Maybe in order to later
+// `KJ_IF_SOME` the Maybe to `co_await` some asynchronous operation outside the `catch` block. These
+// may either be mechanically converted as-is, or refactored to move the `co_await` operation
+// directly into the `KJ_CATCH` block, eliminating the need for the Maybe. That is, the following
+// are equivalent:
+//
+//   Maybe<Exception> maybeException;
+//   try {
+//     // code that may throw
+//   } catch (...) {
+//     maybeException = kj::getCaughtexceptionAsKj();
+//   }
+//   KJ_IF_SOME(e, maybeException) {
+//     co_await asyncExceptionHandler(kj::mv(e));
+//   }
+//
+//   KJ_TRY {
+//     // code that may throw
+//   } KJ_CATCH(e) {
+//     co_await asyncExceptionHandler(kj::mv(e));
+//   }
+//
+// Lastly, there is `kj::runCatchingExceptions(func)`. `runCatchingExceptions()` calls
+// `getCaughtExceptionAsKj()` under the hood, so there are no concerns about inadvertently catching
+// uncatchable exceptions. Instead, the main concerns are changes in semantics due to no longer
+// moving function objects around, or due to inlining the function object's body into the calling
+// function. An example of the former:
+//
+//   KJ_IF_SOME(e, runCatchingExceptions(kj::mv(func))) {
+//     // code that handles the exception `e`
+//   }
+//
+//   KJ_TRY {
+//     func();  // SUBTLE: No longer moves `func`!
+//   } KJ_CATCH(e) {
+//     // code that handles the exception `e`
+//   }
+//
+// A contrived example of a change in semantics due to inlining the function body:
+//
+//   KJ_IF_SOME(e, runCatchingExceptions([&]() {
+//     // code that may throw
+//     auto val = KJ_UNWRAP_OR_RETURN(maybeVal);
+//     // more code that may throw
+//   })) {
+//     // code that handles the exception `e`
+//   }
+//
+//   KJ_TRY {
+//     // code that may throw
+//     // SUBTLE: Cannot use KJ_UNWRAP_OR_RETURN anymore.
+//     KJ_IF_SOME(val, maybeVal) {
+//       // more code that may throw
+//     }
+//   } KJ_CATCH(e) {
+//     // code that handles the exception `e`
+//   }
+//
+// Since a common `runCatchingExceptions()` pattern is to immediately `KJ_IF_SOME` its result,
+// you may rarely encounter the following odd syntax:
+//
+//   KJ_IF_SOME(e, runCatchingExceptions(kj::mv(func))) {
+//     // Block A: code that handles the exception `e`
+//   } else {
+//     // Block B: un-"tried" code that runs only on success
+//   }
+//   // Block C: code that runs on success or exception handling, if they did not throw
+//
+// Such patterns could be expressed by setting a `failed` boolean in the `KJ_CATCH` handler, and
+// running Block B iff `!failed` after the `KJ_TRY / `KJ_CATCH`, or we could add a new
+// `KJ_IF_CATCH(e)` macro that supports a trailing `else` clause. That said, such patterns are
+// probably ill-advised to begin with.
+
+#if __clang__
+// clang understands the GCC set of pragma directives.
+// Not applied to GCC due to Bug 78657 (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=78657).
+#define KJ_SILENCE_SHADOWING_BEGIN \
+    _Pragma("GCC diagnostic push") \
+    _Pragma("GCC diagnostic ignored \"-Wshadow\"")
+#define KJ_SILENCE_SHADOWING_END \
+    _Pragma("GCC diagnostic pop")
+#elif defined(_MSC_VER)  // __clang__
+// https://learn.microsoft.com/en-us/previous-versions/visualstudio/visual-studio-2015/code-quality/c6244
+#define KJ_SILENCE_SHADOWING_BEGIN \
+    _Pragma("warning(push)") \
+    _Pragma("warning(suppress: 6244)")
+#define KJ_SILENCE_SHADOWING_END \
+    _Pragma("warning(pop)")
+#else  // defined(_MSC_VER)
+// We only support clang, gcc, and MSVC.
+// For GCC and consistency's sake, let's define empty macros here.
+#define KJ_SILENCE_SHADOWING_BEGIN
+#define KJ_SILENCE_SHADOWING_END
+#endif
+
+// Since we have two macros -- KJ_TRY and KJ_CATCH -- which must both access the same exception
+// storage variable, we must choose a hard-coded name for it. This will cause variable shadowing in
+// nested KJ_TRY/KJ_CATCHes, but that is benign, so we disable shadowing warnings. The `_kj` prefix
+// on the variable name should make name collision with user code extremely unlikely.
+#define KJ_TRY \
+    KJ_SILENCE_SHADOWING_BEGIN \
+    if (::kj::Maybe<::kj::Exception> _kjTryCatchException; true) \
+      try KJ_SILENCE_SHADOWING_END
+
+// TODO(soon): Inline getCaughtExceptionAsKj()'s logic here and use KJ_TRY / KJ_CATCH to implement
+//   getCaughtExceptionAsKj(). This should reduce sad path overhead by 50% (no re-throw), but may
+//   increase code size. Experiment with this after KJ_TRY / KJ_CATCH has been adopted at large.
+#define KJ_CATCH(exception) \
+      catch (...) { \
+        _kjTryCatchException = ::kj::getCaughtExceptionAsKj(); \
+        goto KJ_UNIQUE_NAME(_kjTryCatchHandler); \
+      } \
+    else \
+      KJ_UNIQUE_NAME(_kjTryCatchHandler): \
+      if (auto& exception = *::kj::_::readMaybe(_kjTryCatchException); false) {} \
+      else
+
 namespace _ { class Runnable; }
 
 template <typename Func>
@@ -353,6 +618,9 @@ public:
   // Runs the given function (e.g., a lambda).  If isUnwinding() is true, any exceptions are
   // caught and treated as secondary faults, meaning they are considered to be side-effects of the
   // exception that is unwinding the stack.  Otherwise, exceptions are passed through normally.
+
+  static uint uncaughtExceptionCount();
+  // exposes `std::uncaught_exceptions`
 
 private:
   uint uncaughtCount;
@@ -410,7 +678,7 @@ KJ_NOINLINE ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint igno
 
 String stringifyStackTrace(ArrayPtr<void* const>);
 // Convert the stack trace to a string with file names and line numbers. This may involve executing
-// suprocesses.
+// subprocesses.
 
 String stringifyStackTraceAddresses(ArrayPtr<void* const> trace);
 StringPtr stringifyStackTraceAddresses(ArrayPtr<void* const> trace, ArrayPtr<char> scratch);

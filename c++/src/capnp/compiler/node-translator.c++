@@ -691,6 +691,9 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
       break;
   }
 
+  builder.setStartByte(decl.getStartByte());
+  builder.setEndByte(decl.getEndByte());
+
   builder.adoptAnnotations(compileAnnotationApplications(decl.getAnnotations(), targetsFlagName));
 
   auto di = sourceInfo.get();
@@ -698,6 +701,8 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
   if (decl.hasDocComment()) {
     di.setDocComment(decl.getDocComment());
   }
+  di.setStartByte(decl.getStartByte());
+  di.setEndByte(decl.getEndByte());
 }
 
 static kj::StringPtr getExpressionTargetName(Expression::Reader exp) {
@@ -935,9 +940,12 @@ void NodeTranslator::compileEnum(Void decl,
 
     dupDetector.check(enumerantDecl.getId().getOrdinal());
 
+    auto sourceInfo = sourceInfoList[i];
     if (enumerantDecl.hasDocComment()) {
-      sourceInfoList[i].setDocComment(enumerantDecl.getDocComment());
+      sourceInfo.setDocComment(enumerantDecl.getDocComment());
     }
+    sourceInfo.setStartByte(enumerantDecl.getStartByte());
+    sourceInfo.setEndByte(enumerantDecl.getEndByte());
 
     auto enumerantBuilder = list[i++];
     enumerantBuilder.setName(enumerantDecl.getName().getValue());
@@ -1117,6 +1125,8 @@ private:
         KJ_IF_SOME(dc, docComment) {
           builderPair.sourceInfo.setDocComment(dc);
         }
+        builderPair.sourceInfo.setStartByte(startByte);
+        builderPair.sourceInfo.setEndByte(endByte);
 
         schema = builder;
         return builder;
@@ -1216,7 +1226,7 @@ private:
 
             memberInfo = &arena.allocate<MemberInfo>(
                 parent, codeOrder++, member,
-                newGroupNode(parent.node, member.getName().getValue()),
+                newGroupNode(parent.node, member),
                 true);
             allMembers.add(memberInfo);
             memberInfo->unionScope = &unionLayout;
@@ -1233,7 +1243,7 @@ private:
           StructLayout::Group& group = arena.allocate<StructLayout::Group>(layout);
           memberInfo = &arena.allocate<MemberInfo>(
               parent, codeOrder++, member,
-              newGroupNode(parent.node, member.getName().getValue()),
+              newGroupNode(parent.node, member),
               true);
           allMembers.add(memberInfo);
           traverseGroup(member.getNestedDecls(), *memberInfo, group);
@@ -1291,7 +1301,7 @@ private:
             parent.childCount++;
             memberInfo = &arena.allocate<MemberInfo>(
                 parent, codeOrder++, member,
-                newGroupNode(parent.node, member.getName().getValue()),
+                newGroupNode(parent.node, member),
                 false);
             allMembers.add(memberInfo);
           }
@@ -1307,7 +1317,7 @@ private:
           parent.childCount++;
           memberInfo = &arena.allocate<MemberInfo>(
               parent, codeOrder++, member,
-              newGroupNode(parent.node, member.getName().getValue()),
+              newGroupNode(parent.node, member),
               false);
           allMembers.add(memberInfo);
 
@@ -1340,19 +1350,25 @@ private:
     }
   }
 
-  NodeSourceInfoBuilderPair newGroupNode(schema::Node::Reader parent, kj::StringPtr name) {
+  NodeSourceInfoBuilderPair newGroupNode(schema::Node::Reader parent, Declaration::Reader decl) {
     AuxNode aux {
       translator.orphanage.newOrphan<schema::Node>(),
       translator.orphanage.newOrphan<schema::Node::SourceInfo>()
     };
     auto node = aux.node.get();
     auto sourceInfo = aux.sourceInfo.get();
+    auto name = decl.getName().getValue();
 
     // We'll set the ID and scope ID later.
     node.setDisplayName(kj::str(parent.getDisplayName(), '.', name));
     node.setDisplayNamePrefixLength(node.getDisplayName().size() - name.size());
     node.setIsGeneric(parent.getIsGeneric());
     node.initStruct().setIsGroup(true);
+    node.setStartByte(decl.getStartByte());
+    node.setEndByte(decl.getEndByte());
+
+    sourceInfo.setStartByte(decl.getStartByte());
+    sourceInfo.setEndByte(decl.getEndByte());
 
     // The remaining contents of node.struct will be filled in later.
 
@@ -1579,9 +1595,12 @@ void NodeTranslator::compileInterface(Declaration::Interface::Reader decl,
     dupDetector.check(ordinalDecl);
     uint16_t ordinal = ordinalDecl.getValue();
 
+    auto sourceInfo = sourceInfoList[i];
     if (methodDecl.hasDocComment()) {
-      sourceInfoList[i].setDocComment(methodDecl.getDocComment());
+      sourceInfo.setDocComment(methodDecl.getDocComment());
     }
+    sourceInfo.setStartByte(methodDecl.getStartByte());
+    sourceInfo.setEndByte(methodDecl.getEndByte());
 
     auto methodBuilder = list[i++];
     methodBuilder.setName(methodDecl.getName().getValue());
@@ -1641,8 +1660,19 @@ uint64_t NodeTranslator::compileParamList(
       builder.setDisplayNamePrefixLength(builder.getDisplayName().size() - typeName.size());
       builder.setIsGeneric(parent.getIsGeneric() || implicitParams.size() > 0);
       builder.setScopeId(0);  // detached struct type
+      builder.setStartByte(paramList.getStartByte());
+      builder.setEndByte(paramList.getEndByte());
 
       builder.initStruct();
+
+      // Put `sourceInfoBuilder` is a smaller scope since we move `newSourceInfo` later.
+      {
+        auto sourceInfoBuilder = newSourceInfo.get();
+
+        sourceInfoBuilder.setId(builder.getId());
+        sourceInfoBuilder.setStartByte(paramList.getStartByte());
+        sourceInfoBuilder.setEndByte(paramList.getEndByte());
+      }
 
       // Note that the struct we create here has a brand parameter list mirrioring the method's
       // implicit parameter list. Of course, fields inside the struct using the method's implicit
@@ -2199,6 +2229,11 @@ void ValueTranslator::fillStructValue(DynamicStruct::Builder builder,
                 // established `value` is not a tuple, this will only return a valid result if
                 // the value has unambiguous type.
                 auto result = compileValueInner(value, field.getType());
+
+                if (result.getType() == DynamicValue::UNKNOWN) {
+                  // Error already reported.
+                  break;
+                }
 
                 // Does it match the first field?
                 if (matchesType(value, groupField.getType(), result)) {

@@ -162,12 +162,18 @@ fn main() -> Result<()> {
         println!("cargo:rustc-link-lib=dl");
     }
 
+    // capnproto requires C++23, which does not have standard flags yet.
+    #[cfg(target_os = "windows")]
+    build.flag("/std:c++23preview");
+    #[cfg(not(target_os = "windows"))]
+    build.flag("-std=c++23");
+
     // Unfuck MSVC
     build.flag_if_supported("/Zc:__cplusplus");
     build.flag_if_supported("/EHsc");
     build.flag_if_supported("/TP");
     build.opt_level(3);
-    build.warnings(false).std("c++20").compile("kj");
+    build.warnings(false).compile("kj");
 
     Ok(())
 }

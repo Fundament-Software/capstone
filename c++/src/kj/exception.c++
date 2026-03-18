@@ -232,14 +232,14 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount,
 namespace {
 
 struct PipePair {
-  kj::AutoCloseFd readEnd;
-  kj::AutoCloseFd writeEnd;
+  kj::OwnFd readEnd;
+  kj::OwnFd writeEnd;
 };
 
 PipePair raiiPipe() {
   int fds[2];
   KJ_SYSCALL(pipe(fds));
-  return PipePair { AutoCloseFd(fds[0]), AutoCloseFd(fds[1]) };
+  return PipePair { OwnFd(fds[0]), OwnFd(fds[1]) };
 }
 
 // A simple subprocess wrapper with in/out pipes.
@@ -283,8 +283,8 @@ struct Subprocess {
   }
 
   pid_t pid;
-  kj::AutoCloseFd in;
-  kj::AutoCloseFd out;
+  kj::OwnFd in;
+  kj::OwnFd out;
 };
 
 String stringifyStackTraceWithLlvm(ArrayPtr<void* const> trace) {
@@ -761,6 +761,46 @@ namespace {
       "mcontext_t should be an extension of CONTEXT");
   memcpy(&win32Context, &ucontext->uc_mcontext, sizeof(win32Context));
   auto trace = getStackTrace(traceSpace, 0, GetCurrentThread(), win32Context);
+#elif __linux__ && __x86_64__
+  kj::ArrayPtr<void* const> trace;
+
+  // If we're dealing with a segfault, certain kinds of segfaults can confuse glibc's backtrace().
+  // Let's try to detect these and make things easier for it.
+  ucontext_t* ucontext = reinterpret_cast<ucontext_t*>(context);
+
+  if (signo == SIGSEGV && (void*)ucontext->uc_mcontext.gregs[REG_RIP] == info->si_addr) {
+    // The instruction pointer is the address that caused the fault. This implies that we jumped
+    // to an invalid address. glibc's backtrace() doesn't know what to do with this. It tries
+    // to look up unwind tables for this address, but it doesn't find any, so it gives up -- or
+    // worse, it crashes, which leads to no crash report at all.
+    //
+    // Luckily, it's almost always the case that such a jump was a CALL instruction (not a JMP
+    // instruction), as most likely we invoked an invalid function pointer or virtual table
+    // entry. A CALL instruction pushes the return address to the stack before jumping. That
+    // means that the instruction address we *really* want is easy to find -- the stack pointer
+    // is pointing to it!
+    //
+    // Also fortunate is that glibc's backtrace() uses the same ucontext object that was passed
+    // to the signal handler. If we modify it, backtrace() will use the modified version. So
+    // let's just fix it up.
+
+    // Copy top of stack into RIP.
+    ucontext->uc_mcontext.gregs[REG_RIP] =
+        *reinterpret_cast<intptr_t*>(ucontext->uc_mcontext.gregs[REG_RSP]);
+
+    // Pop stack. (Stack grows down.)
+    ucontext->uc_mcontext.gregs[REG_RSP] += sizeof(void*);
+
+    // Now trace from here. In order to capture the invalid jump, we prepend the invalid address
+    // to the trace.
+    kj::ArrayPtr<void*> traceArr(traceSpace);
+    trace = kj::getStackTrace(traceArr.slice(1, traceArr.size()), 3);
+    trace = kj::arrayPtr(trace.begin() - 1, trace.end());
+    const_cast<void*&>(trace[0]) = info->si_addr;
+  } else {
+    // ignoreCount = 2 to ignore crashHandler() and signal trampoline.
+    trace = getStackTrace(traceSpace, 2);
+  }
 #else
   // ignoreCount = 2 to ignore crashHandler() and signal trampoline.
   auto trace = getStackTrace(traceSpace, 2);
@@ -944,34 +984,48 @@ String KJ_STRINGIFY(const Exception& e) {
              stringifyStackTrace(e.getStackTrace()));
 }
 
-Exception::Exception(Type type, const char* file, int line, String description) noexcept
-    : file(trimSourceFilename(file).cStr()), line(line), type(type), description(mv(description)),
-      traceCount(0) {}
+static_assert(sizeof(kj::Exception) == 2 * sizeof(size_t),
+    "exception type is too big, please keep it lean");
 
-Exception::Exception(Type type, String file, int line, String description) noexcept
-    : ownFile(kj::mv(file)), file(trimSourceFilename(ownFile).cStr()), line(line), type(type),
-      description(mv(description)), traceCount(0) {}
+Exception::Exception(Type type, const char* file, int line, String description) noexcept {
+  storage->file = trimSourceFilename(file).cStr();
+  storage->line = line;
+  storage->type = type;
+  storage->description = mv(description);
+}
 
-Exception::Exception(const Exception& other) noexcept
-    : file(other.file), line(other.line), type(other.type),
-      description(heapString(other.description)), traceCount(other.traceCount) {
-  if (file == other.ownFile.cStr()) {
-    ownFile = heapString(other.ownFile);
-    file = ownFile.cStr();
+Exception::Exception(Type type, String file, int line, String description) noexcept {
+  storage->ownFile = kj::mv(file);
+  storage->file = trimSourceFilename(storage->ownFile).cStr();
+  storage->line = line;
+  storage->type = type;
+  storage->description = mv(description);
+}
+
+Exception::Exception(const Exception& other) noexcept {
+  storage->file = other.storage->file;
+  storage->line = other.storage->line;
+  storage->type = other.storage->type;
+  storage->description = heapString(other.storage->description);
+
+  if (other.storage->ownFile != nullptr) {
+    storage->ownFile = heapString(other.storage->ownFile);
+    storage->file = trimSourceFilename(storage->ownFile).cStr();
   }
 
-  if (other.remoteTrace != nullptr) {
-    remoteTrace = kj::str(other.remoteTrace);
+  if (other.storage->remoteTrace != nullptr) {
+    storage->remoteTrace = kj::str(other.storage->remoteTrace);
   }
 
-  memcpy(trace, other.trace, sizeof(trace[0]) * traceCount);
+  storage->traceCount = other.storage->traceCount;
+  memcpy(storage->trace, other.storage->trace, sizeof(storage->trace[0]) * storage->traceCount);
 
-  KJ_IF_SOME(c, other.context) {
-    context = heap(*c);
+  KJ_IF_SOME(c, other.storage->context) {
+    storage->context = heap(*c);
   }
 
-  for (auto& detail: other.details) {
-    details.add(Detail {
+  for (auto& detail: other.storage->details) {
+    storage->details.add(Detail {
       .id = detail.id,
       .value = kj::heapArray(detail.value.asPtr()),
     });
@@ -988,11 +1042,11 @@ Exception::Context::Context(const Context& other) noexcept
 }
 
 void Exception::wrapContext(const char* file, int line, String&& description) {
-  context = heap<Context>(file, line, mv(description), mv(context));
+  storage->context = heap<Context>(file, line, mv(description), mv(storage->context));
 }
 
 void Exception::extendTrace(uint ignoreCount, uint limit) {
-  if (isFullTrace) {
+  if (storage->isFullTrace) {
     // Awkward: extendTrace() was called twice without truncating in between. This should probably
     // be an error, but historically we didn't check for this so I'm hesitant to make it an error
     // now. We shouldn't actually extend the trace, though, as our current trace is presumably
@@ -1001,26 +1055,26 @@ void Exception::extendTrace(uint ignoreCount, uint limit) {
     return;
   }
 
-  KJ_STACK_ARRAY(void*, newTraceSpace, kj::min(kj::size(trace), limit) + ignoreCount + 1,
-      sizeof(trace)/sizeof(trace[0]) + 8, 128);
+  KJ_STACK_ARRAY(void*, newTraceSpace, kj::min(kj::size(storage->trace), limit) + ignoreCount + 1,
+      sizeof(storage->trace)/sizeof(storage->trace[0]) + 8, 128);
 
   auto newTrace = kj::getStackTrace(newTraceSpace, ignoreCount + 1);
   if (newTrace.size() > ignoreCount + 2) {
     // Remove suffix that won't fit into our static-sized trace.
-    newTrace = newTrace.first(kj::min(kj::size(trace) - traceCount, newTrace.size()));
+    newTrace = newTrace.first(kj::min(kj::size(storage->trace) - storage->traceCount, newTrace.size()));
 
     // Copy the rest into our trace.
-    memcpy(trace + traceCount, newTrace.begin(), newTrace.asBytes().size());
-    traceCount += newTrace.size();
-    isFullTrace = true;
+    memcpy(storage->trace + storage->traceCount, newTrace.begin(), newTrace.asBytes().size());
+    storage->traceCount += newTrace.size();
+    storage->isFullTrace = true;
   }
 }
 
 void Exception::truncateCommonTrace() {
-  if (isFullTrace) {
+  if (storage->isFullTrace) {
     // We're truncating the common portion of the full trace, turning it back into a limited
     // trace.
-    isFullTrace = false;
+    storage->isFullTrace = false;
   } else {
     // If the trace was never extended in the first place, trying to truncate it is at best a waste
     // of time and at worst might remove information for no reason. So, don't.
@@ -1032,29 +1086,29 @@ void Exception::truncateCommonTrace() {
     return;
   }
 
-  if (traceCount > 0) {
+  if (storage->traceCount > 0) {
     // Create a "reference" stack trace that is a little bit deeper than the one in the exception.
-    void* refTraceSpace[sizeof(this->trace) / sizeof(this->trace[0]) + 4]{};
+    void* refTraceSpace[sizeof(storage->trace) / sizeof(storage->trace[0]) + 4]{};
     auto refTrace = kj::getStackTrace(refTraceSpace, 0);
 
     // We expect that the deepest frame in the exception's stack trace should be somewhere in our
     // own trace, since our own trace has a deeper limit. Search for it.
     for (uint i = refTrace.size(); i > 0; i--) {
-      if (refTrace[i-1] == trace[traceCount-1]) {
+      if (refTrace[i-1] == storage->trace[storage->traceCount-1]) {
         // See how many frames match.
         for (uint j = 0; j < i; j++) {
-          if (j >= traceCount) {
+          if (j >= storage->traceCount) {
             // We matched the whole trace, apparently?
-            traceCount = 0;
+            storage->traceCount = 0;
             return;
-          } else if (refTrace[i-j-1] != trace[traceCount-j-1]) {
+          } else if (refTrace[i-j-1] != storage->trace[storage->traceCount-j-1]) {
             // Found mismatching entry.
 
             // If we matched more than half of the reference trace, guess that this is in fact
             // the prefix we're looking for.
             if (j > refTrace.size() / 2) {
               // Delete the matching suffix.
-              traceCount -= j;
+              storage->traceCount -= j;
               return;
             }
           }
@@ -1070,23 +1124,17 @@ void Exception::addTrace(void* ptr) {
   // TODO(cleanup): Abort here if isFullTrace is true, and see what breaks. This method only makes
   // sense to call on partial traces.
 
-  if (traceCount < kj::size(trace)) {
-    trace[traceCount++] = ptr;
+  if (storage->traceCount < kj::size(storage->trace)) {
+    storage->trace[storage->traceCount++] = ptr;
   }
 }
 
 void Exception::addTraceHere() {
-#if __GNUC__
-  addTrace(__builtin_return_address(0));
-#elif _MSC_VER
-  addTrace(_ReturnAddress());
-#else
-  #error "please implement for your compiler"
-#endif
+  addTrace(KJ_CALLING_ADDRESS());
 }
 
 kj::Maybe<kj::ArrayPtr<const byte>> Exception::getDetail(DetailTypeId typeId) const {
-  for (auto& detail: details) {
+  for (auto& detail: storage->details) {
     if (detail.id == typeId) {
       return detail.value.asPtr();
     }
@@ -1095,17 +1143,17 @@ kj::Maybe<kj::ArrayPtr<const byte>> Exception::getDetail(DetailTypeId typeId) co
 }
 
 kj::ArrayPtr<const Exception::Detail> Exception::getDetails() const {
-  return details.asPtr();
+  return storage->details.asPtr();
 }
 
 kj::Maybe<kj::Array<byte>> Exception::releaseDetail(DetailTypeId typeId) {
-  for (auto& detail: details) {
+  for (auto& detail: storage->details) {
     if (detail.id == typeId) {
       kj::Array<byte> result = kj::mv(detail.value);
-      if (&detail != &details.back()) {
-        detail = kj::mv(details.back());
+      if (&detail != &storage->details.back()) {
+        detail = kj::mv(storage->details.back());
       }
-      details.removeLast();
+      storage->details.removeLast();
       return kj::mv(result);
     }
   }
@@ -1113,13 +1161,13 @@ kj::Maybe<kj::Array<byte>> Exception::releaseDetail(DetailTypeId typeId) {
 }
 
 void Exception::setDetail(DetailTypeId typeId, kj::Array<byte> value) {
-  for (auto& detail: details) {
+  for (auto& detail: storage->details) {
     if (detail.id == typeId) {
       detail.value = kj::mv(value);
       return;
     }
   }
-  details.add(Detail {
+  storage->details.add(Detail {
     .id = typeId,
     .value = kj::mv(value),
   });
@@ -1187,12 +1235,17 @@ InFlightExceptionIterator::InFlightExceptionIterator()
     : ptr(currentException) {}
 
 Maybe<const Exception&> InFlightExceptionIterator::next() {
-  if (ptr == nullptr) return kj::none;
+  while (ptr != nullptr) {
+    const ExceptionImpl *result = static_cast<const ExceptionImpl *>(ptr);
+    validateExceptionPointer(result);
+    ptr = result->nextCurrentException;
+    if (!result->isMovedAway()) {
+      return *result;
+    }
+    // this exception was by consumed kj::getCaughtExceptionAsKj, skip it
+  }
 
-  const ExceptionImpl* result = static_cast<const ExceptionImpl*>(ptr);
-  validateExceptionPointer(result);
-  ptr = result->nextCurrentException;
-  return *result;
+  return kj::none;
 }
 
 kj::Exception getDestructionReason(void* traceSeparator, kj::Exception::Type defaultType,
@@ -1228,6 +1281,7 @@ thread_local ExceptionCallback* threadLocalCallback = nullptr;
 void requireOnStack(void* ptr, kj::StringPtr description) {
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) || \
     KJ_HAS_COMPILER_FEATURE(address_sanitizer) || \
+    KJ_HAS_COMPILER_FEATURE(hwaddress_sanitizer) || \
     defined(__SANITIZE_ADDRESS__)
   // When using libfuzzer or ASAN, this sanity check may spurriously fail, so skip it.
 #else
@@ -1272,16 +1326,12 @@ Function<void(Function<void()>)> ExceptionCallback::getThreadInitializer() {
   return next.getThreadInitializer();
 }
 
-namespace _ {  // private
-  uint uncaughtExceptionCount();  // defined later in this file
-}
-
 class ExceptionCallback::RootExceptionCallback: public ExceptionCallback {
 public:
   RootExceptionCallback(): ExceptionCallback(*this) {}
 
   void onRecoverableException(Exception&& exception) override {
-    if (_::uncaughtExceptionCount() > 0) {
+    if (UnwindDetector::uncaughtExceptionCount() > 0) {
       // Bad time to throw an exception.  Just log instead.
       //
       // TODO(someday): We should really compare uncaughtExceptionCount() against the count at
@@ -1391,18 +1441,14 @@ void throwRecoverableException(kj::Exception&& exception, uint ignoreCount) {
 
 // =======================================================================================
 
-namespace _ {  // private
-
-uint uncaughtExceptionCount() {
+uint UnwindDetector::uncaughtExceptionCount() {
   return std::uncaught_exceptions();
 }
 
-}  // namespace _ (private)
-
-UnwindDetector::UnwindDetector(): uncaughtCount(_::uncaughtExceptionCount()) {}
+UnwindDetector::UnwindDetector(): uncaughtCount(uncaughtExceptionCount()) {}
 
 bool UnwindDetector::isUnwinding() const {
-  return _::uncaughtExceptionCount() > uncaughtCount;
+  return uncaughtExceptionCount() > uncaughtCount;
 }
 
 void UnwindDetector::catchThrownExceptionAsSecondaryFault() const {
@@ -1483,6 +1529,7 @@ kj::Exception getCaughtExceptionAsKj() {
   try {
     throw;
   } catch (Exception& e) {
+    KJ_REQUIRE(!e.isMovedAway(), "getCaughtExceptionAsKj should be called at most once per catch");
     e.truncateCommonTrace();
     return kj::mv(e);
   } catch (CanceledException) {
