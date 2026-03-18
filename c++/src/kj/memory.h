@@ -22,9 +22,30 @@
 #pragma once
 
 #include "common.h"
-#ifdef KJ_DEBUG
-#include <atomic>  // std::atomic for KJ_ASSERT_PTR_COUNTERS
+
+// KJ_DEBUG_MEMORY == 1 enables variety of checks designed to catch memory usage errors.
+// KJ_DEBUG_MEMORY undefined or KJ_DEBUG_MEMORY == 0 disables all such checks.
+#if !defined(KJ_DEBUG_MEMORY)
+#define KJ_DEBUG_MEMORY 0
 #endif
+
+// KJ_WARN_REFCOUNTED_ATTACH == 1 enables deprecation warnings when using kj::Own<T>::attach() on
+// refcounted objects.
+#if !defined(KJ_WARN_REFCOUNTED_ATTACH)
+#define KJ_WARN_REFCOUNTED_ATTACH 0
+#endif
+
+// KJ_ASSERT_PTR_COUNTERS == 1 keeps track of active Ptr<T> instances and asserts validity
+// of their ownership.
+// Matches KJ_DEBUG_MEMORY by default.
+#if !defined(KJ_ASSERT_PTR_COUNTERS)
+#define KJ_ASSERT_PTR_COUNTERS KJ_DEBUG_MEMORY
+#endif // KJ_ASSERT_PTR_COUNTERS
+
+#if KJ_ASSERT_PTR_COUNTERS
+#include <atomic>
+#endif // KJ_ASSERT_PTR_COUNTERS
+
 
 KJ_BEGIN_HEADER
 
@@ -60,7 +81,15 @@ inline constexpr bool _kj_internal_isPolymorphic(T*) {
 //     template <typename X, typename Y>
 //     KJ_DECLARE_NON_POLYMORPHIC(MyType<X, Y>)
 
+class AtomicRefcounted;
+class Refcounted;
+
 namespace _ {  // private
+
+template <typename T, typename U>
+concept DerivedFrom = requires(const T* t) { static_cast<const U*>(t); };
+template <typename T>
+concept IsRefcounted = DerivedFrom<T, Refcounted> || DerivedFrom<T, AtomicRefcounted>;
 
 template <typename T> struct RefOrVoid_ { typedef T& Type; };
 template <> struct RefOrVoid_<void> { typedef void Type; };
@@ -72,42 +101,27 @@ using RefOrVoid = typename RefOrVoid_<T>::Type;
 //
 // This is a hack needed to avoid defining Own<void> as a totally separate class.
 
-template <typename T, bool isPolymorphic = _kj_internal_isPolymorphic((T*)nullptr)>
-struct CastToVoid_;
-
-template <typename T>
-struct CastToVoid_<T, false> {
-  static void* apply(T* ptr) {
-    return static_cast<void*>(ptr);
-  }
-  static const void* applyConst(T* ptr) {
-    const T* cptr = ptr;
-    return static_cast<const void*>(cptr);
-  }
-};
-
-template <typename T>
-struct CastToVoid_<T, true> {
-  static void* apply(T* ptr) {
-    return dynamic_cast<void*>(ptr);
-  }
-  static const void* applyConst(T* ptr) {
-    const T* cptr = ptr;
-    return dynamic_cast<const void*>(cptr);
-  }
-};
-
 template <typename T>
 void* castToVoid(T* ptr) {
-  return CastToVoid_<T>::apply(ptr);
+  if constexpr (_kj_internal_isPolymorphic((T*)nullptr)) {
+    return dynamic_cast<void*>(ptr);
+  } else {
+    return static_cast<void*>(ptr);
+  }
 }
 
 template <typename T>
 const void* castToConstVoid(T* ptr) {
-  return CastToVoid_<T>::applyConst(ptr);
+  if constexpr (_kj_internal_isPolymorphic((T*)nullptr)) {
+    const T* cptr = ptr;
+    return dynamic_cast<const void*>(cptr);
+  } else {
+    const T* cptr = ptr;
+    return static_cast<const void*>(cptr);
+  }
 }
 
-void throwWrongDisposerError();
+KJ_NORETURN(void throwWrongDisposerError());
 
 }  // namespace _ (private)
 
@@ -143,10 +157,6 @@ public:
   //
   // Callers must not call dispose() on the same pointer twice, even if the first call throws
   // an exception.
-
-private:
-  template <typename T, bool polymorphic = _kj_internal_isPolymorphic((T*)nullptr)>
-  struct Dispose_;
 };
 
 template <typename T>
@@ -177,13 +187,8 @@ public:
 // =======================================================================================
 // Ptr Counters
 
-#ifdef KJ_DEBUG
-#define KJ_ASSERT_PTR_COUNTERS
-// When defined, keeps track of active Ptr<T> instances and asserts validity of their ownership
-#endif
-
 namespace _ {
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
 
 void atomicPtrCounterAssertionFailed(const char* const);
 
@@ -217,7 +222,7 @@ private:
 using PtrCounter = AtomicPtrCounter;
 // Default counter type to use
 
-#endif
+#endif // KJ_ASSERT_PTR_COUNTERS
 }
 
 // =======================================================================================
@@ -282,7 +287,7 @@ public:
     return *this;
   }
 
-  template <typename... Attachments>
+  template <typename... Attachments> requires (!::kj::_::IsRefcounted<T>)
   Own<T> attach(Attachments&&... attachments) KJ_WARN_UNUSED_RESULT;
   // Returns an Own<T> which points to the same object but which also ensures that all values
   // passed to `attachments` remain alive until after this object is destroyed. Normally
@@ -290,6 +295,22 @@ public:
   //
   // Note that attachments will eventually be destroyed in the order they are listed. Hence,
   // foo.attach(bar, baz) is equivalent to (but more efficient than) foo.attach(bar).attach(baz).
+
+  template <typename... Attachments> requires (::kj::_::IsRefcounted<T>)
+#if KJ_WARN_REFCOUNTED_ATTACH
+  KJ_DEPRECATED("using attach() with refcounted objects can be a bug; if intentional, use attachToThisReference()")
+#endif
+  Own<T> attach(Attachments&&... attachments) KJ_WARN_UNUSED_RESULT;
+
+  template <typename... Attachments> requires (::kj::_::IsRefcounted<T>)
+  Own<T> attachToThisReference(Attachments&&... attachments) KJ_WARN_UNUSED_RESULT;
+  // Like attach(), but only for objects deriving from kj::Refcounted or kj::AtomicRefcounted.
+  // attach() is commonly used to keep dependencies alive for a T value, but this is only reliable
+  // if T has a single kj::Own<T>. Refcounted objects can have multiple kj::Own<T>s, so using
+  // attach() for their dependencies is a potential source of memory errors.
+  //
+  // When an attachment only needs to live as long as a single reference to a refcounted
+  // object, attachToThisReference() can be called to explicitly opt into this behavior.
 
   template <typename U>
   Own<U> downcast() {
@@ -317,8 +338,8 @@ public:
   inline operator T*() { return ptr; }
   inline operator const T*() const { return ptr; }
 
-  // Surrenders ownership of the underlying object to the caller. The caller must pass in the 
-  // correct disposer to prove that they know how the object is meant to be disposed of. 
+  // Surrenders ownership of the underlying object to the caller. The caller must pass in the
+  // correct disposer to prove that they know how the object is meant to be disposed of.
   inline T* disown(const Disposer* d) {
     if (d != disposer) _::throwWrongDisposerError();
     T* ptrCopy = ptr;
@@ -352,9 +373,11 @@ private:
     return ptr;
   }
 
+  template <typename... Attachments>
+  Own<T> attachImpl(Attachments&&... attachments) KJ_WARN_UNUSED_RESULT;
+
   template <typename, typename>
   friend class Own;
-  friend class Maybe<Own<T>>;
 };
 
 template <>
@@ -440,8 +463,8 @@ public:
   inline operator T*() { return ptr; }
   inline operator const T*() const { return ptr; }
 
-  // Surrenders ownership of the underlying object to the caller. The caller must pass in the 
-  // correct disposer to prove that they know how the object is meant to be disposed of. 
+  // Surrenders ownership of the underlying object to the caller. The caller must pass in the
+  // correct disposer to prove that they know how the object is meant to be disposed of.
   template<typename SD>
   inline T* disown() {
     static_assert(kj::isSameType<StaticDisposer, SD>(), "disposer must be the same as Own's disposer");
@@ -475,152 +498,32 @@ private:
 
   template <typename, typename>
   friend class Own;
-  friend class Maybe<Own<T, StaticDisposer>>;
 };
 
-namespace _ {  // private
-
+// MaybeTraits specialization for Own<T, D>.
+// This enables:
+// 1. Niche optimization: Maybe<Own<T>> uses ptr == nullptr as "none", reducing size from 24 to 16.
+// 2. Implicit conversion: If U is implicitly convertible to Own<T, D>, then U is implicitly
+//    convertible to Maybe<Own<T, D>>. This allows: Maybe<Own<Base>> m = ownDerived;
+// 3. Reference conversion: Maybe<Own<T>> can convert to Maybe<U&> when T* converts to U*.
 template <typename T, typename D>
-class OwnOwn {
-public:
-  inline OwnOwn(Own<T, D>&& value) noexcept: value(kj::mv(value)) {}
+struct MaybeTraits<Own<T, D>> {
+  // Niche optimization: nullptr is the "none" state
+  static void initNone(Own<T, D>* ptr) noexcept { kj::ctor(*ptr); }
+  static bool isNone(const Own<T, D>& o) noexcept { return o.get() == nullptr; }
 
-  inline Own<T, D>& operator*() & { return value; }
-  inline const Own<T, D>& operator*() const & { return value; }
-  inline Own<T, D>&& operator*() && { return kj::mv(value); }
-  inline const Own<T, D>&& operator*() const && { return kj::mv(value); }
-  inline Own<T, D>* operator->() { return &value; }
-  inline const Own<T, D>* operator->() const { return &value; }
-  inline operator Own<T, D>*() { return value ? &value : nullptr; }
-  inline operator const Own<T, D>*() const { return value ? &value : nullptr; }
+  // Enable converting constructor: Maybe<Own<T>>(U&&) accepts types U convertible to Own<T>.
+  // The constructor is implicit when U→Own<T> is implicit (e.g., Own<Derived>→Own<Base>).
+  // Example: Maybe<Own<Base>> m = kj::heap<Derived>();
+  static constexpr bool convertingConstructor = true;
 
-private:
-  Own<T, D> value;
-};
+  // Allow Maybe<Own<T>> -> Maybe<T&> via dereference.
+  // This enables: void foo(Maybe<T&> b); foo(maybeOwn);
+  static constexpr bool dereferencingConversion = true;
 
-template <typename T, typename D>
-OwnOwn<T, D> readMaybe(Maybe<Own<T, D>>&& maybe) { return OwnOwn<T, D>(kj::mv(maybe.ptr)); }
-template <typename T, typename D>
-Own<T, D>* readMaybe(Maybe<Own<T, D>>& maybe) { return maybe.ptr ? &maybe.ptr : nullptr; }
-template <typename T, typename D>
-const Own<T, D>* readMaybe(const Maybe<Own<T, D>>& maybe) {
-  return maybe.ptr ? &maybe.ptr : nullptr;
-}
-
-}  // namespace _ (private)
-
-template <typename T, typename D>
-class Maybe<Own<T, D>> {
-public:
-  inline Maybe(): ptr(nullptr) {}
-  inline Maybe(Own<T, D>&& t) noexcept: ptr(kj::mv(t)) {}
-  inline Maybe(Maybe&& other) noexcept: ptr(kj::mv(other.ptr)) {}
-
-  template <typename U>
-  inline Maybe(Maybe<Own<U, D>>&& other): ptr(mv(other.ptr)) {}
-  template <typename U>
-  inline Maybe(Own<U, D>&& other): ptr(mv(other)) {}
-
-  KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
-  inline Maybe(decltype(nullptr)) noexcept: ptr(nullptr) {}
-
-  inline Maybe(kj::None) noexcept: ptr(nullptr) {}
-
-  inline Own<T, D>& emplace(Own<T, D> value) {
-    // Assign the Maybe to the given value and return the content. This avoids the need to do a
-    // KJ_ASSERT_NONNULL() immediately after setting the Maybe just to read it back again.
-    ptr = kj::mv(value);
-    return ptr;
-  }
-
-  template <typename U = T>
-  inline operator NoInfer<Maybe<U&>>() { return ptr.get(); }
-  template <typename U = T>
-  inline operator NoInfer<Maybe<const U&>>() const { return ptr.get(); }
-  // Implicit conversion to `Maybe<U&>`. The weird templating is to make sure that
-  // `Maybe<Own<void>>` can be instantiated with the compiler complaining about forming references
-  // to void -- the use of templates here will cause SFINAE to kick in and hide these, whereas if
-  // they are not templates then SFINAE isn't applied and so they are considered errors.
-
-  inline Maybe& operator=(Maybe&& other) { ptr = kj::mv(other.ptr); return *this; }
-
-  KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
-  inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
-
-  inline bool operator==(kj::None) const { return ptr == nullptr; }
-
-  Own<T, D>& orDefault(Own<T, D>& defaultValue) {
-    if (ptr == nullptr) {
-      return defaultValue;
-    } else {
-      return ptr;
-    }
-  }
-  const Own<T, D>& orDefault(const Own<T, D>& defaultValue) const {
-    if (ptr == nullptr) {
-      return defaultValue;
-    } else {
-      return ptr;
-    }
-  }
-
-  template <typename F,
-      typename Result = decltype(instance<bool>() ? instance<Own<T, D>>() : instance<F>()())>
-  Result orDefault(F&& lazyDefaultValue) && {
-    if (ptr == nullptr) {
-      return lazyDefaultValue();
-    } else {
-      return kj::mv(ptr);
-    }
-  }
-
-  template <typename Func>
-  auto map(Func&& f) & -> Maybe<decltype(f(instance<Own<T, D>&>()))> {
-    if (ptr == nullptr) {
-      return kj::none;
-    } else {
-      return f(ptr);
-    }
-  }
-
-  template <typename Func>
-  auto map(Func&& f) const & -> Maybe<decltype(f(instance<const Own<T, D>&>()))> {
-    if (ptr == nullptr) {
-      return kj::none;
-    } else {
-      return f(ptr);
-    }
-  }
-
-  template <typename Func>
-  auto map(Func&& f) && -> Maybe<decltype(f(instance<Own<T, D>&&>()))> {
-    if (ptr == nullptr) {
-      return kj::none;
-    } else {
-      return f(kj::mv(ptr));
-    }
-  }
-
-  template <typename Func>
-  auto map(Func&& f) const && -> Maybe<decltype(f(instance<const Own<T, D>&&>()))> {
-    if (ptr == nullptr) {
-      return kj::none;
-    } else {
-      return f(kj::mv(ptr));
-    }
-  }
-
-private:
-  Own<T, D> ptr;
-
-  template <typename U>
-  friend class Maybe;
-  template <typename U, typename D2>
-  friend _::OwnOwn<U, D2> _::readMaybe(Maybe<Own<U, D2>>&& maybe);
-  template <typename U, typename D2>
-  friend Own<U, D2>* _::readMaybe(Maybe<Own<U, D2>>& maybe);
-  template <typename U, typename D2>
-  friend const Own<U, D2>* _::readMaybe(const Maybe<Own<U, D2>>& maybe);
+  // Own's move ctor just copies ptr and sets source to nullptr (the none state).
+  // Moving a null Own is safe.
+  static constexpr bool noneIsMoveSafe = true;
 };
 
 namespace _ {  // private
@@ -735,13 +638,13 @@ class Ptr;
 
 template <typename T>
 class Pin {
-  // Pin<T> is a smart, in-place storage for T. 
+  // Pin<T> is a smart, in-place storage for T.
   //
-  // Pin<T> should be created on the stack or used as a data member. It should not be 
+  // Pin<T> should be created on the stack or used as a data member. It should not be
   // allocated on the heap.
   // Pin<T> is integrated with Ptr<T>, and is legal to move/destroy only when there are no active
-  // pointers. 
-  // When KJ_ASSERT_PTR_COUNTERS is defined, pointers are tracked and validity of these 
+  // pointers.
+  // When KJ_ASSERT_PTR_COUNTERS is defined, pointers are tracked and validity of these
   // operations are asserted.
   // Zero-overhead replacement for T if KJ_ASSERT_PTR_COUNTERS is not defined.
 
@@ -753,15 +656,15 @@ public:
   inline Pin(Pin<T>&& other): t(kj::mv(other.t)) {
     // Move T's ownership.
     // Undefined behavior when live pointers exist, asserted when KJ_ASSERT_PTR_COUNTERS is defined.
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
     other.ptrCounter.assertEmpty();
 #endif
   }
 
   inline ~Pin() {
-    // Destroy a Pin with underlying object. 
+    // Destroy a Pin with underlying object.
     // Undefined behavior when live pointers exist, asserted when KJ_ASSERT_PTR_COUNTERS is defined.
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
     ptrCounter.assertEmpty();
 #endif
   }
@@ -793,7 +696,7 @@ private:
   inline Pin(T&& t): t(kj::mv(t)) {}
 
   T t;
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   _::PtrCounter ptrCounter;
 #endif
 
@@ -810,7 +713,7 @@ private:
 template <typename T>
 class Ptr {
   // Ptr<T> is a smart alternative to T&.
-  // 
+  //
   // When used together with Pin<T> it keeps track of active pointers.
   // Asserts lifetime constraints when KJ_ASSERT_PTR_COUNTERS is defined.
   // Zero-overhead alternative for T& if KJ_ASSERT_PTR_COUNTERS is not defined.
@@ -821,18 +724,18 @@ public:
       // the value was moved out
       return;
     }
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
     counter->dec();
 #endif
   }
 
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   Ptr(Ptr&& other) : ptr(other.ptr), counter(other.counter) { other.ptr = nullptr; }
 #else
   Ptr(Ptr&& other) : ptr(other.ptr) { other.ptr = nullptr; }
 #endif
 
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
   Ptr(Ptr<U>&& other) : ptr(other.ptr), counter(other.counter) { other.ptr = nullptr; }
 #else
@@ -841,15 +744,15 @@ public:
 #endif
 
 // Ptr<T> can be freely copied.
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   Ptr(const Ptr& other) : ptr(other.ptr), counter(other.counter) { counter->inc(); }
 #else
   Ptr(const Ptr& other) : ptr(other.ptr) {}
 #endif
 
-  inline void operator=(std::nullptr_t other) { 
+  inline void operator=(decltype(nullptr)) {
     if (ptr != nullptr) {
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
       counter->dec();
       counter = nullptr;
 #endif
@@ -878,14 +781,14 @@ public:
 
 private:
 
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   inline Ptr(Pin<T>* pin) : ptr(pin->get()), counter(&pin->ptrCounter) { counter->inc(); }
 #else
   inline Ptr(Pin<T>* pin) : ptr(pin->get()) {}
 #endif
 
 
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
   inline Ptr(Pin<U>* pin) : ptr(pin->get()), counter(&pin->ptrCounter) { counter->inc(); }
 #else
@@ -894,7 +797,7 @@ private:
 #endif
 
   T *ptr;
-#ifdef KJ_ASSERT_PTR_COUNTERS
+#if KJ_ASSERT_PTR_COUNTERS
   _::PtrCounter* counter;
 #endif
 
@@ -911,24 +814,15 @@ private:
 // Inline implementation details
 
 template <typename T>
-struct Disposer::Dispose_<T, true> {
-  static void dispose(T* object, const Disposer& disposer) {
+void Disposer::dispose(T* object) const {
+  if constexpr (_kj_internal_isPolymorphic((T*)nullptr)) {
     // Note that dynamic_cast<void*> does not require RTTI to be enabled, because the offset to
     // the top of the object is in the vtable -- as it obviously needs to be to correctly implement
     // operator delete.
-    disposer.disposeImpl(dynamic_cast<void*>(object));
+    disposeImpl(dynamic_cast<void*>(object));
+  } else {
+    disposeImpl(static_cast<void*>(object));
   }
-};
-template <typename T>
-struct Disposer::Dispose_<T, false> {
-  static void dispose(T* object, const Disposer& disposer) {
-    disposer.disposeImpl(static_cast<void*>(object));
-  }
-};
-
-template <typename T>
-void Disposer::dispose(T* object) const {
-  Dispose_<T>::dispose(object, *this);
 }
 
 namespace _ {  // private
@@ -974,8 +868,27 @@ const StaticDisposerAdapter<T, D> StaticDisposerAdapter<T, D>::instance =
 }  // namespace _ (private)
 
 template <typename T>
-template <typename... Attachments>
+template <typename... Attachments> requires (!::kj::_::IsRefcounted<T>)
 Own<T> Own<T>::attach(Attachments&&... attachments) {
+  return attachImpl(kj::fwd<Attachments>(attachments)...);
+}
+
+template <typename T>
+template <typename... Attachments> requires (::kj::_::IsRefcounted<T>)
+Own<T> Own<T>::attach(Attachments&&... attachments) {
+  // TODO(someday): statically assert against IsRefcounted().
+  return attachImpl(kj::fwd<Attachments>(attachments)...);
+}
+
+template <typename T>
+template <typename... Attachments> requires (::kj::_::IsRefcounted<T>)
+Own<T> Own<T>::attachToThisReference(Attachments&&... attachments) {
+  return attachImpl(kj::fwd<Attachments>(attachments)...);
+}
+
+template <typename T>
+template <typename... Attachments>
+Own<T> Own<T>::attachImpl(Attachments&&... attachments) {
   T* ptrCopy = ptr;
 
   KJ_IREQUIRE(ptrCopy != nullptr, "cannot attach to null pointer");
@@ -992,12 +905,14 @@ Own<T> Own<T>::attach(Attachments&&... attachments) {
 
 template <typename T, typename... Attachments>
 Own<T> attachRef(T& value, Attachments&&... attachments) {
+  // TODO(someday): maybe also assert against T deriving from kj::Refcounted here?
   auto bundle = new _::DisposableOwnedBundle<Attachments...>(kj::fwd<Attachments>(attachments)...);
   return Own<T>(&value, *bundle);
 }
 
 template <typename T, typename... Attachments>
 Own<Decay<T>> attachVal(T&& value, Attachments&&... attachments) {
+  // TODO(someday): maybe also assert against T deriving from kj::Refcounted here?
   auto bundle = new _::DisposableOwnedBundle<T, Attachments...>(
       kj::fwd<T>(value), kj::fwd<Attachments>(attachments)...);
   return Own<Decay<T>>(&bundle->first, *bundle);

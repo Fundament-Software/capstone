@@ -81,6 +81,12 @@ TwoPartyVatNetwork::TwoPartyVatNetwork(kj::AsyncCapabilityStream& stream, uint m
 
 TwoPartyVatNetwork::~TwoPartyVatNetwork() noexcept(false) {};
 
+static bool adaptiveFlowControlEnabled = false;
+
+void TwoPartyVatNetwork::useAdaptiveFlowControl() {
+  adaptiveFlowControlEnabled = true;
+}
+
 MessageStream& TwoPartyVatNetwork::getStream() {
   KJ_SWITCH_ONEOF(stream) {
     KJ_CASE_ONEOF(s, MessageStream*) {
@@ -172,7 +178,7 @@ public:
     auto& previousWrite = KJ_ASSERT_NONNULL(network.previousWrite, "already shut down");
     bool alreadyPendingSend = !network.queuedMessages.empty();
     network.currentQueueSize += message.sizeInWords() * sizeof(word);
-    network.queuedMessages.add(kj::addRef(*this));
+    network.queuedMessages.add(addRefToThis());
     if (alreadyPendingSend) {
       // The first send sets up an evalLast that will clear out pendingMessages when it's sent.
       // If pendingMessages is non-empty, then there must already be a callback waiting to send
@@ -229,7 +235,7 @@ class TwoPartyVatNetwork::IncomingMessageImpl final: public IncomingRpcMessage {
 public:
   IncomingMessageImpl(kj::Own<MessageReader> message): message(kj::mv(message)) {}
 
-  IncomingMessageImpl(MessageReaderAndFds init, kj::Array<kj::AutoCloseFd> fdSpace)
+  IncomingMessageImpl(MessageReaderAndFds init, kj::Array<kj::OwnFd> fdSpace)
       : message(kj::mv(init.reader)),
         fdSpace(kj::mv(fdSpace)),
         fds(init.fds) {
@@ -240,7 +246,7 @@ public:
     return message->getRoot<AnyPointer>();
   }
 
-  kj::ArrayPtr<kj::AutoCloseFd> getAttachedFds() override {
+  kj::ArrayPtr<kj::OwnFd> getAttachedFds() override {
     return fds;
   }
 
@@ -250,12 +256,16 @@ public:
 
 private:
   kj::Own<MessageReader> message;
-  kj::Array<kj::AutoCloseFd> fdSpace;
-  kj::ArrayPtr<kj::AutoCloseFd> fds;
+  kj::Array<kj::OwnFd> fdSpace;
+  kj::ArrayPtr<kj::OwnFd> fds;
 };
 
 kj::Own<RpcFlowController> TwoPartyVatNetwork::newStream() {
-  return RpcFlowController::newVariableWindowController(*this);
+  if (adaptiveFlowControlEnabled) {
+    return RpcFlowController::newAdaptiveController(getWindow(), clock);
+  } else {
+    return RpcFlowController::newVariableWindowController(*this);
+  }
 }
 
 size_t TwoPartyVatNetwork::getWindow() {
@@ -308,9 +318,9 @@ kj::Promise<kj::Maybe<kj::Own<IncomingRpcMessage>>> TwoPartyVatNetwork::receiveI
       return kj::cp(e);
     }
 
-    kj::Array<kj::AutoCloseFd> fdSpace = nullptr;
+    kj::Array<kj::OwnFd> fdSpace = nullptr;
     if(maxFdsPerMessage > 0) {
-      fdSpace = kj::heapArray<kj::AutoCloseFd>(maxFdsPerMessage);
+      fdSpace = kj::heapArray<kj::OwnFd>(maxFdsPerMessage);
     }
     auto promise = readCanceler.wrap(getStream().tryReadMessage(fdSpace, receiveOptions));
     return promise.then([fdSpace = kj::mv(fdSpace)]

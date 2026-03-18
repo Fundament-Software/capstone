@@ -142,7 +142,13 @@ fn main() -> eyre::Result<()> {
         println!("cargo:rustc-link-lib=dl");
     }
 
-    build.opt_level(3).warnings(false).std("c++20");
+    // capnproto requires C++23, which does not have standard flags yet.
+    #[cfg(target_os = "windows")]
+    build.flag("/std:c++23preview");
+    #[cfg(not(target_os = "windows"))]
+    build.flag("-std=c++23");
+
+    build.opt_level(3).warnings(false);
     if CAPNPC {
         build.compile("capnpc");
     } else {

@@ -55,8 +55,8 @@ public:
   // Callers must not call dispose() on the same array twice, even if the first call throws
   // an exception.
 
-private:
-  template <typename T, bool hasTrivialDestructor = KJ_HAS_TRIVIAL_DESTRUCTOR(T)>
+protected:
+  template <typename T>
   struct Dispose_;
 };
 
@@ -144,7 +144,7 @@ public:
       : ptr(firstElement), size_(size), disposer(&disposer) {}
 
   KJ_DISALLOW_COPY(Array);
-  inline ~Array() noexcept { dispose(); }
+  inline ~Array() noexcept(false) { dispose(); }
 
   inline operator ArrayPtr<T>() KJ_LIFETIMEBOUND {
     return ArrayPtr<T>(ptr, size_);
@@ -161,50 +161,62 @@ public:
 
   inline constexpr size_t size() const { return size_; }
   inline constexpr T& operator[](size_t index) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.", index, size_);
     return ptr[index];
   }
   inline constexpr const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.", index, size_);
     return ptr[index];
   }
 
-  inline const T* begin() const KJ_LIFETIMEBOUND { return ptr; }
-  inline const T* end() const KJ_LIFETIMEBOUND { return ptr + size_; }
-  inline const T& front() const KJ_LIFETIMEBOUND { return *ptr; }
-  inline const T& back() const KJ_LIFETIMEBOUND { return *(ptr + size_ - 1); }
-  inline T* begin() KJ_LIFETIMEBOUND { return ptr; }
-  inline T* end() KJ_LIFETIMEBOUND { return ptr + size_; }
-  inline T& front() KJ_LIFETIMEBOUND { return *ptr; }
-  inline T& back() KJ_LIFETIMEBOUND { return *(ptr + size_ - 1); }
+  inline constexpr const T* begin() const KJ_LIFETIMEBOUND { return ptr; }
+  inline constexpr const T* end() const KJ_LIFETIMEBOUND { return ptr + size_; }
+  inline constexpr const T& front() const KJ_LIFETIMEBOUND { return *ptr; }
+  inline constexpr const T& back() const KJ_LIFETIMEBOUND { return *(ptr + size_ - 1); }
+  inline constexpr T* begin() KJ_LIFETIMEBOUND { return ptr; }
+  inline constexpr T* end() KJ_LIFETIMEBOUND { return ptr + size_; }
+  inline constexpr T& front() KJ_LIFETIMEBOUND { return *ptr; }
+  inline constexpr T& back() KJ_LIFETIMEBOUND { return *(ptr + size_ - 1); }
 
   template <typename U>
   inline bool operator==(const U& other) const { return asPtr() == other; }
 
   inline ArrayPtr<T> slice(size_t start, size_t end) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().");
+    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().", start, end, size_);
     return ArrayPtr<T>(ptr + start, end - start);
   }
   inline ArrayPtr<const T> slice(size_t start, size_t end) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().");
+    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().", start, end, size_);
     return ArrayPtr<const T>(ptr + start, end - start);
   }
   inline ArrayPtr<T> slice(size_t start) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().", start, size_);
     return ArrayPtr<T>(ptr + start, size_ - start);
   }
   inline ArrayPtr<const T> slice(size_t start) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().", start, size_);
     return ArrayPtr<const T>(ptr + start, size_ - start);
   }
 
   inline ArrayPtr<T> first(size_t count) KJ_LIFETIMEBOUND { return slice(0, count); }
   inline ArrayPtr<const T> first(size_t count) const KJ_LIFETIMEBOUND { return slice(0, count); }
 
-  inline ArrayPtr<const byte> asBytes() const KJ_LIFETIMEBOUND { return asPtr().asBytes(); }
-  inline ArrayPtr<PropagateConst<T, byte>> asBytes() KJ_LIFETIMEBOUND { return asPtr().asBytes(); }
-  inline ArrayPtr<const char> asChars() const KJ_LIFETIMEBOUND { return asPtr().asChars(); }
-  inline ArrayPtr<PropagateConst<T, char>> asChars() KJ_LIFETIMEBOUND { return asPtr().asChars(); }
+  inline ArrayPtr<const byte> asBytes() const KJ_LIFETIMEBOUND {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    return asPtr().asBytes();
+  }
+  inline ArrayPtr<PropagateConst<T, byte>> asBytes() KJ_LIFETIMEBOUND {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    return asPtr().asBytes();
+  }
+  inline ArrayPtr<const char> asChars() const KJ_LIFETIMEBOUND {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    return asPtr().asChars();
+  }
+  inline ArrayPtr<PropagateConst<T, char>> asChars() KJ_LIFETIMEBOUND {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    return asPtr().asChars();
+  }
 
   inline Array<PropagateConst<T, byte>> releaseAsBytes() {
     // Like asBytes() but transfers ownership.
@@ -251,9 +263,18 @@ public:
   // Like Own<T>::attach(), but attaches to an Array.
 
   template <typename U>
-  inline auto as() { return U::from(this); }
-  // Syntax sugar for invoking U::from.
+  inline auto as() { return asImpl((U*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(U*, Array&).
   // Used to chain conversion calls rather than wrap with function.
+
+  template <typename U>
+  inline auto as() const { return asImpl((U*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(U*, const Array&).
+  // Used to chain conversion calls rather than wrap with function.
+
+  inline bool hasNullDisposer() const {return disposer == &NullArrayDisposer::instance; }
+  // Returns true if array uses NullArrayDisposer, intended for use with string literal
+  // ConstStrings.
 
 private:
   T* ptr;
@@ -300,8 +321,7 @@ private:
   virtual void disposeImpl(void* firstElement, size_t elementSize, size_t elementCount,
                            size_t capacity, void (*destroyElement)(void*)) const override;
 
-  template <typename T, bool hasTrivialConstructor = KJ_HAS_TRIVIAL_CONSTRUCTOR(T),
-                        bool hasNothrowConstructor = KJ_HAS_NOTHROW_CONSTRUCTOR(T)>
+  template <typename T>
   struct Allocate_;
 };
 
@@ -383,11 +403,13 @@ public:
   inline size_t size() const { return pos - ptr; }
   inline size_t capacity() const { return endPtr - ptr; }
   inline T& operator[](size_t index) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr), "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr),
+        "Out-of-bounds Array access.", index, pos-ptr);
     return ptr[index];
   }
   inline const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr), "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr),
+        "Out-of-bounds Array access.", index, pos-ptr);
     return ptr[index];
   }
 
@@ -442,7 +464,7 @@ public:
 
     T* target = ptr + size;
     if (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
-      // const_cast is safe here because the member won't ever be dereferenced because it 
+      // const_cast is safe here because the member won't ever be dereferenced because it
       // points to the end of the segment.
       pos = const_cast<RemoveConst<T>*>(target);
     } else {
@@ -454,7 +476,7 @@ public:
 
   void clear() {
     if (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
-      // const_cast is safe here because the member won't ever be dereferenced because it 
+      // const_cast is safe here because the member won't ever be dereferenced because it
       // points to the end of the segment.
       pos = const_cast<RemoveConst<T>*>(ptr);
     } else {
@@ -471,7 +493,7 @@ public:
     if (target > pos) {
       // expand
       if (KJ_HAS_TRIVIAL_CONSTRUCTOR(T)) {
-        // const_cast is safe here because the member won't ever be dereferenced because it 
+        // const_cast is safe here because the member won't ever be dereferenced because it
         // points to the end of the segment.
         pos = const_cast<RemoveConst<T>*>(target);
       } else {
@@ -482,7 +504,7 @@ public:
     } else {
       // truncate
       if (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
-        // const_cast is safe here because the member won't ever be dereferenced because it 
+        // const_cast is safe here because the member won't ever be dereferenced because it
         // points to the end of the segment.
         pos = const_cast<RemoveConst<T>*>(target);
       } else {
@@ -611,22 +633,81 @@ private:
 };
 
 // =======================================================================================
-// KJ_MAP
-
-#define KJ_MAP(elementName, array) \
-  ::kj::_::Mapper<KJ_DECLTYPE_REF(array)>(array) * \
-  [&](typename ::kj::_::Mapper<KJ_DECLTYPE_REF(array)>::Element elementName)
-// Applies some function to every element of an array, returning an Array of the results,  with
-// nice syntax.  Example:
+// Small-buffer-optimized SmallArray
 //
-//     StringPtr foo = "abcd";
-//     Array<char> bar = KJ_MAP(c, foo) -> char { return c + 1; };
-//     KJ_ASSERT(str(bar) == "bcde");
+// SmallArray is useful when you need a temporary buffer, whose size you cannot know until runtime
+// but is likely to be small, and whose lifetime can be bounded by either the stack or some
+// immovable parent object.
+//
+// SmallArray is not an Array. In particular, it has the following differences:
+//
+// 1. SmallArray has an inline buffer of `smallSize` elements, where `smallSize` is a size_t
+//    template parameter. If one is constructed with a size less than or equal to `smallSize`, the
+//    inline space is used, and no heap allocation is performed. Otherwise, a regular heap Array is
+//    allocated.
+//
+// 2. SmallArray is immovable. You must construct one in place wherever you want to use one. They
+//    cannot be "released", "finished", or assigned-to.
+//
+// 3. SmallArray has no specific constructor functions like `heapArray<T>()`. Instead, use its
+//    constructor directly, passing a single `size` parameter.
+//
+// SmallArray requires its element type T to have a default constuctor. This is because SmallArray
+// always constructs and destructs the objects in its inline space, even if it ends up falling back
+// to a heap Array. This is done for implementation simplicity, and notably matches the behavior of
+// the `KJ_STACK_ARRAY` macro, which has the same use case as SmallArray.
+//
+// TODO(someday): Implement SmallArrayBuilder to support types which have no default constructor.
+
+template <typename T, size_t smallSize>
+class SmallArray final: private Array<T> {
+public:
+  explicit SmallArray(size_t size);
+
+  // We support the full Array<T> API except `releaseAsBytes()`, `releaseAsChars()`, `attach()`,
+  // `operator=()`, and move-construction.
+
+  KJ_DISALLOW_COPY_AND_MOVE(SmallArray);
+
+  using Array<T>::operator ArrayPtr<T>;
+  using Array<T>::operator ArrayPtr<const T>;
+  using Array<T>::asPtr;
+  using Array<T>::size;
+  using Array<T>::operator[];
+  using Array<T>::begin;
+  using Array<T>::end;
+  using Array<T>::front;
+  using Array<T>::back;
+  using Array<T>::operator==;
+  using Array<T>::slice;
+  using Array<T>::first;
+  using Array<T>::asBytes;
+  using Array<T>::asChars;
+  using Array<T>::as;
+
+private:
+  T space[smallSize];
+};
+
+// =======================================================================================
+// KJ_MAP for iterable containers and C arrays
+//
+// The KJ_MAP macro and Mapper primary template are declared in kj/common.h.
+// Below is a constrained specialization for iterable containers (begin/end/size) and
+// an explicit specialization for C arrays. Both produce Array<Result>.
 
 namespace _ {  // private
 
 template <typename T>
-struct Mapper {
+concept MappableContainer = requires(T& t) {
+  *t.begin();
+  t.end();
+  t.size();
+};
+
+template <typename T>
+  requires MappableContainer<T>
+struct Mapper<T> {
   T array;
   Mapper(T&& array): array(kj::fwd<T>(array)) {}
   template <typename Func>
@@ -661,72 +742,55 @@ struct Mapper<T(&)[s]> {
 // Inline implementation details
 
 template <typename T>
-struct ArrayDisposer::Dispose_<T, true> {
-  static void dispose(T* firstElement, size_t elementCount, size_t capacity,
-                      const ArrayDisposer& disposer) {
-    disposer.disposeImpl(const_cast<RemoveConst<T>*>(firstElement),
-                         sizeof(T), elementCount, capacity, nullptr);
-  }
-};
-template <typename T>
-struct ArrayDisposer::Dispose_<T, false> {
+struct ArrayDisposer::Dispose_ {
   static void destruct(void* ptr) {
     kj::dtor(*reinterpret_cast<T*>(ptr));
-  }
-
-  static void dispose(T* firstElement, size_t elementCount, size_t capacity,
-                      const ArrayDisposer& disposer) {
-    disposer.disposeImpl(const_cast<RemoveConst<T>*>(firstElement),
-                         sizeof(T), elementCount, capacity, &destruct);
   }
 };
 
 template <typename T>
 void ArrayDisposer::dispose(T* firstElement, size_t elementCount, size_t capacity) const {
-  Dispose_<T>::dispose(firstElement, elementCount, capacity, *this);
+  if constexpr (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
+    disposeImpl(const_cast<RemoveConst<T>*>(firstElement),
+                         sizeof(T), elementCount, capacity, nullptr);
+  } else {
+    disposeImpl(const_cast<RemoveConst<T>*>(firstElement),
+                         sizeof(T), elementCount, capacity, &Dispose_<T>::destruct);
+  }
 }
+
+template <typename T, size_t smallSize>
+SmallArray<T, smallSize>::SmallArray(size_t size)
+    : Array<T>(size <= smallSize
+        ? Array<T>(space, size, NullArrayDisposer::instance)
+        : heapArray<T>(size)) {}
 
 namespace _ {  // private
 
 template <typename T>
-struct HeapArrayDisposer::Allocate_<T, true, true> {
-  static T* allocate(size_t elementCount, size_t capacity) {
-    return reinterpret_cast<T*>(allocateImpl(
-        sizeof(T), elementCount, capacity, nullptr, nullptr));
-  }
-};
-template <typename T>
-struct HeapArrayDisposer::Allocate_<T, false, true> {
+struct HeapArrayDisposer::Allocate_ {
   static void construct(void* ptr) {
     kj::ctor(*reinterpret_cast<T*>(ptr));
-  }
-  static T* allocate(size_t elementCount, size_t capacity) {
-    return reinterpret_cast<T*>(allocateImpl(
-        sizeof(T), elementCount, capacity, &construct, nullptr));
-  }
-};
-template <typename T>
-struct HeapArrayDisposer::Allocate_<T, false, false> {
-  static void construct(void* ptr) {
-    kj::ctor(*reinterpret_cast<T*>(ptr));
-  }
-  static void destruct(void* ptr) {
-    kj::dtor(*reinterpret_cast<T*>(ptr));
-  }
-  static T* allocate(size_t elementCount, size_t capacity) {
-    return reinterpret_cast<T*>(allocateImpl(
-        sizeof(T), elementCount, capacity, &construct, &destruct));
   }
 };
 
 template <typename T>
 T* HeapArrayDisposer::allocate(size_t count) {
-  return Allocate_<T>::allocate(count, count);
+  if constexpr (KJ_HAS_TRIVIAL_CONSTRUCTOR(T)) {
+    return reinterpret_cast<T*>(allocateImpl(sizeof(T), count, count, nullptr, nullptr));
+  } else if (KJ_HAS_NOTHROW_CONSTRUCTOR(T)) {
+    return reinterpret_cast<T*>(allocateImpl(
+      sizeof(T), count, count, &Allocate_<T>::construct, nullptr));
+  } else {
+    return reinterpret_cast<T*>(allocateImpl(
+      sizeof(T), count, count, &Allocate_<T>::construct, &Dispose_<T>::destruct));
+  }
 }
 
 template <typename T>
 T* HeapArrayDisposer::allocateUninitialized(size_t count) {
-  return Allocate_<T, true, true>::allocate(0, count);
+  return reinterpret_cast<T*>(allocateImpl(sizeof(T), 0, count, nullptr, nullptr));
+
 }
 
 template <typename Element, typename Iterator, bool move, bool = canMemcpy<Element>()>

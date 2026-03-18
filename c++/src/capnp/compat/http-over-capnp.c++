@@ -181,14 +181,13 @@ private:
       }
     });
 
-    try {
+    KJ_TRY {
       KJ_IF_SOME(ws, webSocket) {
         co_await canceler.wrap(func(ws));
       } else {
         kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "request canceled"));
       }
-    } catch (...) {
-      auto e = kj::getCaughtExceptionAsKj();
+    } KJ_CATCH(e) {
       error = kj::heap(kj::cp(e));
       kj::throwFatalException(kj::mv(e));
     }
@@ -232,7 +231,7 @@ public:
     req.setCode(code);
     req.setReason(reason);
     sentBytes += reason.size() + 2;
-    return req.send().ignoreResult();
+    return req.sendIgnoringResult();
   }
 
   void disconnect() override {
@@ -517,6 +516,37 @@ public:
         // DISCONNECTED exception here so that the server side doesn't log a spurious error.
         revocableContext.revoke(KJ_EXCEPTION(DISCONNECTED,
             "client disconnected before HTTP-over-capnp response was sent"));
+      } else if (revocableContext.isInUse()) {
+        // Since someone still holds a capability to the `ClientRequestContext`, the destructor
+        // of `RevocableServer` will revoke it with a FAILED-type exception with the description
+        // "capability was revoked  (RevocableServer was destroyed)", unless we revoke with some
+        // other exception first.
+        //
+        // But, since `hasSentResponse()` is true, the server must have already made its one RPC
+        // call to the context, to deliver the response headers. So, we don't expect any more
+        // calls anyway, so it shouldn't really matter what revocation exception we use.
+        //
+        // However, somehow, we've observed in production the "capability was revoked" exception
+        // being logged in `dontWaitForRpc()` on the server side. In fact, it is logged a lot. This
+        // doesn't make sense because `HttpServiceResponseImpl` on the server side is very careful
+        // to ensure that it only makes one call. I stared at the code for a while and couldn't
+        // figure out how this is possible. But we have no report of there being any actual
+        // problem as a result of the error, so I'm inclined to believe it's just a spurrious side
+        // effect of a canceled request.
+        //
+        // To make the log stop happening, we will use a DISCONNECTED exception here, which
+        // `dontWaitForRpc()` won't log.
+        //
+        // TODO(perf): On another note, I observe in Workers Runtime process-sandboxing tests we
+        //   commonly do hit this branch on requests that have bodies and complete successfully.
+        //   Those test cases do NOT have the problem where they log the exception on the server
+        //   side; the only problem is that `isInUse()` apparently returns true even after the
+        //   whole request has successfully completed, which leads us to construct an exception
+        //   object for no reason. (And if we didn't do it here, ~RevocableServer would do it
+        //   instead.) Might be worth investigating in order to optimize?
+        revocableContext.revoke(KJ_EXCEPTION(DISCONNECTED,
+            "client disconnected before HTTP-over-capnp response completed (but after it "
+            "started)"));
       }
     });
 
@@ -564,16 +594,15 @@ public:
     }
 
     // Finish pumping the response or WebSocket. (Probably it's already finished.)
-    try {
+    KJ_TRY {
       co_await context.finishPump();
-    } catch (...) {
+    } KJ_CATCH(exception) {
       // Ignore DISCONNECTED exceptions from this pump, because it should have been the server's
       // responsibility to propagate any exceptions from pushing the response. If this were a local
       // HttpService (with no RPC layer), such exceptions would not propagate here, so we want to
       // do the same. Actually, technically, even non-DISCONNECTED exceptions arguably shouldn't
       // propagate here for the same reason. But, non-DISCONNECTED exceptions are more likely to
       // flag some real bug, so I'm leaving them alone for now. This could be revisited later.
-      auto exception = kj::getCaughtExceptionAsKj();
       if (exception.getType() != kj::Exception::Type::DISCONNECTED) {
         kj::throwFatalException(kj::mv(exception));
       }
@@ -730,7 +759,7 @@ public:
   bool responseSent = false;
 
   static kj::HttpMethod validateMethod(capnp::HttpMethod method) {
-    KJ_REQUIRE(method <= capnp::HttpMethod::UNSUBSCRIBE, "unknown method", method);
+    KJ_REQUIRE(method <= capnp::HttpMethod::BAN, "unknown method", method);
     return static_cast<kj::HttpMethod>(method);
   }
 
@@ -771,7 +800,7 @@ public:
     rpcResponse.adoptHeaders(factory.headersToCapnp(
         headers, Orphanage::getForMessageContaining(rpcResponse)));
 
-    replyTask = req.send().ignoreResult();
+    replyTask = req.sendIgnoringResult();
   }
 
   kj::Own<kj::AsyncOutputStream> reject(
@@ -819,12 +848,6 @@ public:
       : factory(factory), inner(kj::mv(inner)) {}
 
   kj::Promise<void> request(RequestContext context) override {
-    // Common implementation of request() and startRequest(). callback() performs the
-    // method-specific stuff at the end.
-    //
-    // TODO(cleanup): When we move to C++17 or newer we can use `if constexpr` instead of a
-    //   callback.
-
     auto params = context.getParams();
     auto metadata = params.getRequest();
 
@@ -1049,18 +1072,18 @@ kj::HttpHeaders HttpOverCapnpFactory::capnpToKj(
             auto cvInt = static_cast<uint>(nv.getCommonValue());
             KJ_REQUIRE(nameInt < valueCapnpToKj.size(),
                 "unknown common header value", nv.getCommonValue());
-            result.set(nameCapnpToKj[nameInt], valueCapnpToKj[cvInt]);
+            result.setPtr(nameCapnpToKj[nameInt], valueCapnpToKj[cvInt]);
             break;
           }
           case capnp::HttpHeader::Common::VALUE: {
             auto headerId = nameCapnpToKj[nameInt];
             if (result.get(headerId) == kj::none) {
-              result.set(headerId, nv.getValue());
+              result.setPtr(headerId, nv.getValue());
             } else {
               // Unusual: This is a duplicate header, so fall back to add(), which may trigger
               //   comma-concatenation, except in certain cases where comma-concatentaion would
               //   be problematic.
-              result.add(headerId.toString(), nv.getValue());
+              result.addPtrPtr(headerId.toString(), nv.getValue());
             }
             break;
           }
@@ -1069,7 +1092,7 @@ kj::HttpHeaders HttpOverCapnpFactory::capnpToKj(
       }
       case capnp::HttpHeader::UNCOMMON: {
         auto nv = header.getUncommon();
-        result.add(nv.getName(), nv.getValue());
+        result.addPtrPtr(nv.getName(), nv.getValue());
       }
     }
   }

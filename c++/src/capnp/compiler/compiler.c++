@@ -259,7 +259,7 @@ private:
 class Compiler::Impl final : public SchemaLoader::LazyLoadCallback {
 public:
   explicit Impl(AnnotationFlag annotationFlag);
-  virtual ~Impl() noexcept(false);
+  ~Impl() noexcept(false);
 
   uint64_t add(Module& module);
   kj::Maybe<uint64_t> lookup(uint64_t parent, kj::StringPtr childName);
@@ -1437,7 +1437,7 @@ Compiler::CompiledType Compiler::ModuleScope::getRoot() {
 
   {
     auto lock = compiler.impl.lockExclusive();
-    auto brandScope = kj::refcounted<BrandScope>(ErrorIgnorer::instance, node.getId(), 0, node);
+    auto brandScope = kj::rc<BrandScope>(ErrorIgnorer::instance, node.getId(), 0, node);
     Resolver::ResolvedDecl decl { node.getId(), 0, 0, node.getKind(), &node, kj::none };
     newDecl.set(lock, BrandedDecl(kj::mv(decl), kj::mv(brandScope), {}));
   }

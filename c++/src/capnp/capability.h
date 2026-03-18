@@ -121,6 +121,9 @@ public:
   RemotePromise<Results> send() KJ_WARN_UNUSED_RESULT;
   // Send the call and return a promise for the results.
 
+  kj::Promise<void> sendIgnoringResult();
+  // Equivalent to send().ignoreResult(), but is a bit more efficient.
+
   typename Results::Pipeline sendForPipeline();
   // Send the call in pipeline-only mode. The returned object can be used to make pipelined calls,
   // but there is no way to wait for the completion of the original call. This allows some
@@ -302,6 +305,7 @@ private:
 
   static kj::Own<ClientHook> makeLocalClient(kj::Own<Capability::Server>&& server);
   static kj::Own<ClientHook> makeRevocableLocalClient(Capability::Server& server);
+  static bool isLocalClientShared(ClientHook& hook);
   static void revokeLocalClientIfShared(ClientHook& hook);
   static void revokeLocalClient(ClientHook& hook);
   static void revokeLocalClient(ClientHook& hook, kj::Exception&& reason);
@@ -591,6 +595,9 @@ public:
 
   typename T::Client getClient();
 
+  bool isInUse();
+  // Returns whether the capability returned by getClient() still has references outstanding.
+
   void revoke();
   void revoke(kj::Exception&& reason);
   // Revokes the capability immediately, rather than waiting for the destructor. This can also
@@ -692,6 +699,7 @@ class CapabilityServerSetBase {
 public:
   Capability::Client addInternal(kj::Own<Capability::Server>&& server, void* ptr);
   kj::Promise<void*> getLocalServerInternal(Capability::Client& client);
+  void* tryGetLocalServerSyncInternal(Capability::Client& client);
 };
 
 }  // namespace _ (private)
@@ -723,6 +731,15 @@ public:
   // wait for it to resolve. Keep in mind that the server will be deleted when all clients are
   // gone, so the caller should make sure to keep the client alive (hence why this method only
   // accepts an lvalue input).
+
+  kj::Maybe<typename T::Server&> tryGetLocalServerSync(typename T::Client& client);
+  // Like getLocalServer() but attempts to unwrap synchronously. A null return value does not
+  // necessarily mean that the capability isn't part of this set, just that it isn't known yet;
+  // in this case you must fall back to `getLocalServer()`. (In particular, if the capability is
+  // a promise, it's necessary to wait for it to resolve.)
+  //
+  // DANGER: Capabilities can be promises more often than you think. Be very careful about using
+  // this. If in doubt, don't.
 };
 
 // =======================================================================================
@@ -858,12 +875,6 @@ public:
 
 private:
   const void* brand;
-};
-
-class RevocableClientHook: public ClientHook {
-public:
-  virtual void revoke() = 0;
-  virtual void revoke(kj::Exception&& reason) = 0;
 };
 
 class CallContextHook {
@@ -1089,6 +1100,13 @@ RemotePromise<Results> Request<Params, Results>::send() {
 }
 
 template <typename Params, typename Results>
+kj::Promise<void> Request<Params, Results>::sendIgnoringResult() {
+  auto typelessPromise = hook->send();
+  hook = nullptr;  // prevent reuse
+  return kj::mv(typelessPromise).ignoreResult();
+}
+
+template <typename Params, typename Results>
 typename Results::Pipeline Request<Params, Results>::sendForPipeline() {
   auto typelessPipeline = hook->sendForPipeline();
   hook = nullptr;  // prevent reuse
@@ -1230,6 +1248,11 @@ typename T::Client RevocableServer<T>::getClient() {
 }
 
 template <typename T>
+bool RevocableServer<T>::isInUse() {
+  return Capability::Client::isLocalClientShared(*hook);
+}
+
+template <typename T>
 void RevocableServer<T>::revoke() {
   Capability::Client::revokeLocalClient(*hook);
 }
@@ -1296,6 +1319,17 @@ kj::Promise<kj::Maybe<typename T::Server&>> CapabilityServerSet<T>::getLocalServ
       return *reinterpret_cast<typename T::Server*>(server);
     }
   });
+}
+
+template <typename T>
+kj::Maybe<typename T::Server&> CapabilityServerSet<T>::tryGetLocalServerSync(
+    typename T::Client& client) {
+  void* server = tryGetLocalServerSyncInternal(client);
+  if (server == nullptr) {
+    return kj::none;
+  } else {
+    return *reinterpret_cast<typename T::Server*>(server);
+  }
 }
 
 template <typename T>

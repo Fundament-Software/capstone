@@ -358,23 +358,23 @@ KJ_TEST("HttpHeaders validation") {
   auto table = HttpHeaderTable::Builder().build();
   HttpHeaders headers(*table);
 
-  headers.add("Valid-Name", "valid value");
+  headers.addPtrPtr("Valid-Name", "valid value");
 
   // The HTTP RFC prohibits control characters, but browsers only prohibit \0, \r, and \n. KJ goes
   // with the browsers for compatibility.
-  headers.add("Valid-Name", "valid\x01value");
+  headers.addPtrPtr("Valid-Name", "valid\x01value");
 
   // The HTTP RFC does not permit non-ASCII values.
   // KJ chooses to interpret them as UTF-8, to avoid the need for any expensive conversion.
   // Browsers apparently interpret them as LATIN-1. Applications can reinterpet these strings as
   // LATIN-1 easily enough if they really need to.
-  headers.add("Valid-Name", u8"valid€value");
+  headers.addPtrPtr("Valid-Name", u8"valid€value");
 
-  KJ_EXPECT_THROW_MESSAGE("invalid header name", headers.add("Invalid Name", "value"));
-  KJ_EXPECT_THROW_MESSAGE("invalid header name", headers.add("Invalid@Name", "value"));
+  KJ_EXPECT_THROW_MESSAGE("invalid header name", headers.addPtrPtr("Invalid Name", "value"));
+  KJ_EXPECT_THROW_MESSAGE("invalid header name", headers.addPtrPtr("Invalid@Name", "value"));
 
-  KJ_EXPECT_THROW_MESSAGE("invalid header value", headers.set(HttpHeaderId::HOST, "in\nvalid"));
-  KJ_EXPECT_THROW_MESSAGE("invalid header value", headers.add("Valid-Name", "in\nvalid"));
+  KJ_EXPECT_THROW_MESSAGE("invalid header value", headers.setPtr(HttpHeaderId::HOST, "in\nvalid"));
+  KJ_EXPECT_THROW_MESSAGE("invalid header value", headers.addPtrPtr("Valid-Name", "in\nvalid"));
 }
 
 KJ_TEST("HttpHeaders Set-Cookie handling") {
@@ -384,12 +384,12 @@ KJ_TEST("HttpHeaders Set-Cookie handling") {
   auto table = builder.build();
 
   HttpHeaders headers(*table);
-  headers.set(hCookie, "Foo");
-  headers.add("Cookie", "Bar");
-  headers.add("Cookie", "Baz");
-  headers.set(hSetCookie, "Foo");
-  headers.add("Set-Cookie", "Bar");
-  headers.add("Set-Cookie", "Baz");
+  headers.setPtr(hCookie, "Foo");
+  headers.addPtrPtr("Cookie", "Bar");
+  headers.addPtrPtr("Cookie", "Baz");
+  headers.setPtr(hSetCookie, "Foo");
+  headers.addPtrPtr("Set-Cookie", "Bar");
+  headers.addPtrPtr("Set-Cookie", "Baz");
 
   auto text = headers.toString();
   KJ_EXPECT(text ==
@@ -406,9 +406,6 @@ class ReadFragmenter final: public kj::AsyncIoStream {
 public:
   ReadFragmenter(AsyncIoStream& inner, size_t limit): inner(inner), limit(limit) {}
 
-  Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
-    return inner.read(buffer, minBytes, kj::max(minBytes, kj::min(limit, maxBytes)));
-  }
   Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     return inner.tryRead(buffer, minBytes, kj::max(minBytes, kj::min(limit, maxBytes)));
   }
@@ -575,7 +572,7 @@ void testHttpClientRequest(kj::WaitScope& waitScope, const HttpRequestTestCase& 
 
   HttpHeaders headers(table);
   for (auto& header: testCase.requestHeaders) {
-    headers.set(header.id, header.value);
+    headers.setPtr(header.id, header.value);
   }
 
   auto request = client->request(testCase.method, testCase.path, headers, testCase.requestBodySize);
@@ -646,7 +643,7 @@ void testHttpClient(kj::WaitScope& waitScope, HttpHeaderTable& table,
 
   HttpHeaders headers(table);
   for (auto& header: testCase.request.requestHeaders) {
-    headers.set(header.id, header.value);
+    headers.setPtr(header.id, header.value);
   }
 
   auto request = client.request(
@@ -718,7 +715,7 @@ public:
 
       responseHeaders.clear();
       for (auto& header: response.responseHeaders) {
-        responseHeaders.set(header.id, header.value);
+        responseHeaders.setPtr(header.id, header.value);
       }
 
       auto stream = responseSender.send(response.statusCode, response.statusText,
@@ -1183,6 +1180,64 @@ KJ_TEST("HttpClient chunked body pump from fixed length stream") {
                     "b\r\nfoo bar baz\r\n0\r\n\r\n", text);
 }
 
+KJ_TEST("HttpServer handles 'chunked, chunked' as 'chunked'") {
+  // Test that "Transfer-Encoding: chunked, chunked" is treated as equivalent to "chunked"
+  // This is technically invalid per HTTP spec but needed for compatibility
+  KJ_HTTP_TEST_SETUP_IO;
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+
+  HttpRequestTestCase REQUEST_WITH_CHUNKED_CHUNKED = {
+    "POST /foo HTTP/1.1\r\n"
+    "Transfer-Encoding: chunked, chunked\r\n"
+    "\r\n"
+    "6\r\n"
+    "foobar\r\n"
+    "0\r\n"
+    "\r\n",
+
+    HttpMethod::POST,
+    "/foo",
+    {},
+    kj::none,  // chunked encoding, no fixed length
+    { "foobar" }
+  };
+
+  HttpRequestTestCase REQUEST_WITH_CHUNKED_CHUNKED_NO_SPACE = {
+    "POST /bar HTTP/1.1\r\n"
+    "Transfer-Encoding: chunked,chunked\r\n"
+    "\r\n"
+    "3\r\n"
+    "baz\r\n"
+    "0\r\n"
+    "\r\n",
+
+    HttpMethod::POST,
+    "/bar",
+    {},
+    kj::none,  // chunked encoding, no fixed length
+    { "baz" }
+  };
+
+  HttpResponseTestCase RESPONSE = {
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 2\r\n"
+    "\r\n"
+    "ok",
+
+    200, "OK",
+    {},
+    2, {"ok"}
+  };
+
+  // Test with "chunked, chunked" (with space)
+  testHttpServerRequest(waitScope, timer, REQUEST_WITH_CHUNKED_CHUNKED, RESPONSE,
+                        KJ_HTTP_TEST_CREATE_2PIPE);
+
+  // Test with "chunked,chunked" (no space)
+  testHttpServerRequest(waitScope, timer, REQUEST_WITH_CHUNKED_CHUNKED_NO_SPACE, RESPONSE,
+                        KJ_HTTP_TEST_CREATE_2PIPE);
+}
+
 KJ_TEST("HttpServer requests") {
   HttpResponseTestCase RESPONSE = {
     "HTTP/1.1 200 OK\r\n"
@@ -1459,7 +1514,7 @@ KJ_TEST("HttpClient parallel pipeline") {
 
     HttpHeaders headers(table);
     for (auto& header: testCase.request.requestHeaders) {
-      headers.set(header.id, header.value);
+      headers.setPtr(header.id, header.value);
     }
 
     auto request = client->request(
@@ -1709,13 +1764,13 @@ KJ_TEST("WebSocket core protocol") {
   auto client = newWebSocket(kj::mv(pipe.ends[0]), kj::none);
   auto server = newWebSocket(kj::mv(pipe.ends[1]), kj::none);
 
-  auto mediumString = kj::strArray(kj::repeat(kj::StringPtr("123456789"), 30), "");
-  auto bigString = kj::strArray(kj::repeat(kj::StringPtr("123456789"), 10000), "");
+  auto mediumString = kj::strArray(kj::repeat("123456789"_kj, 30), "");
+  auto bigString = kj::strArray(kj::repeat("123456789"_kj, 10000), "");
 
-  auto clientTask = client->send(kj::StringPtr("hello"))
+  auto clientTask = client->send("hello"_kj)
       .then([&]() { return client->send(mediumString); })
       .then([&]() { return client->send(bigString); })
-      .then([&]() { return client->send(kj::StringPtr("world").asBytes()); })
+      .then([&]() { return client->send("world"_kjb); })
       .then([&]() { return client->close(1234, "bored"); })
       .then([&]() { KJ_EXPECT(client->sentByteCount() == 90307)});
 
@@ -1848,7 +1903,7 @@ KJ_TEST("WebSocket masked") {
   };
 
   auto clientTask = client->write(DATA);
-  auto serverTask = server->send(kj::StringPtr("hello "));
+  auto serverTask = server->send("hello "_kj);
 
   {
     auto message = server->receive().wait(waitScope);
@@ -2077,12 +2132,12 @@ KJ_TEST("WebSocket unsolicited pong") {
   clientTask.wait(waitScope);
 }
 
-KJ_TEST("WebSocket ping") {
+void doWebSocketPingTest(kj::Maybe<EntropySource&> maskGenerator) {
   KJ_HTTP_TEST_SETUP_IO;
   auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
 
   auto client = kj::mv(pipe.ends[0]);
-  auto server = newWebSocket(kj::mv(pipe.ends[1]), kj::none);
+  auto server = newWebSocket(kj::mv(pipe.ends[1]), maskGenerator);
 
   // Be extra-annoying by having the ping arrive between fragments.
   byte DATA[] = {
@@ -2101,17 +2156,37 @@ KJ_TEST("WebSocket ping") {
     KJ_EXPECT(message.get<kj::String>() == "hello world");
   }
 
-  auto serverTask = server->send(kj::StringPtr("bar"));
+  auto serverTask = server->send("bar"_kj);
 
-  byte EXPECTED[] = {
-    0x8A, 0x03, 'f', 'o', 'o',  // pong
-    0x81, 0x03, 'b', 'a', 'r',  // message
-  };
+  kj::ArrayPtr<const byte> expected;
 
-  expectRead(*client, EXPECTED).wait(waitScope);
+  if (maskGenerator == kj::none) {
+    static const byte EXPECTED[] = {
+      0x8A, 0x03, 'f', 'o', 'o',  // pong
+      0x81, 0x03, 'b', 'a', 'r',  // message
+    };
+    expected = EXPECTED;
+  } else {
+    static const byte EXPECTED[] = {
+      0x8A, 0x83, 12, 34, 56, 78, 'f'^12, 'o'^34, 'o'^56,  // masked pong
+      0x81, 0x83, 12, 34, 56, 78, 'b'^12, 'a'^34, 'r'^56,  // masked message
+    };
+    expected = EXPECTED;
+  }
+
+  expectRead(*client, expected).wait(waitScope);
 
   clientTask.wait(waitScope);
   serverTask.wait(waitScope);
+}
+
+KJ_TEST("WebSocket ping") {
+  doWebSocketPingTest(kj::none);
+}
+
+KJ_TEST("WebSocket ping with mask") {
+  FakeEntropySource maskGenerator;
+  doWebSocketPingTest(maskGenerator);
 }
 
 KJ_TEST("WebSocket ping mid-send") {
@@ -2121,7 +2196,7 @@ KJ_TEST("WebSocket ping mid-send") {
   auto client = kj::mv(pipe.ends[0]);
   auto server = newWebSocket(kj::mv(pipe.ends[1]), kj::none);
 
-  auto bigString = kj::strArray(kj::repeat(kj::StringPtr("12345678"), 65536), "");
+  auto bigString = kj::strArray(kj::repeat("12345678"_kj, 65536), "");
   auto serverTask = server->send(bigString).eagerlyEvaluate(nullptr);
 
   byte DATA[] = {
@@ -2155,9 +2230,6 @@ public:
   InputOutputPair(kj::Own<kj::AsyncInputStream> in, kj::Own<kj::AsyncOutputStream> out)
       : in(kj::mv(in)), out(kj::mv(out)) {}
 
-  kj::Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
-    return in->read(buffer, minBytes, maxBytes);
-  }
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     return in->tryRead(buffer, minBytes, maxBytes);
   }
@@ -2205,7 +2277,7 @@ KJ_TEST("WebSocket double-ping mid-send") {
   auto server = newWebSocket(kj::heap<InputOutputPair>(kj::mv(upPipe.in), kj::mv(downPipe.out)),
                              kj::none);
 
-  auto bigString = kj::strArray(kj::repeat(kj::StringPtr("12345678"), 65536), "");
+  auto bigString = kj::strArray(kj::repeat("12345678"_kj, 65536), "");
   auto serverTask = server->send(bigString).eagerlyEvaluate(nullptr);
 
   byte DATA[] = {
@@ -2258,7 +2330,7 @@ KJ_TEST("WebSocket multiple ping outside of send") {
     KJ_EXPECT(message.get<kj::String>() == "other");
   }
 
-  auto bigString = kj::strArray(kj::repeat(kj::StringPtr("12345678"), 65536), "");
+  auto bigString = kj::strArray(kj::repeat("12345678"_kj, 65536), "");
   auto serverTask = server->send(bigString).eagerlyEvaluate(nullptr);
 
   // We expect to receive pongs for only the first and last pings, because the server has the
@@ -2288,7 +2360,7 @@ KJ_TEST("WebSocket ping received during pong send") {
   // Send a very large ping so that sending the pong takes a while. Then send a second ping
   // immediately after.
   byte PREFIX[] = { 0x89, 0x7f, 0, 0, 0, 0, 0, 8, 0, 0 };
-  auto bigString = kj::strArray(kj::repeat(kj::StringPtr("12345678"), 65536), "");
+  auto bigString = kj::strArray(kj::repeat("12345678"_kj, 65536), "");
   byte POSTFIX[] = {
     0x89, 0x03, 'f', 'o', 'o',
     0x81, 0x03, 'b', 'a', 'r',
@@ -2362,15 +2434,15 @@ KJ_TEST("WebSocket pump disconnect on send") {
   auto sendTask = client1->send("hello"_kj);
 
   // Endpoint reads three bytes and then disconnects.
-  char buffer[3]{};
-  pipe2.ends[1]->read(buffer, 3).wait(waitScope);
+  byte buffer[3]{};
+  pipe2.ends[1]->read(buffer).wait(waitScope);
   pipe2.ends[1] = nullptr;
 
   // Pump throws disconnected.
   KJ_EXPECT_THROW_RECOVERABLE(DISCONNECTED, pumpTask.wait(waitScope));
 
   // client1 may or may not have been able to send its whole message depending on buffering.
-  sendTask.then([]() {}, [](kj::Exception&& e) {
+  sendTask.catch_([](kj::Exception&& e) {
     KJ_EXPECT(e.getType() == kj::Exception::Type::DISCONNECTED);
   }).wait(waitScope);
 }
@@ -2432,8 +2504,8 @@ KJ_TEST("WebSocket maximum message size") {
   auto server = newWebSocket(kj::mv(pipe.ends[1]), kj::none, kj::none, errorCatcher);
 
   size_t maxSize = 100;
-  auto biggestAllowedString = kj::strArray(kj::repeat(kj::StringPtr("A"), maxSize), "");
-  auto tooBigString = kj::strArray(kj::repeat(kj::StringPtr("B"), maxSize + 1), "");
+  auto biggestAllowedString = kj::strArray(kj::repeat("A"_kj, maxSize), "");
+  auto tooBigString = kj::strArray(kj::repeat("B"_kj, maxSize + 1), "");
 
   auto rawCloseMessage = kj::heapArray<kj::byte>(129);
   auto clientTask = client->send(biggestAllowedString)
@@ -2481,8 +2553,8 @@ KJ_TEST("WebSocket maximum compressed message size") {
   }, errorCatcher);
 
   size_t maxSize = 100;
-  auto biggestAllowedString = kj::strArray(kj::repeat(kj::StringPtr("A"), maxSize), "");
-  auto tooBigString = kj::strArray(kj::repeat(kj::StringPtr("B"), maxSize + 1), "");
+  auto biggestAllowedString = kj::strArray(kj::repeat("A"_kj, maxSize), "");
+  auto tooBigString = kj::strArray(kj::repeat("B"_kj, maxSize + 1), "");
 
   auto rawCloseMessage = kj::heapArray<kj::byte>(129);
   auto clientTask = client->send(biggestAllowedString)
@@ -2675,7 +2747,7 @@ kj::ArrayPtr<const byte> asBytes(const char (&chars)[s]) {
 void testWebSocketClient(kj::WaitScope& waitScope, HttpHeaderTable& headerTable,
                          kj::HttpHeaderId hMyHeader, HttpClient& client) {
   kj::HttpHeaders headers(headerTable);
-  headers.set(hMyHeader, "foo");
+  headers.setPtr(hMyHeader, "foo");
   auto response = client.openWebSocket("/websocket", headers).wait(waitScope);
 
   KJ_EXPECT(response.statusCode == 101);
@@ -2690,7 +2762,7 @@ void testWebSocketClient(kj::WaitScope& waitScope, HttpHeaderTable& headerTable,
     KJ_EXPECT(message.get<kj::String>() == "start-inline");
   }
 
-  ws->send(kj::StringPtr("bar")).wait(waitScope);
+  ws->send("bar"_kj).wait(waitScope);
   {
     auto message = ws->receive().wait(waitScope);
     KJ_ASSERT(message.is<kj::String>());
@@ -2715,7 +2787,7 @@ void testWebSocketTwoMessageCompression(kj::WaitScope& waitScope, HttpHeaderTabl
   // compressed message changes.
 
   kj::HttpHeaders headers(headerTable);
-  headers.set(extHeader, extensions);
+  headers.setPtr(extHeader, extensions);
   auto response = client.openWebSocket("/websocket", headers).wait(waitScope);
 
   KJ_EXPECT(response.statusCode == 101);
@@ -2729,14 +2801,14 @@ void testWebSocketTwoMessageCompression(kj::WaitScope& waitScope, HttpHeaderTabl
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hello");
   }
-  ws->send(kj::StringPtr("Hello")).wait(waitScope);
+  ws->send("Hello"_kj).wait(waitScope);
 
   {
     auto message = ws->receive().wait(waitScope);
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hello");
   }
-  ws->send(kj::StringPtr("Hello")).wait(waitScope);
+  ws->send("Hello"_kj).wait(waitScope);
 
   ws->close(0x1234, "qux").wait(waitScope);
   {
@@ -2757,7 +2829,7 @@ void testWebSocketThreeMessageCompression(kj::WaitScope& waitScope, HttpHeaderTa
   // The third message is the same as the first (from the application code's perspective).
 
   kj::HttpHeaders headers(headerTable);
-  headers.set(extHeader, extensions);
+  headers.setPtr(extHeader, extensions);
   auto response = client.openWebSocket("/websocket", headers).wait(waitScope);
 
   KJ_EXPECT(response.statusCode == 101);
@@ -2772,7 +2844,7 @@ void testWebSocketThreeMessageCompression(kj::WaitScope& waitScope, HttpHeaderTa
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hello");
   }
-  ws->send(kj::StringPtr("Hello")).wait(waitScope);
+  ws->send("Hello"_kj).wait(waitScope);
 
   // The message we receive is not compressed, but the one we send is.
   {
@@ -2780,7 +2852,7 @@ void testWebSocketThreeMessageCompression(kj::WaitScope& waitScope, HttpHeaderTa
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hi");
   }
-  ws->send(kj::StringPtr("Hi")).wait(waitScope);
+  ws->send("Hi"_kj).wait(waitScope);
 
   // Compressed message.
   {
@@ -2788,7 +2860,7 @@ void testWebSocketThreeMessageCompression(kj::WaitScope& waitScope, HttpHeaderTa
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hello");
   }
-  ws->send(kj::StringPtr("Hello")).wait(waitScope);
+  ws->send("Hello"_kj).wait(waitScope);
 
   ws->close(0x1234, "qux").wait(waitScope);
   {
@@ -2807,7 +2879,7 @@ void testWebSocketEmptyMessageCompression(kj::WaitScope& waitScope, HttpHeaderTa
   // Confirm that we can send empty messages when compression is enabled.
 
   kj::HttpHeaders headers(headerTable);
-  headers.set(extHeader, extensions);
+  headers.setPtr(extHeader, extensions);
   auto response = client.openWebSocket("/websocket", headers).wait(waitScope);
 
   KJ_EXPECT(response.statusCode == 101);
@@ -2821,21 +2893,21 @@ void testWebSocketEmptyMessageCompression(kj::WaitScope& waitScope, HttpHeaderTa
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hello");
   }
-  ws->send(kj::StringPtr("Hello")).wait(waitScope);
+  ws->send("Hello"_kj).wait(waitScope);
 
   {
     auto message = ws->receive().wait(waitScope);
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "");
   }
-  ws->send(kj::StringPtr("")).wait(waitScope);
+  ws->send(""_kj).wait(waitScope);
 
   {
     auto message = ws->receive().wait(waitScope);
     KJ_ASSERT(message.is<kj::String>());
     KJ_EXPECT(message.get<kj::String>() == "Hello");
   }
-  ws->send(kj::StringPtr("Hello")).wait(waitScope);
+  ws->send("Hello"_kj).wait(waitScope);
 
   ws->close(0x1234, "qux").wait(waitScope);
   {
@@ -2862,7 +2934,7 @@ void testWebSocketOptimizePumpProxy(kj::WaitScope& waitScope, HttpHeaderTable& h
   // configuration and pass it to `proxyServer` in a way that would allow for optimizedPumping.
 
   kj::HttpHeaders headers(headerTable);
-  headers.set(extHeader, extensions);
+  headers.setPtr(extHeader, extensions);
   auto response = client.openWebSocket("/websocket", headers).wait(waitScope);
 
   KJ_EXPECT(response.statusCode == 101);
@@ -2900,7 +2972,7 @@ void testWebSocketFourMessageCompression(kj::WaitScope& waitScope, HttpHeaderTab
   // the message). We will receive three messages.
 
   kj::HttpHeaders headers(headerTable);
-  headers.set(extHeader, extensions);
+  headers.setPtr(extHeader, extensions);
   auto response = client.openWebSocket("/websocket", headers).wait(waitScope);
 
   KJ_EXPECT(response.statusCode == 101);
@@ -3782,7 +3854,7 @@ KJ_TEST("HttpClient WebSocket error") {
   auto client = newHttpClient(*headerTable, *pipe.ends[0], clientSettings);
 
   kj::HttpHeaders headers(*headerTable);
-  headers.set(hMyHeader, "foo");
+  headers.setPtr(hMyHeader, "foo");
 
   {
     auto response = client->openWebSocket("/websocket", headers).wait(waitScope);
@@ -4281,12 +4353,11 @@ KJ_TEST("HttpServer bad requests") {
 
     auto request = testCase.request;
     auto writePromise = pipe.ends[1]->write(request.asBytes());
-    try {
+    KJ_TRY {
       auto response = pipe.ends[1]->readAllText().wait(waitScope);
       auto expectedResponse = testCase.expectedResponse;
       KJ_EXPECT(expectedResponse == response, expectedResponse, response);
-    } catch (...) {
-      auto ex = kj::getCaughtExceptionAsKj();
+    } KJ_CATCH(ex) {
       KJ_FAIL_REQUIRE("not supposed to happen", ex);
     }
 
@@ -4298,6 +4369,70 @@ KJ_TEST("HttpServer bad requests") {
       KJ_EXPECT(testCase.expectWriteError, "write error wasn't expected");
     }
   }
+}
+
+KJ_TEST("HttpServer rejects negative Content-Length") {
+  KJ_HTTP_TEST_SETUP_IO;
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+
+  HttpHeaderTable table;
+  BrokenHttpService service;
+  HttpServer server(timer, table, service, {
+    .canceledUploadGraceBytes = 1024 * 1024,
+  });
+
+  auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
+
+  auto msg =
+      "POST / HTTP/1.1\r\n"
+      "Content-Length: -1\r\n"
+      "\r\n"
+      "foo"_kjb;
+
+  auto writePromise = pipe.ends[1]->write(msg);
+  auto response = pipe.ends[1]->readAllText().wait(waitScope);
+
+  // The server should reject the negative Content-Length. The KJ_FAIL_REQUIRE in getEntityBody()
+  // gets caught by the server loop and turned into a 500 error.
+  KJ_EXPECT(response.startsWith("HTTP/1.1 500 Internal Server Error"), response);
+
+  KJ_EXPECT(writePromise.poll(waitScope));
+  try { writePromise.wait(waitScope); } catch (...) {}
+}
+
+KJ_TEST("HttpServer rejects chunked body with overflowing chunk size") {
+  KJ_HTTP_TEST_SETUP_IO;
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+
+  HttpHeaderTable table;
+  BrokenHttpService service;
+  HttpServer server(timer, table, service, {
+    .canceledUploadGraceBytes = 1024 * 1024,
+  });
+
+  auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
+
+  // 17 hex digits: 0x10000000000000000 = 2^64, which overflows uint64_t.
+  auto msg =
+      "POST / HTTP/1.1\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n"
+      "10000000000000000\r\n"
+      "x\r\n"
+      "0\r\n"
+      "\r\n"_kjb;
+
+  auto writePromise = pipe.ends[1]->write(msg);
+  auto response = pipe.ends[1]->readAllText().wait(waitScope);
+
+  // The chunk size overflow causes a KJ_REQUIRE failure during body reading, which the server
+  // catches and turns into a 500 error.
+  KJ_EXPECT(response.startsWith("HTTP/1.1 500 Internal Server Error"), response);
+
+  KJ_EXPECT(writePromise.poll(waitScope));
+  try { writePromise.wait(waitScope); } catch (...) {}
 }
 
 // Ensure that HttpServerSettings can continue to be constexpr.
@@ -4657,6 +4792,13 @@ class SuspendAfter: private HttpService {
   // suspends all subsequent requests until its counter is reset.
 
 public:
+  SuspendAfter(HttpHeaderTable::Builder builder = {})
+      : fooHeaderId(builder.add("Foo")),
+        barHeaderId(builder.add("Bar")),
+        table(builder.build()) {}
+
+  const HttpHeaderTable& getHeaderTable() { return *table; }
+
   void suspendAfter(uint countdownParam) { countdown = countdownParam; }
 
   kj::Maybe<kj::Own<HttpService>> operator()(HttpServer::SuspendableRequest& sr) {
@@ -4677,16 +4819,38 @@ private:
   kj::Promise<void> request(
       HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) override {
-    HttpHeaders responseHeaders(table);
+    // Check headers made it through the transfer.
+    KJ_EXPECT(headers.get(fooHeaderId).orDefault("(nil)") == "foo");
+    KJ_EXPECT(headers.get(barHeaderId).orDefault("(nil)") == "bar1, bar2");
+    bool foundBaz = false;
+    headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
+      if (name == "Baz") {
+        KJ_EXPECT(!foundBaz);
+        KJ_EXPECT(value == "baz");
+        foundBaz = true;
+      }
+    });
+    KJ_EXPECT(foundBaz);
+
+    // Send response.
+    HttpHeaders responseHeaders(*table);
     response.send(200, "OK", responseHeaders);
     return requestBody.readAllBytes().ignoreResult();
   }
 
-  HttpHeaderTable table;
+  HttpHeaderId fooHeaderId;
+  HttpHeaderId barHeaderId;
+  kj::Own<HttpHeaderTable> table;
 
   uint countdown = kj::maxValue;
   kj::Maybe<HttpServer::SuspendedRequest> suspendedRequest;
 };
+
+#define SUSPEND_AFTER_EXPECTED_HEADERS \
+  "Foo: foo\r\n" \
+  "Bar: bar1\r\n" \
+  "Bar: bar2\r\n" \
+  "Baz: baz\r\n"
 
 KJ_TEST("HttpServer can suspend a request") {
   // This test sends a single request to an HttpServer three times. First it writes the request to
@@ -4698,15 +4862,13 @@ KJ_TEST("HttpServer can suspend a request") {
   kj::TimerImpl timer(kj::origin<kj::TimePoint>());
   auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
 
-  HttpHeaderTable table;
   // This HttpService will not actually be used, because we're passing a factory in to
   // listenHttpCleanDrain().
   HangingHttpService service;
-  HttpServer server(timer, table, service);
+  SuspendAfter factory;
+  HttpServer server(timer, factory.getHeaderTable(), service);
 
   kj::Maybe<HttpServer::SuspendedRequest> suspendedRequest;
-
-  SuspendAfter factory;
 
   {
     // Observe the HttpServer suspend.
@@ -4716,6 +4878,7 @@ KJ_TEST("HttpServer can suspend a request") {
 
     static constexpr kj::StringPtr REQUEST =
         "POST / HTTP/1.1\r\n"
+        SUSPEND_AFTER_EXPECTED_HEADERS
         "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "6\r\n"
@@ -4791,24 +4954,25 @@ KJ_TEST("HttpServer can suspend and resume pipelined requests") {
   kj::TimerImpl timer(kj::origin<kj::TimePoint>());
   auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
 
-  HttpHeaderTable table;
   // This HttpService will not actually be used, because we're passing a factory in to
   // listenHttpCleanDrain().
   HangingHttpService service;
-  HttpServer server(timer, table, service);
+  SuspendAfter factory;
+  HttpServer server(timer, factory.getHeaderTable(), service);
 
   // We'll suspend the second request.
   kj::Maybe<HttpServer::SuspendedRequest> suspendedRequest;
-  SuspendAfter factory;
 
   static auto LENGTHFUL_REQUEST =
       "POST / HTTP/1.1\r\n"
       "Content-Length: 6\r\n"
+      SUSPEND_AFTER_EXPECTED_HEADERS
       "\r\n"
       "foobar"_kjb;
   static auto CHUNKED_REQUEST =
       "POST / HTTP/1.1\r\n"
       "Transfer-Encoding: chunked\r\n"
+      SUSPEND_AFTER_EXPECTED_HEADERS
       "\r\n"
       "6\r\n"
       "foobar\r\n"
@@ -4900,11 +5064,10 @@ KJ_TEST("HttpServer can suspend a request with no leftover") {
   // This HttpService will not actually be used, because we're passing a factory in to
   // listenHttpCleanDrain().
   HangingHttpService service;
-  HttpServer server(timer, table, service);
+  SuspendAfter factory;
+  HttpServer server(timer, factory.getHeaderTable(), service);
 
   kj::Maybe<HttpServer::SuspendedRequest> suspendedRequest;
-
-  SuspendAfter factory;
 
   {
     factory.suspendAfter(0);
@@ -4912,6 +5075,7 @@ KJ_TEST("HttpServer can suspend a request with no leftover") {
 
     static auto REQUEST_HEADERS =
         "POST / HTTP/1.1\r\n"
+        SUSPEND_AFTER_EXPECTED_HEADERS
         "Transfer-Encoding: chunked\r\n"
         "\r\n"_kjb;
     pipe.ends[1]->write(REQUEST_HEADERS).wait(waitScope);
@@ -5166,16 +5330,16 @@ KJ_TEST("HttpClient WebSocket: client can have a custom WebSocket error handler"
     0xF0, 0x02, 'y', 'o'  // all RSV bits set, plus FIN
   };
   const byte closeFrame[] = {
-    0x88, 0xa8, 0xC, 0x22, 0x38, 0x4e, 0x3, 0xea, // FIN, opcode=Close, code=1009
-    'R', 'e', 'c', 'e', 'i', 'v', 'e', 'd', ' ',
-    'f', 'r', 'a', 'm', 'e', ' ',
-    'h', 'a', 'd', ' ',
-    'R', 'S', 'V', ' ',
-    'b', 'i', 't', 's', ' ',
-    '2', ' ',
-    'o', 'r', ' ',
-    '3', ' ',
-    's', 'e', 't',
+    0x88, 0xa8, 12, 34, 56, 78, 0x3^12, 0xea^34, // FIN, opcode=Close, code=1009
+    'R'^56, 'e'^78, 'c'^12, 'e'^34, 'i'^56, 'v'^78, 'e'^12, 'd'^34, ' '^56,
+    'f'^78, 'r'^12, 'a'^34, 'm'^56, 'e'^78, ' '^12,
+    'h'^34, 'a'^56, 'd'^78, ' '^12,
+    'R'^34, 'S'^56, 'V'^78, ' '^12,
+    'b'^34, 'i'^56, 't'^78, 's'^12, ' '^34,
+    '2'^56, ' '^78,
+    'o'^12, 'r'^34, ' '^56,
+    '3'^78, ' '^12,
+    's'^34, 'e'^56, 't'^78,
   };
 
   auto request = kj::str("GET /websocket", wsRequestHandshake);
@@ -5510,9 +5674,6 @@ public:
     --count;
   }
 
-  kj::Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
-    return inner->read(buffer, minBytes, maxBytes);
-  }
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     return inner->tryRead(buffer, minBytes, maxBytes);
   }
@@ -5996,6 +6157,341 @@ KJ_TEST("HttpClient concurrency limiting") {
   KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {0, 0} }));
 }
 
+KJ_TEST("HttpClient releaseSlotOnHeadersReceived") {
+#if KJ_HTTP_TEST_USE_OS_PIPE && !__linux__
+  return;
+#endif
+
+  // Comprehensive test for releaseSlotOnHeadersReceived. With maxConcurrentRequests=1, we
+  // interleave regular HTTP, WebSocket, and CONNECT requests, tightly controlling when the server
+  // sends response headers and when the client reads response bodies. We verify concurrent and
+  // cumulative connection counts at every step.
+
+  KJ_HTTP_TEST_SETUP_IO;
+  KJ_HTTP_TEST_SETUP_LOOPBACK_LISTENER_AND_ADDR;
+
+  kj::TimerImpl serverTimer(kj::origin<kj::TimePoint>());
+  kj::TimerImpl clientTimer(kj::origin<kj::TimePoint>());
+  HttpHeaderTable headerTable;
+
+  // A service where the test controls exactly when each request's response headers are sent.
+  // Each incoming request (HTTP, WS, or CONNECT) co_awaits a gate promise before responding.
+  struct GatedService final: public HttpService {
+    HttpHeaderTable& headerTable;
+    uint nextGate = 0;
+    kj::Vector<kj::Promise<void>> gates;
+
+    GatedService(HttpHeaderTable& headerTable): headerTable(headerTable) {}
+
+    kj::Promise<void> request(
+        HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
+        kj::AsyncInputStream& requestBody, Response& response) override {
+      KJ_ASSERT(nextGate < gates.size(), "no gate available for incoming request");
+      co_await gates[nextGate++];
+      if (headers.isWebSocket()) {
+        auto ws = response.acceptWebSocket(HttpHeaders(headerTable));
+        // Send a message, then wait for the client to close.
+        co_await ws->send("hello from server"_kj);
+        co_await ws->receive();
+      } else {
+        auto body = kj::str("body:", url);
+        auto stream = response.send(200, "OK", HttpHeaders(headerTable), body.size());
+        co_await stream->write(body.asBytes());
+        co_await requestBody.readAllBytes();
+      }
+    }
+
+    kj::Promise<void> connect(kj::StringPtr host,
+                              const HttpHeaders& headers,
+                              kj::AsyncIoStream& connection,
+                              ConnectResponse& response,
+                              kj::HttpConnectSettings settings) override {
+      KJ_ASSERT(nextGate < gates.size(), "no gate available for incoming CONNECT");
+      co_await gates[nextGate++];
+      response.accept(200, "OK", HttpHeaders(headerTable));
+      co_await connection.pumpTo(connection);
+    }
+  };
+
+  GatedService service(headerTable);
+
+  // Create gate fulfillers. We'll need gates for: http1, http2, ws, connect1, connect2.
+  kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> gateFulfillers;
+  for (auto i KJ_UNUSED: kj::zeroTo(5)) {
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    service.gates.add(kj::mv(paf.promise));
+    gateFulfillers.add(kj::mv(paf.fulfiller));
+  }
+  auto& httpGate1 = *gateFulfillers[0];
+  auto& httpGate2 = *gateFulfillers[1];
+  auto& wsGate = *gateFulfillers[2];
+  auto& connectGate1 = *gateFulfillers[3];
+  auto& connectGate2 = *gateFulfillers[4];
+
+  HttpServerSettings serverSettings;
+  HttpServer server(serverTimer, headerTable, service, serverSettings);
+  auto listenTask = server.listenHttp(*listener);
+
+  uint count = 0;
+  uint cumulative = 0;
+  CountingNetworkAddress countingAddr(*addr, count, cumulative);
+
+  FakeEntropySource entropySource;
+  HttpClientSettings clientSettings;
+  clientSettings.entropySource = entropySource;
+  clientSettings.idleTimeout = 0 * kj::SECONDS;
+  auto innerClient = newHttpClient(clientTimer, headerTable, countingAddr, clientSettings);
+
+  uint concurrent = 0;
+  ConcurrencyLimitingHttpClientSettings settings;
+  settings.maxConcurrentRequests = 1;
+  settings.countChangedCallback = [&](uint runningCount, uint pendingCount) {
+    concurrent = runningCount;
+  };
+  settings.releaseSlotOnHeadersReceived = true;
+  auto client = newConcurrencyLimitingHttpClient(*innerClient, kj::mv(settings));
+
+  KJ_EXPECT(concurrent == 0);
+  KJ_EXPECT(cumulative == 0);
+
+  // ---------------------------------------------------------------------------
+  // Regular HTTP requests
+  // ---------------------------------------------------------------------------
+
+  // Issue HTTP request 1. It takes the only slot.
+  auto http1 = client->request(HttpMethod::GET, kj::str("/1"), HttpHeaders(headerTable));
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 1);
+
+  // Issue HTTP request 2. It's queued behind http1 in the concurrency limiter.
+  auto http2 = client->request(HttpMethod::GET, kj::str("/2"), HttpHeaders(headerTable));
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 1);  // Still 1: http2 hasn't opened a connection yet.
+
+  // Neither response is ready (server hasn't sent headers).
+  KJ_EXPECT(!http1.response.poll(waitScope));
+  KJ_EXPECT(!http2.response.poll(waitScope));
+
+  // Signal server to respond to http1. Its headers arrive, releasing the slot.
+  httpGate1.fulfill();
+  KJ_ASSERT(http1.response.poll(waitScope));
+  auto httpResp1 = http1.response.wait(waitScope);
+  KJ_EXPECT(httpResp1.statusCode == 200);
+
+  // http2 should now be unblocked and have opened a connection. The slot transferred from http1
+  // to http2 (released on headers, immediately acquired by queued http2).
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 2);
+
+  // But http2's response is not ready yet (server hasn't responded to it).
+  KJ_EXPECT(!http2.response.poll(waitScope));
+
+  // ---------------------------------------------------------------------------
+  // WebSocket request (while http2 is still waiting for headers)
+  // ---------------------------------------------------------------------------
+
+  // Issue a WebSocket request. It's queued because http2 holds the slot.
+  auto wsReq = client->openWebSocket(kj::str("/websocket"), HttpHeaders(headerTable));
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 2);  // WS hasn't opened a connection yet.
+
+  // Signal server to respond to http2. Its headers arrive, releasing the slot.
+  httpGate2.fulfill();
+  KJ_ASSERT(http2.response.poll(waitScope));
+  auto httpResp2 = http2.response.wait(waitScope);
+  KJ_EXPECT(httpResp2.statusCode == 200);
+
+  // WS should now be unblocked. The slot transferred from http2 to ws.
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 3);
+
+  // Read http2's body before http1's body, proving the slot was already released.
+  auto body2 = httpResp2.body->readAllText().wait(waitScope);
+  KJ_EXPECT(body2 == "body:/2");
+  auto body1 = httpResp1.body->readAllText().wait(waitScope);
+  KJ_EXPECT(body1 == "body:/1");
+
+  // ---------------------------------------------------------------------------
+  // CONNECT requests (while WS is still waiting for headers)
+  // ---------------------------------------------------------------------------
+
+  // Issue CONNECT request 1. It's queued because WS holds the slot.
+  auto connect1 = client->connect("host1:443"_kj, HttpHeaders(headerTable), {});
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 3);  // connect1 hasn't opened a connection yet.
+
+  // Signal server to accept WS. The WS upgrade response releases the slot.
+  wsGate.fulfill();
+  KJ_ASSERT(wsReq.poll(waitScope));
+  auto wsResp = wsReq.wait(waitScope);
+  KJ_EXPECT(wsResp.statusCode == 101);
+  auto& ws = KJ_ASSERT_NONNULL(wsResp.webSocketOrBody.tryGet<kj::Own<WebSocket>>());
+
+  // CONNECT 1 should now be unblocked. The slot transferred from ws to connect1.
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 4);
+
+  // Issue CONNECT request 2. It's queued because connect1 holds the slot.
+  auto connect2 = client->connect("host2:443"_kj, HttpHeaders(headerTable), {});
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 4);  // connect2 hasn't opened a connection yet.
+
+  // Read the WS message and close the WebSocket.
+  auto wsMsg = ws->receive().wait(waitScope);
+  KJ_ASSERT(wsMsg.is<kj::String>());
+  KJ_EXPECT(wsMsg.get<kj::String>() == "hello from server");
+  ws->close(1000, "done"_kj).wait(waitScope);
+
+  // Signal server to accept CONNECT 1. The 200 status releases the slot.
+  connectGate1.fulfill();
+  KJ_ASSERT(connect1.status.poll(waitScope));
+  auto status1 = connect1.status.wait(waitScope);
+  KJ_EXPECT(status1.statusCode == 200);
+
+  // CONNECT 2 should now be unblocked. The slot transferred from connect1 to connect2.
+  waitScope.poll();
+  KJ_EXPECT(concurrent == 1);
+  KJ_EXPECT(cumulative == 5);
+
+  // Signal server to accept CONNECT 2. No more queued requests, so the slot is freed.
+  connectGate2.fulfill();
+  KJ_ASSERT(connect2.status.poll(waitScope));
+  auto status2 = connect2.status.wait(waitScope);
+  KJ_EXPECT(status2.statusCode == 200);
+  KJ_EXPECT(concurrent == 0);
+  KJ_EXPECT(cumulative == 5);
+
+  // ---------------------------------------------------------------------------
+  // Verify CONNECT tunnels are usable
+  // ---------------------------------------------------------------------------
+
+  // Write and read through both CONNECT tunnels. We must start the read before waiting on the
+  // write, because the in-memory pipe has no buffering: the server's pumpTo forwards data
+  // synchronously, and the write won't complete until the echoed data is read.
+  {
+    auto writePromise = connect1.connection->write("tunnel1"_kjb);
+    expectRead(*connect1.connection, "tunnel1"_kj).wait(waitScope);
+    writePromise.wait(waitScope);
+  }
+  {
+    auto writePromise = connect2.connection->write("tunnel2"_kjb);
+    expectRead(*connect2.connection, "tunnel2"_kj).wait(waitScope);
+    writePromise.wait(waitScope);
+  }
+
+  connect1.connection->shutdownWrite();
+  connect2.connection->shutdownWrite();
+
+  KJ_EXPECT(cumulative == 5);
+}
+
+KJ_TEST("HttpClient releaseSlotOnHeadersReceived immediate path") {
+#if KJ_HTTP_TEST_USE_OS_PIPE && !__linux__
+  return;
+#endif
+
+  // The previous test exercises the queued path for openWebSocket() and connect(). This test
+  // ensures the immediate path (concurrentRequests < maxConcurrentRequests) is also covered for
+  // all three request types by issuing each when the slot is free.
+
+  KJ_HTTP_TEST_SETUP_IO;
+  KJ_HTTP_TEST_SETUP_LOOPBACK_LISTENER_AND_ADDR;
+
+  kj::TimerImpl serverTimer(kj::origin<kj::TimePoint>());
+  kj::TimerImpl clientTimer(kj::origin<kj::TimePoint>());
+  HttpHeaderTable headerTable;
+
+  struct Service final: public HttpService {
+    HttpHeaderTable& headerTable;
+    Service(HttpHeaderTable& headerTable): headerTable(headerTable) {}
+
+    kj::Promise<void> request(
+        HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
+        kj::AsyncInputStream& requestBody, Response& response) override {
+      if (headers.isWebSocket()) {
+        auto ws = response.acceptWebSocket(HttpHeaders(headerTable));
+        co_await ws->receive();
+      } else {
+        auto body = "ok"_kjb;
+        auto stream = response.send(200, "OK", HttpHeaders(headerTable), body.size());
+        co_await stream->write(body);
+        co_await requestBody.readAllBytes();
+      }
+    }
+
+    kj::Promise<void> connect(kj::StringPtr host,
+                              const HttpHeaders& headers,
+                              kj::AsyncIoStream& connection,
+                              ConnectResponse& response,
+                              kj::HttpConnectSettings settings) override {
+      response.accept(200, "OK", HttpHeaders(headerTable));
+      co_await connection.pumpTo(connection);
+    }
+  };
+
+  Service service(headerTable);
+  HttpServerSettings serverSettings;
+  HttpServer server(serverTimer, headerTable, service, serverSettings);
+  auto listenTask = server.listenHttp(*listener);
+
+  uint count = 0;
+  uint cumulative = 0;
+  CountingNetworkAddress countingAddr(*addr, count, cumulative);
+
+  FakeEntropySource entropySource;
+  HttpClientSettings clientSettings;
+  clientSettings.entropySource = entropySource;
+  clientSettings.idleTimeout = 0 * kj::SECONDS;
+  auto innerClient = newHttpClient(clientTimer, headerTable, countingAddr, clientSettings);
+
+  uint concurrent = 0;
+  ConcurrencyLimitingHttpClientSettings settings;
+  settings.maxConcurrentRequests = 1;
+  settings.countChangedCallback = [&](uint runningCount, uint pendingCount) {
+    concurrent = runningCount;
+  };
+  settings.releaseSlotOnHeadersReceived = true;
+  auto client = newConcurrencyLimitingHttpClient(*innerClient, kj::mv(settings));
+
+  // HTTP request — immediate path.
+  KJ_EXPECT(concurrent == 0);
+  auto http = client->request(HttpMethod::GET, kj::str("/"), HttpHeaders(headerTable));
+  KJ_EXPECT(concurrent == 1);
+  auto httpResp = http.response.wait(waitScope);
+  KJ_EXPECT(httpResp.statusCode == 200);
+  KJ_EXPECT(concurrent == 0);
+  httpResp.body->readAllText().wait(waitScope);
+  KJ_EXPECT(cumulative == 1);
+
+  // WebSocket — immediate path.
+  KJ_EXPECT(concurrent == 0);
+  auto wsResp = client->openWebSocket(kj::str("/websocket"), HttpHeaders(headerTable))
+      .wait(waitScope);
+  KJ_EXPECT(wsResp.statusCode == 101);
+  KJ_EXPECT(concurrent == 0);
+  auto& ws = KJ_ASSERT_NONNULL(wsResp.webSocketOrBody.tryGet<kj::Own<WebSocket>>());
+  ws->close(1000, "done"_kj).wait(waitScope);
+  KJ_EXPECT(cumulative == 2);
+
+  // CONNECT — immediate path.
+  KJ_EXPECT(concurrent == 0);
+  auto conn = client->connect("host:443"_kj, HttpHeaders(headerTable), {});
+  KJ_EXPECT(concurrent == 1);
+  auto status = conn.status.wait(waitScope);
+  KJ_EXPECT(status.statusCode == 200);
+  KJ_EXPECT(concurrent == 0);
+  conn.connection->shutdownWrite();
+  KJ_EXPECT(cumulative == 3);
+}
+
 KJ_TEST("HttpClientImpl connect()") {
   KJ_HTTP_TEST_SETUP_IO;
   auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
@@ -6188,7 +6684,7 @@ KJ_TEST("HttpClient to capnproto.org") {
     auto client = newHttpClient(table, *conn);
 
     HttpHeaders headers(table);
-    headers.set(HttpHeaderId::HOST, "capnproto.org");
+    headers.setPtr(HttpHeaderId::HOST, "capnproto.org");
 
     auto response = client->request(HttpMethod::GET, "/", headers).response.wait(io.waitScope);
     KJ_EXPECT(response.statusCode / 100 == 3);
@@ -6218,8 +6714,8 @@ public:
       // Actually, we can't literally cancel mid-read, because this leaves the stream in an
       // unknown state which requires closing the connection. Instead, we know that the sender
       // will send 5 bytes, so we read that, then pause.
-      static char junk[5];
-      return requestBody.read(junk, 5)
+      static byte junk[5];
+      return requestBody.read(junk)
           .then([]() -> kj::Promise<void> { return kj::NEVER_DONE; })
           .exclusiveJoin(timer.afterDelay(1 * kj::MILLISECONDS))
           .then([this, &responseSender]() {
@@ -6574,9 +7070,6 @@ KJ_TEST("HttpServer handles disconnected exception for clients disconnecting aft
   public:
     DisconnectingAsyncIoStream(AsyncIoStream& inner): inner(inner) {}
 
-    Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
-      return inner.read(buffer, minBytes, maxBytes);
-    }
     Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
       return inner.tryRead(buffer, minBytes, maxBytes);
     }

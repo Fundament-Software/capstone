@@ -18,36 +18,70 @@ env:
   INSTALL_DEPS: |
     install_deps() {
       local clang=$1
-      export DEBIAN_FRONTEND=noninteractive && sudo apt-get update && sudo apt-get install --no-upgrade --no-install-recommends -y clang-$clang libc++-$clang-dev libc++abi-$clang-dev
+      export DEBIAN_FRONTEND=noninteractive && sudo apt-get update && sudo apt-get install --no-upgrade --no-install-recommends -y clang-$clang libc++-$clang-dev libc++abi-$clang-dev libclang-rt-$clang-dev lld-$clang llvm-$clang
     }
 
 jobs:
   Linux-musl:
-    # Docker images are no longer cached on the 24.04 runner, use 22.04 instead
-    runs-on: ubuntu-22.04
-    # We depend on both clang and libc++. Alpine Linux 3.17 seems to be the first version to include
-    # a libc++ package (based on LLVM 15), but building capnproto failed when I tried it.
-    # Alpine Linux 3.18's libc++ package is from LLVM 16, however, and worked out-of-the-box, so
-    # Clang 16 appears to be the earliest Clang version we can run easily on Alpine Linux.
-    container: alpine:3.18.2
+    runs-on: ubuntu-24.04
+    # We depend on both clang and libc++. We use Alpine Linux 3.23 which supports LLVM 21.
+    container: alpine:3.23
     steps:
       - uses: actions/checkout@v6
       - name: install dependencies
-        run: apk add autoconf automake bash build-base cmake libtool libucontext-dev linux-headers openssl-dev clang16 libc++-dev
+        # TODO(cleanup): Could use clang21 here, but that would introduce warnings and make the
+        # build fail due to -Werror – fix and update.
+        run: apk add autoconf automake bash build-base cmake libtool libucontext-dev linux-headers openssl-dev clang20 libc++-dev llvm-libunwind-dev
       - name: super-test
-        run: ./super-test.sh quick clang-16
+        run: ./super-test.sh quick clang-20
   Linux-clang:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        clang: [14, 15, 16, 17, 18]
-        driver: [bazel, super-test]
+        clang: [18, 19, 20]
+        driver: [bazel-dbg, super-test]
         include:
-          - driver: bazel
-            run-test: cd c++ && bazel test --verbose_failures --test_output=errors -k --cxxopt='-Werror' //...
+          - driver: bazel-dbg
+            run-test: cd c++ && bazel test --config=ci --config=dbg //...
           - driver: super-test
             run-test: ./super-test.sh quick
+    steps:
+      - uses: actions/checkout@v6
+      - name: install dependencies
+        run: eval "$INSTALL_DEPS" && install_deps ${{ matrix.clang }}
+      - name: test
+        run: |
+            export CC=clang-${{ matrix.clang }}
+            export CXX=clang++-${{ matrix.clang }}
+            ${{ matrix.run-test }}
+  Linux-clang-opt:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        clang: [20]
+    steps:
+      - uses: actions/checkout@v6
+      - name: install dependencies
+        run: eval "$INSTALL_DEPS" && install_deps ${{ matrix.clang }}
+      - name: test
+        run: |
+            export CC=clang-${{ matrix.clang }}
+            export CXX=clang++-${{ matrix.clang }}
+            export LD=lld-${{ matrix.clang }}
+            export AR=llvm-ar-${{ matrix.clang }}
+            cd c++ && bazel test --config=ci --config=opt //...
+  Linux-clang-arm64:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        clang: [20]
+        driver: [bazel-dbg]
+        include:
+          - driver: bazel-dbg
+            run-test: cd c++ && bazel test --config=ci --config=dbg //...
     steps:
       - uses: actions/checkout@v6
       - name: install dependencies
@@ -62,7 +96,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        clang: [18]
+        clang: [20]
         config: [asan]
     steps:
       - uses: actions/checkout@v6
@@ -72,7 +106,7 @@ jobs:
         run: |
             export CC=clang-${{ matrix.clang }}
             export CXX=clang++-${{ matrix.clang }}
-            cd c++ && bazel test --verbose_failures --test_output=errors -k --config=${{ matrix.config }} //...
+            cd c++ && bazel test --config=ci --config=${{ matrix.config }} //...
   MacOS:
     runs-on: macos-latest
     strategy:
@@ -144,4 +178,4 @@ jobs:
       - uses: actions/checkout@v6
       - name: test
         run: |
-            cd c++ && bazel test --verbose_failures --test_output=errors -k //...
+            cd c++ && bazel test --config=ci //...
