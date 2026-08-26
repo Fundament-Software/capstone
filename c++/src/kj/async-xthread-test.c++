@@ -29,6 +29,9 @@
 #include "mutex.h"
 #include <kj/test.h>
 
+#include <atomic>
+#include <thread>
+
 #if _WIN32
 #include <windows.h>
 #include "windows-sanity.h"
@@ -342,7 +345,7 @@ KJ_TEST("cancel cross-thread event while it runs") {
     }
 
     {
-      volatile bool called = false;
+      std::atomic<bool> called = false;
       Promise<uint> promise = exec->executeAsync([&]() -> kj::Promise<uint> {
         called = true;
         return kj::NEVER_DONE;
@@ -776,6 +779,9 @@ KJ_TEST("detached cross-thread event doesn't cause crash") {
   MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
   Own<PromiseFulfiller<void>> fulfiller;  // accessed only from the subthread
 
+  // Set once the detached event has begun executing on the subthread.
+  MutexGuarded<bool> eventStarted(false);
+
   Thread thread([&]() noexcept {
     KJ_XTHREAD_TEST_SETUP_LOOP;
 
@@ -805,6 +811,9 @@ KJ_TEST("detached cross-thread event doesn't cause crash") {
       }
 
       exec->executeAsync([&]() -> kj::Promise<void> {
+        // Signal that the event has started running.
+        *eventStarted.lockExclusive() = true;
+
         // Make sure other thread gets time to exit its EventLoop.
         delay();
         delay();
@@ -815,8 +824,9 @@ KJ_TEST("detached cross-thread event doesn't cause crash") {
         KJ_LOG(ERROR, e);
       });
 
-      // Give the other thread a chance to wake up and start working on the event.
-      delay();
+      // Wait until the event has started; destroying the loop while it was still queued would
+      // cancel it, so fulfill() would never run and the subthread would block forever.
+      eventStarted.lockExclusive().wait([](bool started) { return started; });
 
       // Now we'll destroy our EventLoop. That *should* cause detached promises to be destroyed,
       // thereby cancelling it, before disabling our own executor. However, at one point in the
@@ -1006,6 +1016,114 @@ KJ_TEST("cross-thread fulfiller canceled") {
 
     *done.lockExclusive() = true;
   })();
+}
+
+KJ_TEST("cross-thread fulfiller takes ownership after cancellation") {
+  KJ_XTHREAD_TEST_SETUP_LOOP;
+
+  auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
+  auto* fulfiller = paf.fulfiller.get();
+
+  // The relaxed isWaiting() load deliberately does not establish a happens-before edge. The
+  // CANCELED transition itself must publish the waiting thread's prior access to the promise node
+  // before the fulfilling thread takes ownership and deletes it.
+  kj::Thread thread([&]() noexcept {
+    while (fulfiller->isWaiting()) {
+      std::this_thread::yield();
+    }
+    fulfiller->fulfill();
+  });
+
+  paf.promise = nullptr;
+}
+
+KJ_TEST("cross-thread fulfiller isWaiting concurrent with cancellation") {
+  // `isWaiting()` is documented as a cross-thread operation. Race it against the ownership
+  // transfer which follows cancellation: the fulfiller observes CANCELED and deletes its target.
+  // The observer threads make it likely that one has loaded `target` immediately before that
+  // deletion. ASan then detects its subsequent access to `target->state`.
+  KJ_XTHREAD_TEST_SETUP_LOOP;
+
+  auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
+  auto* fulfiller = paf.fulfiller.get();
+
+#if KJ_HAS_COMPILER_FEATURE(thread_sanitizer) || defined(__SANITIZE_THREAD__)
+  // TSAN serializes atomic operations, so a large number of polling threads is extremely slow.
+  constexpr uint OBSERVER_COUNT = 4;
+#else
+  constexpr uint OBSERVER_COUNT = 64;
+#endif
+  std::atomic<uint> entered(0);
+  std::atomic<bool> start(false);
+  std::atomic<bool> cancel(false);
+  std::atomic<bool> stop(false);
+
+  Vector<Own<Thread>> observers;
+  for (uint i = 0; i < OBSERVER_COUNT; ++i) {
+    observers.add(kj::heap<Thread>([&]() noexcept {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+
+      // Ensure that every observer is actively polling before cancellation starts.
+      fulfiller->isWaiting();
+      entered.fetch_add(1, std::memory_order_release);
+      while (!stop.load(std::memory_order_acquire)) {
+        fulfiller->isWaiting();
+      }
+    }));
+  }
+
+  {
+    Thread fulfillThread([&]() noexcept {
+      while (!cancel.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      fulfiller->fulfill();
+    });
+
+    start.store(true, std::memory_order_release);
+    while (entered.load(std::memory_order_acquire) != OBSERVER_COUNT) {
+      std::this_thread::yield();
+    }
+
+    paf.promise = nullptr;
+    cancel.store(true, std::memory_order_release);
+
+    // `fulfill()` must atomically claim the target, see the canceled state, and delete it before
+    // it returns. Leaving this scope joins the thread, establishing that deletion is complete.
+  }
+  stop.store(true, std::memory_order_release);
+}
+
+KJ_TEST("cross-thread fulfiller isWaiting after cross-thread dispatch") {
+  KJ_XTHREAD_TEST_SETUP_LOOP;
+
+  auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
+  auto* fulfiller = paf.fulfiller.get();
+
+  // Coordinate using relaxed atomics so that observing `dispatched` does not itself establish a
+  // happens-before edge. isWaiting() is a cross-thread operation, so it must be safe even after
+  // the event loop has changed the promise's state to DISPATCHED.
+  std::atomic<bool> dispatched(false);
+  std::atomic<bool> checked(false);
+  Thread observer([&]() noexcept {
+    while (!dispatched.load(std::memory_order_relaxed)) {
+      std::this_thread::yield();
+    }
+    KJ_EXPECT(!fulfiller->isWaiting());
+    checked.store(true, std::memory_order_relaxed);
+  });
+
+  Thread fulfillThread([&]() noexcept {
+    fulfiller->fulfill();
+  });
+  paf.promise.wait(waitScope);
+
+  dispatched.store(true, std::memory_order_relaxed);
+  while (!checked.load(std::memory_order_relaxed)) {
+    std::this_thread::yield();
+  }
 }
 
 KJ_TEST("cross-thread fulfiller multiple fulfills") {

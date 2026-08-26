@@ -203,6 +203,8 @@ KJ_TEST("Exceptions propagate through layered coroutines") {
   KJ_EXPECT_THROW_RECOVERABLE(FAILED, simpleCoroutine(kj::mv(throwy)).wait(waitScope));
 }
 
+// GCC gets compilation errors with promise continuations in lambdas
+#if !(__GNUC__ && !__clang__)
 KJ_TEST("Exceptions before the first co_await don't escape, but reject the promise") {
   EventLoop loop;
   WaitScope waitScope(loop);
@@ -531,7 +533,7 @@ Promise<void> sendData(Promise<Own<NetworkAddress>> addressPromise) {
 Promise<String> receiveDataCoroutine(Own<ConnectionReceiver> listener) {
   auto server = co_await listener->accept();
   char buffer[4]{};
-  auto n = co_await server->read(kj::arrayPtr(buffer).asBytes(), 3);
+  auto n = co_await server->read(kj::asBytes(buffer), 3);
   KJ_EXPECT(3u == n);
   co_return heapString(buffer, n);
 }
@@ -878,6 +880,7 @@ KJ_TEST("KJ_TRY/KJ_CATCH inside try/catch with promise rejection in coroutines")
   auto result = testCoro().wait(waitScope);
   KJ_EXPECT(result == "kj:caught std:not-caught");
 }
+#endif  // !(__GNUC__ && !__clang__)
 
 }  // namespace
 }  // namespace kj

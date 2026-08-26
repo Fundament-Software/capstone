@@ -18,7 +18,6 @@ fn get_samples_dir() -> Result<PathBuf> {
     Ok(parent.join("c++").join("samples"))
 }
 
-#[should_panic]
 #[cfg(feature = "compiler")]
 #[test]
 fn test_address_book() {
@@ -50,5 +49,19 @@ fn test_calculator() -> Result<()> {
 #[test]
 fn test_id() -> Result<()> {
     capnp_sys::id();
+    Ok(())
+}
+
+#[cfg(feature = "compiler")]
+#[test]
+fn test_stream() -> Result<()> {
+    let path = get_samples_dir()?.join("stream-test.capnp");
+    let bytes = call(
+        [path.to_string_lossy()].into_iter(),
+        Vec::<String>::new().into_iter(),
+        Vec::<String>::new().into_iter(),
+        true,
+    )?;
+    assert_ne!(bytes.len(), 0);
     Ok(())
 }

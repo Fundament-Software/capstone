@@ -32,7 +32,28 @@ namespace capnp {
 
 FlatArrayMessageReader::FlatArrayMessageReader(
     kj::ArrayPtr<const word> array, ReaderOptions options)
-    : MessageReader(options), end(array.end()) {
+    : MessageReader(options) {
+  init(array);
+}
+
+FlatArrayMessageReader::FlatArrayMessageReader(
+    kj::ArrayPtr<const byte> bytes, ReaderOptions options)
+    : MessageReader(options) {
+  KJ_REQUIRE(bytes.size() % sizeof(word) == 0, "message must be a whole number of words");
+  auto wordCount = bytes.size() / sizeof(word);
+
+  if (reinterpret_cast<uintptr_t>(bytes.begin()) % sizeof(word) == 0) {
+    init(kj::arrayPtr(reinterpret_cast<const word*>(bytes.begin()), wordCount));
+  } else {
+    alignedCopy = kj::heapArray<word>(wordCount);
+    alignedCopy.asBytes().copyFrom(bytes);
+    init(alignedCopy);
+  }
+}
+
+void FlatArrayMessageReader::init(kj::ArrayPtr<const word> array) {
+  end = array.end();
+
   if (array.size() < 1) {
     // Assume empty message.
     return;
@@ -55,7 +76,7 @@ FlatArrayMessageReader::FlatArrayMessageReader(
   {
     uint segmentSize = table[1].get();
 
-    KJ_REQUIRE(array.size() >= offset + segmentSize,
+    KJ_REQUIRE(array.size() - offset >= segmentSize,
                "Message ends prematurely in first segment.") {
       return;
     }
@@ -70,7 +91,7 @@ FlatArrayMessageReader::FlatArrayMessageReader(
     for (uint i = 1; i < segmentCount; i++) {
       uint segmentSize = table[i + 1].get();
 
-      KJ_REQUIRE(array.size() >= offset + segmentSize, "Message ends prematurely.") {
+      KJ_REQUIRE(array.size() - offset >= segmentSize, "Message ends prematurely.") {
         moreSegments = nullptr;
         return;
       }
@@ -188,7 +209,7 @@ InputStreamMessageReader::InputStreamMessageReader(
   uint segmentCount = firstWord[0].get() + 1;
   uint segment0Size = firstWord[1].get();
 
-  size_t totalWords = segment0Size;
+  uint64_t totalWords = segment0Size;
 
   // Reject messages with too many segments for security reasons.
   // Use firstWord[0].get() here instead of segmentCount to catch overflow. The actual limit

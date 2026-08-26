@@ -63,6 +63,17 @@ int reservedSignal = SIGUSR1;
 bool tooLateToSetReserved = false;
 bool capturedChildExit = false;
 
+class ErrnoPreserver {
+public:
+  ErrnoPreserver(): saved(errno) {}
+  ~ErrnoPreserver() noexcept { restore(); }
+
+  void restore() const { errno = saved; }
+
+private:
+  int saved;
+};
+
 #if !KJ_USE_KQUEUE
 bool threadClaimedChildExits = false;
 #endif
@@ -80,6 +91,10 @@ thread_local UnixEventPort* threadEventPort = nullptr;
 }  // namespace
 
 void UnixEventPort::signalHandler(int, siginfo_t* siginfo, void*) noexcept {
+  // Signal handlers must preserve errno. In particular, ThreadSanitizer checks this even though
+  // this handler only runs while `epoll_pwait()` is active.
+  ErrnoPreserver errnoPreserver;
+
   // Since this signal handler is *only* called during `epoll_pwait()`, we aren't subject to the
   // usual signal-safety concerns. We can treat this more like a callback. So, we can just call
   // gotSignal() directly, no biggy.
@@ -107,6 +122,8 @@ static thread_local siginfo_t* threadCapture = nullptr;
 #endif
 
 void UnixEventPort::signalHandler(int, siginfo_t* siginfo, void*) noexcept {
+  ErrnoPreserver errnoPreserver;
+
 #if KJ_HAS_SIGTIMEDWAIT
   // This is never called because we use sigtimedwait() to dequeue the signal while it is still
   // blocked, without running the signal handler. However, if we don't register a handler at all,
@@ -160,6 +177,7 @@ thread_local SignalCapture* threadCapture = nullptr;
 }  // namespace
 
 void UnixEventPort::signalHandler(int, siginfo_t* siginfo, void*) noexcept {
+  ErrnoPreserver errnoPreserver;
   SignalCapture* capture = threadCapture;
   if (capture != nullptr) {
     capture->siginfo = *siginfo;
@@ -171,8 +189,10 @@ void UnixEventPort::signalHandler(int, siginfo_t* siginfo, void*) noexcept {
     // equivalent to `longjmp()` on Linux or `_longjmp()` on BSD/macOS. See comments on
     // SignalCapture::originalMask for explanation.
     pthread_sigmask(SIG_SETMASK, &capture->originalMask, nullptr);
+    errnoPreserver.restore();
     siglongjmp(capture->jumpTo, false);
 #else
+    errnoPreserver.restore();
     siglongjmp(capture->jumpTo, true);
 #endif
   }
@@ -195,8 +215,7 @@ void UnixEventPort::registerSignalHandler(int signum) {
   KJ_SYSCALL(pthread_sigmask(SIG_BLOCK, &mask, nullptr));
 
   // Register the signal handler which should be invoked when we explicitly unblock the signal.
-  struct sigaction action;
-  memset(&action, 0, sizeof(action));
+  struct sigaction action = {};
   action.sa_sigaction = &signalHandler;
   action.sa_flags = SA_SIGINFO;
 
@@ -420,8 +439,7 @@ UnixEventPort::UnixEventPort()
   epollFd = KJ_SYSCALL_FD(epoll_create1(EPOLL_CLOEXEC));
   eventFd = KJ_SYSCALL_FD(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
 
-  struct epoll_event event;
-  memset(&event, 0, sizeof(event));
+  struct epoll_event event = {};
   event.events = EPOLLIN;
   event.data.u64 = 0;
   KJ_SYSCALL(epoll_ctl(epollFd, EPOLL_CTL_ADD, eventFd, &event));
@@ -429,7 +447,7 @@ UnixEventPort::UnixEventPort()
   // Get the current signal mask, from which we'll compute the appropriate mask to pass to
   // epoll_pwait() on each loop. (We explicitly memset to 0 first to make sure we can compare
   // this against another mask with memcmp() for debug purposes.)
-  memset(&originalMask, 0, sizeof(originalMask));
+  originalMask = {};
   KJ_SYSCALL(sigprocmask(0, nullptr, &originalMask));
 }
 
@@ -442,8 +460,7 @@ UnixEventPort::~UnixEventPort() noexcept(false) {
 
 UnixEventPort::FdObserver::FdObserver(UnixEventPort& eventPort, int fd, uint flags)
     : eventPort(eventPort), fd(fd), flags(flags) {
-  struct epoll_event event;
-  memset(&event, 0, sizeof(event));
+  struct epoll_event event = {};
 
   if (flags & OBSERVE_READ) {
     event.events |= EPOLLIN | EPOLLRDHUP;
@@ -546,8 +563,7 @@ bool UnixEventPort::wait() {
 #ifdef KJ_DEBUG
   // In debug mode, verify the current signal mask matches the original.
   {
-    sigset_t currentMask;
-    memset(&currentMask, 0, sizeof(currentMask));
+    sigset_t currentMask = {};
     KJ_SYSCALL(sigprocmask(0, nullptr, &currentMask));
     if (kj::asBytes(currentMask) != kj::asBytes(originalMask)) {
       kj::Vector<kj::String> changes;
@@ -780,16 +796,14 @@ void UnixEventPort::updateNextTimerEvent(kj::Maybe<TimePoint> time) {
     tfd = timerFd.emplace(
         KJ_SYSCALL_FD(timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)));
 
-    struct epoll_event event;
-    memset(&event, 0, sizeof(event));
+    struct epoll_event event = {};
     event.events = EPOLLIN;
     event.data.u64 = 1;
     KJ_SYSCALL(epoll_ctl(epollFd, EPOLL_CTL_ADD, tfd, &event));
   }
 
   // Update timerfd's expiration time.
-  struct itimerspec ts;
-  memset(&ts, 0, sizeof(ts));
+  struct itimerspec ts = {};
   KJ_IF_SOME(t, time) {
     auto t2 = t - origin<TimePoint>();
     ts.it_value.tv_sec  = t2 / SECONDS;
@@ -1036,8 +1050,7 @@ public:
       KJ_SYSCALL(sigemptyset(&mask));
       KJ_SYSCALL(sigaddset(&mask, signum));
       siginfo_t result;
-      struct timespec timeout;
-      memset(&timeout, 0, sizeof(timeout));
+      struct timespec timeout = {};
 
       KJ_SYSCALL_HANDLE_ERRORS(sigtimedwait(&mask, &result, &timeout)) {
         case EAGAIN:
@@ -1065,8 +1078,7 @@ public:
       if (isset) {
         KJ_SYSCALL(sigfillset(&mask));
         KJ_SYSCALL(sigdelset(&mask, signum));
-        siginfo_t info;
-        memset(&info, 0, sizeof(info));
+        siginfo_t info = {};
         threadCapture = &info;
         KJ_DEFER(threadCapture = nullptr);
         int result = sigsuspend(&mask);
@@ -1233,8 +1245,7 @@ bool UnixEventPort::wait() {
 }
 
 bool UnixEventPort::poll() {
-  struct timespec timeout;
-  memset(&timeout, 0, sizeof(timeout));
+  struct timespec timeout = {};
   return doKqueueWait(&timeout);
 }
 
@@ -1423,8 +1434,7 @@ class UnixEventPort::PollContext {
 public:
   PollContext(UnixEventPort& port) {
     for (FdObserver* ptr = port.observersHead; ptr != nullptr; ptr = ptr->next) {
-      struct pollfd pollfd;
-      memset(&pollfd, 0, sizeof(pollfd));
+      struct pollfd pollfd = {};
       pollfd.fd = ptr->fd;
       pollfd.events = ptr->getEventMask();
       pollfds.add(pollfd);
@@ -1433,8 +1443,7 @@ public:
 
 #if KJ_USE_PIPE_FOR_WAKEUP
     {
-      struct pollfd pollfd;
-      memset(&pollfd, 0, sizeof(pollfd));
+      struct pollfd pollfd = {};
       pollfd.fd = port.wakePipeIn;
       pollfd.events = POLLIN;
       pollfds.add(pollfd);

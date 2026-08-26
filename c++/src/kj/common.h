@@ -224,6 +224,20 @@ typedef unsigned char byte;
 #define KJ_NOINLINE __attribute__((noinline))
 #endif
 
+#ifndef KJ_DISPOSE_ATTR
+#define KJ_DISPOSE_ATTR
+// Attribute applied to KJ's type-erased object-teardown dispatch helpers: Disposer::dispose(),
+// ArrayDisposer::dispose(), and PromiseDisposer::dispose(). By default this expands to nothing, so
+// these remain ordinary inlinable functions and existing embedders see no change.
+//
+// An embedder whose build instantiates these helpers at a very large number of call sites may
+// define KJ_DISPOSE_ATTR (typically to KJ_NOINLINE) to force the dispatch out-of-line. Because the
+// instantiations are largely identical, the linker can then fold them (e.g. via ICF) into a small
+// number of shared copies, substantially reducing code size on teardown paths -- at the cost of a
+// non-inlined call per disposal. Defining it does not change the meaning of the program, only
+// inlining/codegen.
+#endif
+
 #if defined(_MSC_VER) && !__clang__
 #define KJ_NORETURN(prototype) __declspec(noreturn) prototype
 #define KJ_UNUSED
@@ -519,22 +533,11 @@ struct DisallowConstCopy {
   // type that contains or inherits from a type that disallows const copies will also automatically
   // disallow const copies.  Hey, cool, that's exactly what we want.
 
-#if CAPNP_DEBUG_TYPES
-  // Alas! Declaring a defaulted non-const copy constructor tickles a bug which causes GCC and
-  // Clang to disagree on ABI, using different calling conventions to pass this type, leading to
-  // immediate segfaults. See:
-  //     https://bugs.llvm.org/show_bug.cgi?id=23764
-  //     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=58074
-  //
-  // Because of this, we can't use this technique. We guard it by CAPNP_DEBUG_TYPES so that it
-  // still applies to the Cap'n Proto developers during internal testing.
-
   DisallowConstCopy() = default;
   DisallowConstCopy(DisallowConstCopy&) = default;
   DisallowConstCopy(DisallowConstCopy&&) = default;
   DisallowConstCopy& operator=(DisallowConstCopy&) = default;
   DisallowConstCopy& operator=(DisallowConstCopy&&) = default;
-#endif
 };
 
 #if _MSC_VER && !defined(__clang__)
@@ -703,9 +706,17 @@ private:
 template<typename T> constexpr T&& mv(T& t) noexcept { return static_cast<T&&>(t); }
 template<typename T> constexpr T&& fwd(NoInfer<T>& t) noexcept { return static_cast<T&&>(t); }
 
-template<typename T> constexpr T cp(T& t) noexcept { return t; }
-template<typename T> constexpr T cp(const T& t) noexcept { return t; }
+template<typename T> constexpr T cp(T& t) noexcept { return T(t); }
+template<typename T> constexpr T cp(const T& t) noexcept { return T(t); }
 // Useful to force a copy, particularly to pass into a function that expects T&&.
+
+template <typename T>
+void swp(T& a, T& b) {
+  // Swap two values. Similar to std::swap. Using kj::swap collides with libc++ sources.
+  T tmp = kj::mv(a);
+  a = kj::mv(b);
+  b = kj::mv(tmp);
+}
 
 template <typename T, typename U, bool takeT, bool uOK = true> struct ChooseType_;
 template <typename T, typename U> struct ChooseType_<T, U, true, true> { typedef T Type; };
@@ -1247,6 +1258,50 @@ template <typename T, typename U>
 concept ConstructibleFrom = requires(U&& u) { T(kj::fwd<U>(u)); };
 // Concept: T has a constructor that accepts U&&.
 
+template <typename T, typename U>
+concept NoThrowConstructibleFrom = requires(U&& u) {
+  T(kj::fwd<U>(u));
+  requires noexcept(new ((void*)nullptr, _::PlacementNew()) T(kj::fwd<U>(u)));
+};
+// Concept: T has a noexcept constructor that accepts U&&.
+
+}  // namespace _ (private)
+
+template <typename T, typename U = T>
+constexpr bool isNoThrowMoveConstructible() {
+  // like std::is_nothrow_move_constructible but that ignores noexcept(false) destructors
+  if constexpr (isReference<T>()) return true;
+  else return _::NoThrowConstructibleFrom<T, U>;
+}
+
+template <typename T>
+concept Cloneable = requires(T& value) { value.clone(); };
+// Concept: `T` has a `clone()` member callable on a `T&`.
+// Note that this supports mutable cloning because we do not hide interior mutability like
+// Rust does.
+// `Cloneable<const T>` represent a const-cloneable object which is similar to Rust `Clone`.
+
+template <typename T>
+concept Copyable = _::ConstructibleFrom<T, T&>;
+// Concept: T has a copy constructor callable on a `T&`.
+// Supports mutable copying similar to `Cloneable<T>`.
+// Unlike Rust this does not represent trivial to copy object, but simply an object with available
+// copy constructor.
+// By KJ conventions we avoid heap allocations in copy constructors. Despite of this copying a
+// complicated object might still be expensive.
+
+namespace _ {  // private
+
+template <typename T>
+auto copyOrClone(T& value) requires Cloneable<T> {
+  return value.clone();
+}
+
+template <typename T>
+Decay<T> copyOrClone(T& value) requires (!Cloneable<T> && Copyable<T>) {
+  return Decay<T>(value);
+}
+
 }  // namespace _ (private)
 
 template <typename T>
@@ -1298,7 +1353,11 @@ public:
       noexcept(noexcept(instance<T&>().~T()))
 #endif
   {
-    destroy();
+    if constexpr (noexcept(instance<T&>().~T())) {
+      if (isSet) { dtor(value); }
+    } else {
+      destroy();
+    }
   }
 
   inline T& operator*() & { return value; }
@@ -1415,7 +1474,7 @@ private:
     }
   };
 
-  bool isSet;
+  bool isSet = false;
 
 #if _MSC_VER && !defined(__clang__)
 #pragma warning(push)
@@ -1507,7 +1566,11 @@ public:
       noexcept(noexcept(instance<T&>().~T()))
 #endif
   {
-    destroy();
+    if constexpr (noexcept(instance<T&>().~T())) {
+      if (!isNone(value)) { dtor(value); }
+    } else {
+      destroy();
+    }
   }
 
   inline T& operator*() & { return value; }
@@ -1796,15 +1859,15 @@ class Maybe {
 
 public:
   Maybe(): ptr(nullptr) {}
-  Maybe(T&& t): ptr(kj::mv(t)) {}
+  Maybe(T&& t) noexcept(isNoThrowMoveConstructible<T>()): ptr(kj::mv(t)) {}
   Maybe(T& t): ptr(t) {}
   Maybe(const T& t): ptr(t) {}
-  Maybe(Maybe&& other): ptr(kj::mv(other.ptr)) {}
+  Maybe(Maybe&& other) noexcept(isNoThrowMoveConstructible<T>()): ptr(kj::mv(other.ptr)) {}
   Maybe(const Maybe& other): ptr(other.ptr) {}
   Maybe(Maybe& other): ptr(other.ptr) {}
 
   template <typename U>
-  Maybe(Maybe<U>&& other) {
+  Maybe(Maybe<U>&& other) noexcept(isNoThrowMoveConstructible<T, U>()) {
     KJ_IF_SOME(val, kj::mv(other)) {
       ptr.emplaceInit(kj::mv(val));
     }
@@ -1827,7 +1890,7 @@ public:
     requires _::HasConvertingConstructorFlag<T> &&  // Only when MaybeTraits<T> opts in
              _::ConstructibleFrom<T, U>
   explicit(!canConvert<U&&, T>())  // Implicit when U→T is implicit, explicit otherwise
-  Maybe(U&& value): ptr(kj::fwd<U>(value)) {}
+  Maybe(U&& value) noexcept(isNoThrowMoveConstructible<T, U>()): ptr(kj::fwd<U>(value)) {}
   // Converting constructor: allows constructing Maybe<T> from a U that is convertible to T.
   // Only exists when MaybeTraits<T>::convertingConstructor is true.
   // Implicit when U is implicitly convertible to T, explicit otherwise.
@@ -2047,6 +2110,34 @@ public:
     }
   }
 
+  T& assertSome() & {
+    // Returns the contained value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return *ptr;
+  }
+  const T& assertSome() const & {
+    // Returns the contained value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return *ptr;
+  }
+  T assertSome() && {
+    // Returns and removes the contained value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    T result(kj::mv(*ptr));
+    ptr = nullptr;
+    return result;
+  }
+  const T&& assertSome() const && {
+    // Returns the contained value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return kj::mv(*ptr);
+  }
+
+  void assertNone() const {
+    // Verifies that the Maybe does not contain a value.
+    KJ_IREQUIRE(ptr == nullptr, "expected Maybe<> to be none");
+  }
+
   T& orDefault(T& defaultValue) & {
     if (ptr == nullptr) {
       return defaultValue;
@@ -2113,6 +2204,28 @@ public:
       return lazyDefaultValue();
     } else {
       return kj::mv(*ptr);
+    }
+  }
+
+  auto clone() requires Cloneable<T> {
+    // Clones the value if it is not none.
+    // Returns Maybe<decltype(t.clone())>
+    using U = decltype(instance<T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      return Maybe<U>(ptr->clone());
+    }
+  }
+
+  auto clone() const requires Cloneable<const T> {
+    // Clones the value if it is not none.
+    // Returns Maybe<decltype(t.clone())>
+    using U = decltype(instance<const T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      return Maybe<U>(ptr->clone());
     }
   }
 
@@ -2184,14 +2297,14 @@ public:
   // to override the move constructor, and if we override the move constructor then we must define
   // the copy constructor here.
 
-  inline constexpr Maybe(Maybe&& other): ptr(other.ptr) { other.ptr = nullptr; }
+  inline constexpr Maybe(Maybe&& other) noexcept: ptr(other.ptr) { other.ptr = nullptr; }
 
   template <typename U>
   inline constexpr Maybe(Maybe<U&>& other): ptr(other.ptr) {}
   template <typename U>
   inline constexpr Maybe(const Maybe<U&>& other): ptr(const_cast<const U*>(other.ptr)) {}
   template <typename U>
-  inline constexpr Maybe(Maybe<U&>&& other): ptr(other.ptr) { other.ptr = nullptr; }
+  inline constexpr Maybe(Maybe<U&>&& other) noexcept: ptr(other.ptr) { other.ptr = nullptr; }
   template <typename U>
   inline constexpr Maybe(const Maybe<U&>&& other) = delete;
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
@@ -2225,6 +2338,32 @@ public:
 
   inline bool operator==(kj::None) const { return ptr == nullptr; }
 
+  T& assertSome() & {
+    // Returns the referenced value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return *ptr;
+  }
+  const T& assertSome() const & {
+    // Returns the referenced value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return *ptr;
+  }
+  T& assertSome() && {
+    // Returns the referenced value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return *ptr;
+  }
+  const T& assertSome() const && {
+    // Returns the referenced value. The Maybe must not be none.
+    KJ_IREQUIRE(ptr != nullptr, "null Maybe<> dereference");
+    return *ptr;
+  }
+
+  void assertNone() const {
+    // Verifies that the Maybe does not contain a reference.
+    KJ_IREQUIRE(ptr == nullptr, "expected Maybe<> to be none");
+  }
+
   T& orDefault(T& defaultValue) {
     if (ptr == nullptr) {
       return defaultValue;
@@ -2237,6 +2376,27 @@ public:
       return defaultValue;
     } else {
       return *ptr;
+    }
+  }
+
+  auto clone() requires Cloneable<T> {
+    // Clones the value (not a reference) if reference is not none.
+    using U = decltype(instance<T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      return Maybe<U>(ptr->clone());
+    }
+  }
+
+  auto clone() const requires Cloneable<const T> {
+    // Clones the value (not a reference) if reference is not none.
+    using U = decltype(instance<const T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      const T& ref = *ptr;
+      return Maybe<U>(ref.clone());
     }
   }
 
@@ -2357,6 +2517,16 @@ struct Mapper<Maybe<T>> {
 template <typename T>
 class Array;
 
+namespace _ {  // private
+class SplitIteratorEnd;
+
+template <typename T>
+class SplitIterator;
+
+template <typename T>
+class SplitIterable;
+}  // namespace _ (private)
+
 template <typename T>
 class ArrayPtr: public DisallowConstCopyIfNotConst<T> {
   // A pointer to an array.  Includes a size.  Like any pointer, it doesn't own the target data,
@@ -2476,14 +2646,16 @@ public:
     return ArrayPtr(ptr + start, size_ - start);
   }
   inline constexpr bool startsWith(const ArrayPtr<const T>& other) const {
-    return other.size() <= size_ && slice(0, other.size()) == other;
+    return other.size() <= size_ && first(other.size()) == other;
   }
   inline constexpr bool endsWith(const ArrayPtr<const T>& other) const {
     return other.size() <= size_ && slice(size_ - other.size(), size_) == other;
   }
 
+  // NOLINTBEGIN(*-arrayptr-slice-zero)
   inline constexpr ArrayPtr first(size_t count) { return slice(0, count); }
   inline constexpr ArrayPtr<const T> first(size_t count) const { return slice(0, count); }
+  // NOLINTEND(*-arrayptr-slice-zero)
 
   inline Maybe<size_t> findFirst(const T& match) const {
     for (size_t i = 0; i < size_; i++) {
@@ -2501,6 +2673,10 @@ public:
     }
     return kj::none;
   }
+
+  inline auto split(T delim) { return _::SplitIterable<T>(*this, kj::mv(delim)); }
+  inline auto split(T delim) const { return _::SplitIterable<const T>(asConst(), kj::mv(delim)); }
+  // Returns iterator of segments (ArrayPtr<T>)
 
   constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const {
     // Reinterpret the array as a byte array. This is explicitly legal under C++ aliasing
@@ -2589,6 +2765,10 @@ public:
   // Syntax sugar for invoking asImpl(U*, const ArrayPtr&).
   // Used to chain conversion calls rather than wrap with function.
 
+  auto clone() requires (Cloneable<T> || Copyable<T>);
+  auto clone() const requires (Cloneable<const T> || Copyable<const T>);
+  // Deep-clone or copy into a heap-owned array.
+
   inline void fill(T t) {
     // Fill the area by copying t over every element.
 
@@ -2621,6 +2801,22 @@ public:
     for (size_t s = size_, i = 0; i < s; i++) { dst[i] = src[i]; }
   }
 
+  inline void write(kj::ArrayPtr<const T> other) {
+    // Copy data to the head of this pointer, then advance past the copied data.
+    // Out-of-bounds exception is raised if data does not fit.
+    // NOLINTNEXTLINE(*-arrayptr-first-copyfrom)
+    first(other.size()).copyFrom(other); // first will do a bounds check
+    ptr += other.size();
+    size_ -= other.size();
+  }
+
+  inline void write(kj::ArrayPtr<const kj::ArrayPtr<const T>> pieces) {
+    // Copy pieces of data to the head of this pointer, then advancing past the copied data.
+    // Pieces are bound-checked individually, i.e. the data can be partially written when raising
+    // an out-of-bounds exception.
+    for (auto piece: pieces) { write(piece); }
+  }
+
 private:
   T* ptr;
   size_t size_;
@@ -2635,8 +2831,69 @@ private:
   }
 };
 
+namespace _ {  // private
+
+class SplitIteratorEnd {};
+
+template <typename T>
+class SplitIterator {
+public:
+  inline SplitIterator(ArrayPtr<T> array, T delim) : array(array), end(0), delim(kj::mv(delim)) {
+    nextSegment();
+  }
+
+  inline ArrayPtr<T> operator*() { return array.first(end); }
+
+  inline SplitIterator& operator++() {
+    if (end == array.size()) {
+      end = array.size() + 1;
+    } else {
+      array = array.slice(end + 1);
+      nextSegment();
+    }
+    return *this;
+  }
+
+  inline bool operator==(const SplitIterator& other) const {
+    return array == other.array && end == other.end;
+  }
+  inline bool operator==(SplitIteratorEnd) const { return end == array.size() + 1; }
+
+private:
+  ArrayPtr<T> array;
+  // The remaining suffix starting at the current segment.
+  size_t end;
+  // Delimiter index, array.size() for the final segment, or array.size() + 1 when exhausted.
+  
+  const T delim;
+
+  inline void nextSegment() {
+    KJ_IF_SOME(index, array.findFirst(delim)) {
+      end = index;
+    } else {
+      end = array.size();
+    }
+  }
+};
+
+template <typename T>
+class SplitIterable {
+public:
+  inline SplitIterable(ArrayPtr<T> array, T&& delim) : array(array), delim(kj::mv(delim)) {}
+  inline SplitIterator<T> begin() { return SplitIterator<T>(array, delim); }
+  inline SplitIterator<const T> begin() const { return SplitIterator<const T>(array.asConst(), delim); }
+  inline SplitIteratorEnd end() const { return SplitIteratorEnd(); }
+
+private:
+  ArrayPtr<T> array;
+  const T delim;
+};
+
+}  // namespace _ (private)
+
 template <>
 inline Maybe<size_t> ArrayPtr<const char>::findFirst(const char& c) const {
+  if (size_ == 0) return kj::none;
   const char* pos = reinterpret_cast<const char*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2647,6 +2904,7 @@ inline Maybe<size_t> ArrayPtr<const char>::findFirst(const char& c) const {
 
 template <>
 inline Maybe<size_t> ArrayPtr<char>::findFirst(const char& c) const {
+  if (size_ == 0) return kj::none;
   char* pos = reinterpret_cast<char*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2657,6 +2915,7 @@ inline Maybe<size_t> ArrayPtr<char>::findFirst(const char& c) const {
 
 template <>
 inline Maybe<size_t> ArrayPtr<const byte>::findFirst(const byte& c) const {
+  if (size_ == 0) return kj::none;
   const byte* pos = reinterpret_cast<const byte*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2667,6 +2926,7 @@ inline Maybe<size_t> ArrayPtr<const byte>::findFirst(const byte& c) const {
 
 template <>
 inline Maybe<size_t> ArrayPtr<byte>::findFirst(const byte& c) const {
+  if (size_ == 0) return kj::none;
   byte* pos = reinterpret_cast<byte*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2693,7 +2953,7 @@ inline constexpr ArrayPtr<T> arrayPtr(T* begin KJ_LIFETIMEBOUND, T* end KJ_LIFET
 template <typename T>
 inline constexpr ArrayPtr<T> arrayPtr(T& t KJ_LIFETIMEBOUND) {
   // Construct ArrayPtr pointing to a single object instance.
-  return arrayPtr(&t, 1);
+  return arrayPtr(&t, 1); //NOLINT(*-arrayptr-singleton)
 }
 
 template <typename T, size_t s>
@@ -2704,7 +2964,7 @@ inline constexpr ArrayPtr<T> arrayPtr(T (&arr)[s]) {
 
 template <typename... Params>
 auto asBytes(Params&&... params) {
-  return kj::arrayPtr(kj::fwd<Params>(params)...).asBytes();
+  return kj::arrayPtr(kj::fwd<Params>(params)...).asBytes(); // NOLINT(*-arrayptr-as-bytes)
 }
 
 // =======================================================================================

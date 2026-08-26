@@ -9,6 +9,8 @@ mod ffi {
             files: &[String],
             imports: &[String],
             prefixes: &[String],
+            memoryFilesData: &[String],
+            memoryFilesPaths: &[String],
             standard_import: bool,
         ) -> Result<Vec<u8>>;
 
@@ -27,10 +29,35 @@ pub fn call(
     let import_list: Vec<String> = imports.map(|e| e.as_ref().to_string()).collect();
     let prefix_list: Vec<String> = prefixes.map(|e| e.as_ref().to_string()).collect();
 
+    let memoryFilePaths: Vec<String> = [
+        "capnp/c++.capnp",
+        "capnp/persistent.capnp",
+        "capnp/rpc.capnp",
+        "capnp/rpc-twoparty.capnp",
+        "capnp/schema.capnp",
+        "capnp/stream.capnp",
+    ]
+    .iter()
+    .map(|e| e.to_string())
+    .collect();
+    let memoryFileData: Vec<String> = [
+        include_str!("c++.capnp"),
+        include_str!("persistent.capnp"),
+        include_str!("rpc.capnp"),
+        include_str!("rpc-twoparty.capnp"),
+        include_str!("schema.capnp"),
+        include_str!("stream.capnp"),
+    ]
+    .iter()
+    .map(|e| e.to_string())
+    .collect();
+
     ffi::command(
         file_list.as_slice(),
         import_list.as_slice(),
         prefix_list.as_slice(),
+        memoryFileData.as_slice(),
+        memoryFilePaths.as_slice(),
         standard_import,
     )
 }

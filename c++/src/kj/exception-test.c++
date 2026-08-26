@@ -25,10 +25,28 @@
 #include <kj/compat/gtest.h>
 #include <stdexcept>
 #include <stdint.h>
+#include <signal.h>
 
 namespace kj {
 namespace _ {  // private
 namespace {
+
+#if !_WIN32
+void traceFromSignal(int) {
+  void* traceSpace[32]{};
+  getStackTrace(traceSpace, 0);
+}
+
+KJ_TEST("crash handler stack trace is signal-safe") {
+  // The test runner installs the crash handler, which must initialize getStackTrace() up front.
+  struct sigaction action = {};
+  action.sa_handler = &traceFromSignal;
+  KJ_SYSCALL(sigaction(SIGUSR1, &action, nullptr));
+
+  // TSan reports any allocation made by getStackTrace() while handling this signal.
+  KJ_SYSCALL(raise(SIGUSR1));
+}
+#endif
 
 TEST(Exception, TrimSourceFilename) {
 #if _WIN32
@@ -289,7 +307,7 @@ KJ_TEST("exception details") {
   KJ_EXPECT(kj::str(KJ_ASSERT_NONNULL(e.getDetail(456)).asChars()) == "bar");
   KJ_EXPECT(e.getDetail(789) == kj::none);
 
-  kj::Exception e2 = kj::cp(e);
+  kj::Exception e2 = e.clone();
   KJ_EXPECT(kj::str(KJ_ASSERT_NONNULL(e2.getDetail(123)).asChars()) == "foo");
   KJ_EXPECT(kj::str(KJ_ASSERT_NONNULL(e2.getDetail(456)).asChars()) == "bar");
   KJ_EXPECT(e2.getDetail(789) == kj::none);
@@ -328,14 +346,14 @@ KJ_TEST("Maybe<Exception> move-assignment is safe when this owns other") {
   KJ_EXPECT(KJ_ASSERT_NONNULL(outer).getDescription() == "inner exception");
 }
 
-KJ_TEST("copy constructor") {
+KJ_TEST("clone") {
   auto e = new kj::Exception(kj::Exception::Type::FAILED, kj::str("src/bar.cc"),
                              35, kj::str("test_exception"));
   KJ_EXPECT(e->getFile() == "bar.cc"_kj);
   KJ_EXPECT(e->getLine() == 35);
   KJ_EXPECT(e->getDescription() == "test_exception"_kj);
 
-  kj::Exception e1(*e);
+  auto e1 = e->clone();
   delete e;
 
   KJ_EXPECT(e1.getFile() == "bar.cc"_kj);
@@ -642,6 +660,32 @@ KJ_TEST("Maybe<Exception> niche optimization") {
     m = kj::none;
     KJ_EXPECT(m == kj::none);
   }
+}
+
+KJ_TEST("KJ_STRINGIFY(Exception::Type) handles out-of-range values") {
+  // Valid types stringify correctly.
+  KJ_EXPECT(kj::str(kj::Exception::Type::FAILED) == "failed");
+  KJ_EXPECT(kj::str(kj::Exception::Type::OVERLOADED) == "overloaded");
+  KJ_EXPECT(kj::str(kj::Exception::Type::DISCONNECTED) == "disconnected");
+  KJ_EXPECT(kj::str(kj::Exception::Type::UNIMPLEMENTED) == "unimplemented");
+
+  // Out-of-range type must not crash; should return "failed".
+  auto bogus = static_cast<kj::Exception::Type>(99);
+  KJ_EXPECT(kj::str(bogus) == "failed");
+
+  // Maximum uint16 value (worst-case wire input from capnp enum).
+  auto maxBogus = static_cast<kj::Exception::Type>(0xFFFF);
+  KJ_EXPECT(kj::str(maxBogus) == "failed");
+}
+
+KJ_TEST("Exception with out-of-range type stringifies safely") {
+  // Constructing a kj::Exception with an invalid type (e.g. from an unchecked wire cast)
+  // must not crash when the exception is stringified.
+  kj::Exception e(static_cast<kj::Exception::Type>(0xFFFF),
+                  "test.c++", 42, kj::heapString("bogus type test"));
+  auto s = kj::str(e);
+  KJ_ASSERT(strstr(s.cStr(), "failed") != nullptr, s);
+  KJ_ASSERT(strstr(s.cStr(), "bogus type test") != nullptr, s);
 }
 
 }  // namespace

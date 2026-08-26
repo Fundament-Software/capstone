@@ -63,7 +63,7 @@ bool MessageReader::isCanonical() {
 
   _::SegmentReader *segment = arena()->tryGetSegment(_::SegmentId(0));
 
-  if (segment == NULL) {
+  if (segment == nullptr) {
     // The message has no segments
     return false;
   }
@@ -168,7 +168,7 @@ Orphanage MessageBuilder::getOrphanage() {
 bool MessageBuilder::isCanonical() {
   _::SegmentReader *segment = getRootSegment();
 
-  if (segment == NULL) {
+  if (segment == nullptr) {
     // The message has no segments
     return false;
   }
@@ -235,11 +235,11 @@ MallocMessageBuilder::~MallocMessageBuilder() noexcept(false) {
       if (segments.size() > 0) {
         KJ_ASSERT(segments[0].begin() == firstSegment,
             "First segment in getSegmentsForOutput() is not the first segment allocated?");
-        memset(firstSegment, 0, segments[0].size() * sizeof(word));
+        kj::asBytes(static_cast<word*>(firstSegment), segments[0].size()).fill(0);
       }
     }
 
-    for (void* ptr: moreSegments) {
+    for (word* ptr: moreSegments) {
       free(ptr);
     }
   }
@@ -252,7 +252,7 @@ kj::ArrayPtr<word> MallocMessageBuilder::allocateSegment(uint minimumSize) {
       "MallocMessageBuilder nextSize out of bounds.");
 
   if (!returnedFirstSegment && !ownFirstSegment) {
-    kj::ArrayPtr<word> result = kj::arrayPtr(reinterpret_cast<word*>(firstSegment), nextSize);
+    kj::ArrayPtr<word> result = kj::arrayPtr(firstSegment, nextSize);
     if (result.size() >= minimumSize) {
       returnedFirstSegment = true;
       return result;
@@ -265,7 +265,7 @@ kj::ArrayPtr<word> MallocMessageBuilder::allocateSegment(uint minimumSize) {
 
   uint size = kj::max(minimumSize, nextSize);
 
-  void* result = calloc(size, sizeof(word));
+  word* result = reinterpret_cast<word*>(calloc(size, sizeof(word)));
   if (result == nullptr) {
     KJ_FAIL_SYSCALL("calloc(size, sizeof(word))", ENOMEM, size);
   }
@@ -286,7 +286,7 @@ kj::ArrayPtr<word> MallocMessageBuilder::allocateSegment(uint minimumSize) {
     }
   }
 
-  return kj::arrayPtr(reinterpret_cast<word*>(result), size);
+  return kj::arrayPtr(result, size);
 }
 
 // -------------------------------------------------------------------

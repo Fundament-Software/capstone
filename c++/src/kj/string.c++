@@ -146,10 +146,11 @@ String heapString(size_t size) {
 
 String heapString(const char* value, size_t size) {
   char* buffer = _::HeapArrayDisposer::allocate<char>(size + 1);
+  auto result = kj::arrayPtr(buffer, size + 1);
   if (size != 0u) {
-    memcpy(buffer, value, size);
+    result.write(kj::arrayPtr(value, size));
   }
-  buffer[size] = '\0';
+  result[0] = '\0';
   return String(buffer, size, _::HeapArrayDisposer::instance);
 }
 
@@ -342,7 +343,7 @@ static inline bool IsValidFloatChar(char c) {
 void DelocalizeRadix(char* buffer) {
   // Fast check:  if the buffer has a normal decimal point, assume no
   // translation is needed.
-  if (strchr(buffer, '.') != NULL) return;
+  if (strchr(buffer, '.') != nullptr) return;
 
   // Find the first unknown character.
   while (IsValidFloatChar(*buffer)) ++buffer;
@@ -371,7 +372,7 @@ void RemovePlus(char* buffer) {
 
   for (;;) {
     buffer = strchr(buffer, '+');
-    if (buffer == NULL) {
+    if (buffer == nullptr) {
       return;
     }
     memmove(buffer, buffer + 1, strlen(buffer + 1) + 1);
@@ -436,7 +437,7 @@ char* DoubleToBuffer(double value, char* buffer) {
   // of a double.  This long double may have extra bits that make it compare
   // unequal to "value" even though it would be exactly equal if it were
   // truncated to a double.
-  volatile double parsed_value = strtod(buffer, NULL);
+  volatile double parsed_value = strtod(buffer, nullptr);
   if (parsed_value != value) {
     int snprintf_result2 KJ_UNUSED =
       snprintf(buffer, kDoubleToBufferSize, "%.*g", DBL_DIG+2, value);
@@ -546,7 +547,7 @@ double NoLocaleStrtod(const char* text, char** original_endptr) {
 
   char* temp_endptr;
   double result = strtod(text, &temp_endptr);
-  if (original_endptr != NULL) *original_endptr = temp_endptr;
+  if (original_endptr != nullptr) *original_endptr = temp_endptr;
   if (*temp_endptr != '.') return result;
 
   // Parsing halted on a '.'.  Perhaps we're in a different locale?  Let's
@@ -560,7 +561,7 @@ double NoLocaleStrtod(const char* text, char** original_endptr) {
       (temp_endptr - text)) {
     // This attempt got further, so replacing the decimal must have helped.
     // Update original_endptr to point at the right location.
-    if (original_endptr != NULL) {
+    if (original_endptr != nullptr) {
       // size_diff is non-zero if the localized radix has multiple bytes.
       int size_diff = localized.size() - strlen(text);
       // const_cast is necessary to match the strtod() interface.

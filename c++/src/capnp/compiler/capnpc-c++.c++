@@ -1583,7 +1583,7 @@ namespace capnp
             uint32_t mask;
             float value = defaultBody.getFloat32();
             static_assert(sizeof(mask) == sizeof(value), "bug");
-            memcpy(&mask, &value, sizeof(mask));
+            kj::asBytes(mask).copyFrom(kj::asBytes(value));
             defaultMask = kj::str(mask, "u");
           }
           break;
@@ -1595,7 +1595,7 @@ namespace capnp
             uint64_t mask;
             double value = defaultBody.getFloat64();
             static_assert(sizeof(mask) == sizeof(value), "bug");
-            memcpy(&mask, &value, sizeof(mask));
+            kj::asBytes(mask).copyFrom(kj::asBytes(value));
             defaultMask = kj::str(mask, "ull");
           }
           break;

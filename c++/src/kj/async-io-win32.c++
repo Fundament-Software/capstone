@@ -117,7 +117,7 @@ int win32Socketpair(SOCKET socks[2]) {
   if (listener == -1)
     return SOCKET_ERROR;
 
-  memset(&a, 0, sizeof(a));
+  a = {};
   a.inaddr.sin_family = AF_INET;
   a.inaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.inaddr.sin_port = 0;
@@ -129,7 +129,7 @@ int win32Socketpair(SOCKET socks[2]) {
     if  (bind(listener, &a.addr, sizeof(a.inaddr)) == SOCKET_ERROR)
       break;
 
-    memset(&a, 0, sizeof(a));
+    a = {};
     if  (getsockname(listener, &a.addr, &addrlen) == SOCKET_ERROR)
       break;
     // win32 getsockname may only set the port number, p=0.0005.
@@ -818,6 +818,38 @@ Promise<Array<SocketAddress>> SocketAddress::lookupHost(
 
 // =======================================================================================
 
+bool isTransientAcceptError(DWORD error) {
+  // AcceptEx() may fail because the listener is broken, or because the connection it was accepting
+  // is: a client that completes the handshake and then resets before the server gets around to
+  // accepting leaves a dead entry in the queue, and that is what surfaces here. The latter says
+  // nothing about the listener's health, so accept() must take the next connection rather than
+  // fail -- ConnectionReceiver::accept() reports only permanent errors. Telling the two apart is
+  // the job of this function, and as in the Unix implementation it's hard to say exactly which
+  // codes mean which, so we've made a guess.
+  //
+  // Both Win32 and Winsock spellings appear because an overlapped completion may report either.
+  // ERROR_OPERATION_ABORTED is deliberately absent -- that means the operation was cancelled,
+  // which must propagate -- as are WSAENOTSOCK and WSAEINVAL, which indicate a genuinely broken
+  // listener.
+  switch (error) {
+    case ERROR_NETNAME_DELETED:
+    case ERROR_CONNECTION_ABORTED:
+    case ERROR_SEM_TIMEOUT:
+    case WSAECONNRESET:
+    case WSAECONNABORTED:
+    case WSAETIMEDOUT:
+    case WSAENETDOWN:
+    case WSAENETRESET:
+    case WSAEHOSTDOWN:
+    case WSAEHOSTUNREACH:
+    case WSAENETUNREACH:
+      return true;
+
+    default:
+      return false;
+  }
+}
+
 class FdConnectionReceiver final: public ConnectionReceiver, public OwnedFd {
 public:
   FdConnectionReceiver(Win32EventPort& eventPort, SOCKET fd,
@@ -858,6 +890,10 @@ public:
         (Win32EventPort::IoResult ioResult) mutable
         -> Promise<Own<AsyncIoStream>> {
       if (ioResult.errorCode != ERROR_SUCCESS) {
+        if (isTransientAcceptError(ioResult.errorCode)) {
+          // The queued connection died before we could take it. Move on to the next one.
+          return accept();
+        }
         KJ_FAIL_WIN32("AcceptEx()", ioResult.errorCode) { break; }
       } else {
         SOCKET me = fd;

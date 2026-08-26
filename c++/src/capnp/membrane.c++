@@ -22,6 +22,10 @@
 #include "membrane.h"
 #include <kj/debug.h>
 
+#if !KJ_NO_RTTI
+#include <typeinfo>
+#endif
+
 namespace capnp {
 
 namespace {
@@ -535,6 +539,14 @@ public:
     return kj::none;
   }
 
+#if !KJ_NO_RTTI
+  void debugInfo(kj::Vector<kj::ConstString>& chain) override {
+    auto& policyRef = *policy;  // avoid stupid compiler warning about side effects
+    chain.add(kj::str(typeid(policyRef).name()));
+    inner->debugInfo(chain);
+  }
+#endif
+
 private:
   kj::Own<ClientHook> inner;
   kj::Own<MembranePolicy> policy;
@@ -622,6 +634,17 @@ _::OrphanBuilder copyOutOfMembrane(ListReader from, Orphanage to,
 }
 
 }  // namespace _ (private)
+
+AnyPointer::Pipeline membranePipeline(AnyPointer::Pipeline inner, kj::Own<MembranePolicy> policy) {
+  return AnyPointer::Pipeline(kj::refcounted<MembranePipelineHook>(
+      PipelineHook::from(kj::mv(inner)), kj::mv(policy), false));
+}
+
+AnyPointer::Pipeline reverseMembranePipeline(
+    AnyPointer::Pipeline inner, kj::Own<MembranePolicy> policy) {
+  return AnyPointer::Pipeline(kj::refcounted<MembranePipelineHook>(
+      PipelineHook::from(kj::mv(inner)), kj::mv(policy), true));
+}
 
 }  // namespace capnp
 

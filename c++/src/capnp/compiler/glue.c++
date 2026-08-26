@@ -17,7 +17,7 @@ class ErrorImpl : public kj::Exception, public std::exception
 {
 public:
   inline ErrorImpl(Exception &&other) : Exception(kj::mv(other)) {}
-  inline ErrorImpl(const ErrorImpl &self) : Exception(self) {}
+  inline ErrorImpl(const ErrorImpl &self) = delete;
   ~ErrorImpl() noexcept override {}
 
   const char *what() const noexcept override
@@ -35,6 +35,7 @@ class Glue final : public GlobalErrorReporter
   ModuleLoader loader;
   Compiler compiler;
   kj::Own<kj::Filesystem> disk;
+  kj::Own<const kj::Directory> memoryDir;
   kj::HashMap<kj::Path, std::pair<kj::Own<const kj::ReadableDirectory>, bool>> sourceDirectories;
   kj::HashMap<const kj::ReadableDirectory *, kj::String> dirPrefixes;
   bool addStandardImportPaths;
@@ -62,11 +63,20 @@ class Glue final : public GlobalErrorReporter
   virtual bool hadErrors() { return !errors.empty(); }
 
 public:
-  Glue(bool addStandardImports) : disk(kj::newDiskFilesystem()), loader(*this), addStandardImportPaths(addStandardImports) {}
+  Glue(bool addStandardImports) : disk(kj::newDiskFilesystem()), memoryDir(kj::newInMemoryDirectory(kj::nullClock())), loader(*this), addStandardImportPaths(addStandardImports)
+  {
+    loader.addImportPath(*memoryDir);
+  }
 
   void throwErrors(const char *file, int line)
   {
     throw ErrorImpl(kj::Exception(kj::Exception::Type::FAILED, file, line, kj::strArray(errors, "\n")));
+  }
+
+  void addMemoryFile(kj::StringPtr pathStr, kj::StringPtr contentStr)
+  {
+    auto path = kj::Path::parse(pathStr);
+    memoryDir->openFile(path, kj::WriteMode::CREATE | kj::WriteMode::CREATE_PARENT)->writeAll(contentStr);
   }
 
   std::pair<const kj::ReadableDirectory &, kj::Path> interpretSourceFile(kj::StringPtr pathStr)
@@ -241,6 +251,8 @@ public:
 rust::Vec<uint8_t> command(rust::Slice<const rust::String> files,
                            rust::Slice<const rust::String> imports,
                            rust::Slice<const rust::String> prefixes,
+                           rust::Slice<const rust::String> memoryFilesData,
+                           rust::Slice<const rust::String> memoryFilesPaths,
                            bool standard_import)
 {
   Glue glue(standard_import);
@@ -259,6 +271,13 @@ rust::Vec<uint8_t> command(rust::Slice<const rust::String> files,
     {
       KJ_FAIL_REQUIRE("Import path does not exist.");
     }
+  }
+
+  for (size_t i = 0; i < memoryFilesPaths.length() && i < memoryFilesData.length(); ++i)
+  {
+    rust::String path = memoryFilesPaths[i];
+    rust::String data = memoryFilesData[i];
+    glue.addMemoryFile(path.c_str(), data.c_str());
   }
 
   for (auto file : files)

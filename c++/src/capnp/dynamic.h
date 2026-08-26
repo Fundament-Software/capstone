@@ -412,6 +412,7 @@ private:
   friend class Orphan<DynamicList>;
   friend class Orphan<DynamicValue>;
   friend class Orphan<AnyPointer>;
+  friend class AnyList::Reader;
 };
 
 class DynamicList::Builder {
@@ -558,6 +559,9 @@ public:
 
   RemotePromise<DynamicStruct> send();
   // Send the call and return a promise for the results.
+
+  kj::Promise<void> sendIgnoringResult();
+  // Equivalent to send().ignoreResult(), but is a bit more efficient.
 
   kj::Promise<void> sendStreaming();
   // Use when the caller is aware that the response type is StreamResult and wants to invoke
@@ -1556,6 +1560,11 @@ inline DynamicStruct::Reader AnyStruct::Reader::as<DynamicStruct>(StructSchema s
 template <>
 inline DynamicStruct::Builder AnyStruct::Builder::as<DynamicStruct>(StructSchema schema) {
   return DynamicStruct::Builder(schema, _builder);
+}
+
+template <>
+inline DynamicList::Reader AnyList::Reader::as<DynamicList>(ListSchema schema) const {
+  return DynamicList::Reader(schema, _reader);
 }
 
 template <typename T>

@@ -36,6 +36,7 @@
 #endif
 
 #include <kj/list.h>
+#include <kj/atomic.h>
 
 KJ_BEGIN_HEADER
 
@@ -74,9 +75,10 @@ template <typename T>
 class ExceptionOr: public ExceptionOrValue {
 public:
   ExceptionOr() = default;
-  ExceptionOr(T&& value): value(kj::mv(value)) {}
-  ExceptionOr(bool, Exception&& exception): ExceptionOrValue(false, kj::mv(exception)) {}
-  ExceptionOr(ExceptionOr&&) = default;
+  // TODO(soon) - we want to assert isNoThrowMoveConstructible for all Ts here
+  ExceptionOr(T&& value) noexcept(isNoThrowMoveConstructible<T>()): value(kj::mv(value)) {}
+  ExceptionOr(bool, Exception&& exception) noexcept: ExceptionOrValue(false, kj::mv(exception)) {}
+  ExceptionOr(ExceptionOr&&) noexcept = default;
 
   inline ExceptionOr& operator=(ExceptionOr&& other) {
     KJ_IREQUIRE(value == kj::none && exception == kj::none,
@@ -280,7 +282,7 @@ public:
     return sizeof(T) <= sizeof(PromiseArena) && alignof(T) <= alignof(void*);
   }
 
-  static void dispose(PromiseArenaMember* node) {
+  static KJ_DISPOSE_ATTR void dispose(PromiseArenaMember* node) {
     PromiseArena* arena = node->arena;
     // Defer the `delete` to protect against exception in `destroy()`.
     // Reminder: `delete` automatically ignores null pointers
@@ -535,7 +537,7 @@ class PtmfHelper {
 #define BODY \
     PtmfHelper result; \
     static_assert(sizeof(p) == sizeof(result), "unknown ptmf layout"); \
-    memcpy(&result, &p, sizeof(result)); \
+    kj::asBytes(result).copyFrom(kj::asBytes(p)); \
     return result
 
 #else  // __GNUG__
@@ -778,7 +780,7 @@ public:
     } else {
       output.as<T>().value = kj::none;
     }
-    output.exception = hubResult.exception;
+    output.exception = hubResult.exception.clone();
     releaseHub(output);
   }
 };
@@ -801,7 +803,7 @@ public:
     } else {
       output.as<Element>().value = kj::none;
     }
-    output.exception = hubResult.exception;
+    output.exception = hubResult.exception.clone();
     releaseHub(output);
   }
 };
@@ -839,7 +841,7 @@ private:
   ForkBranchBase** tailBranch = &headBranch;
   // Tail becomes null once the inner promise is ready and all branches have been notified.
 
-  Maybe<Own<Event>> fire() override;
+  void fire() override;
   void traceEvent(TraceBuilder& builder) override;
 
   friend class ForkBranchBase;
@@ -919,7 +921,7 @@ private:
   Event* onReadyEvent = nullptr;
   OwnPromiseNode* selfPtr = nullptr;
 
-  Maybe<Own<Event>> fire() override;
+  void fire() override;
   void traceEvent(TraceBuilder& builder) override;
 };
 
@@ -965,7 +967,7 @@ private:
     bool get(ExceptionOrValue& output);
     // Returns true if this is the side that finished.
 
-    Maybe<Own<Event>> fire() override;
+    void fire() override;
     void traceEvent(TraceBuilder& builder) override;
 
   private:
@@ -1016,7 +1018,7 @@ private:
            ExceptionOrValue& output, SourceLocation location);
     ~Branch() noexcept(false);
 
-    Maybe<Own<Event>> fire() override;
+    void fire() override;
     void traceEvent(TraceBuilder& builder) override;
 
   private:
@@ -1101,7 +1103,7 @@ private:
            SourceLocation location);
     ~Branch() noexcept(false);
 
-    Maybe<Own<Event>> fire() override;
+    void fire() override;
     void traceEvent(TraceBuilder &builder) override;
 
   private:
@@ -1168,7 +1170,7 @@ private:
 
   ExceptionOrValue& resultRef;
 
-  Maybe<Own<Event>> fire() override;
+  void fire() override;
   void traceEvent(TraceBuilder& builder) override;
 };
 
@@ -1285,7 +1287,7 @@ private:
   void run();
   virtual void runImpl(WaitScope& waitScope) = 0;
 
-  Maybe<Own<Event>> fire() override;
+  void fire() override;
   void traceEvent(TraceBuilder& builder) override;
   // Implements Event. Each time the event is fired, switchToFiber() is called.
 
@@ -1853,7 +1855,7 @@ private:
   class DelayedDoneHack;
 
   // implements Event ----------------------------------------------------------
-  Maybe<Own<Event>> fire() override;
+  void fire() override;
   // If called with promiseNode == nullptr, it's time to call execute(). If promiseNode != nullptr,
   // then it just indicated readiness and we need to get its result.
 
@@ -1944,18 +1946,9 @@ namespace _ {  // (private)
 template <typename T>
 class XThreadFulfiller;
 
-class XThreadPaf: public PromiseNode {
+class XThreadPafControl final: public AtomicRefcounted {
 public:
-  XThreadPaf(Own<const Executor> executor);
-  virtual ~XThreadPaf() noexcept(false);
-  void destroy() override;
-
-  // implements PromiseNode ----------------------------------------------------
-  void onReady(Event* event) noexcept override;
-  void tracePromise(TraceBuilder& builder, bool stopAtNextEvent) override;
-
-private:
-  enum {
+  enum State {
     WAITING,
     // Not yet fulfilled, and the waiter is still waiting.
     //
@@ -1987,8 +1980,22 @@ private:
     // The waiting thread atomically transitions the state from WAITING to CANCELED if it is no
     // longer listening. In this state, it is the fulfiller thread's responsibility to destroy the
     // object.
-  } state;
+  };
 
+  mutable State state = WAITING;
+};
+
+class XThreadPaf: public PromiseNode {
+public:
+  XThreadPaf(Own<const Executor> executor, Arc<XThreadPafControl> control);
+  virtual ~XThreadPaf() noexcept(false);
+  void destroy() override;
+
+  // implements PromiseNode ----------------------------------------------------
+  void onReady(Event* event) noexcept override;
+  void tracePromise(TraceBuilder& builder, bool stopAtNextEvent) override;
+
+private:
   Own<const Executor> executor;
   // Executor of the waiting thread. We hold a strong reference to it so that we have no risk of UB
   // if the waiting thread exits before the promise is fulfilled.
@@ -1998,6 +2005,10 @@ private:
   // thread's executor. In those states, these pointers are guarded by said executor's mutex.
 
   OnReadyEvent onReadyEvent;
+
+  Arc<XThreadPafControl> control;
+  // The control block is shared with the fulfiller so that isWaiting() can inspect the state
+  // without dereferencing this object after cancellation has allowed it to be destroyed.
 
   class FulfillScope;
 
@@ -2051,7 +2062,8 @@ private:
 template <typename T>
 class XThreadFulfiller final: public CrossThreadPromiseFulfiller<T> {
 public:
-  XThreadFulfiller(XThreadPafImpl<T>* target): target(target) {}
+  XThreadFulfiller(XThreadPafImpl<T>* target, Arc<XThreadPafControl> control)
+      : target(target), control(kj::mv(control)) {}
 
   ~XThreadFulfiller() noexcept(false) {
     if (target != nullptr) {
@@ -2075,20 +2087,13 @@ public:
     }
   }
   bool isWaiting() const override {
-    KJ_IF_SOME(t, target) {
-#if _MSC_VER && !__clang__
-      // Just assume 1-byte loads are atomic... on what kind of absurd platform would they not be?
-      return t.state == XThreadPaf::WAITING;
-#else
-      return __atomic_load_n(&t.state, __ATOMIC_RELAXED) == XThreadPaf::WAITING;
-#endif
-    } else {
-      return false;
-    }
+    return kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::RELAXED) ==
+        XThreadPafControl::WAITING;
   }
 
 private:
   mutable XThreadPaf* target;  // accessed using atomic ops
+  Arc<XThreadPafControl> control;
 };
 
 template <typename T>
@@ -2110,8 +2115,10 @@ PromiseCrossThreadFulfillerPair<T> newPromiseAndCrossThreadFulfiller() {
 
 template <typename T>
 PromiseCrossThreadFulfillerPair<T> Executor::newPromiseAndCrossThreadFulfiller() const {
-  kj::Own<_::XThreadPafImpl<T>, _::PromiseDisposer> node(new _::XThreadPafImpl<T>(addRef()));
-  auto fulfiller = kj::heap<_::XThreadFulfiller<T>>(node);
+  auto control = kj::arc<_::XThreadPafControl>();
+  kj::Own<_::XThreadPafImpl<T>, _::PromiseDisposer> node(
+      new _::XThreadPafImpl<T>(addRef(), control.addRef()));
+  auto fulfiller = kj::heap<_::XThreadFulfiller<T>>(node, kj::mv(control));
   return { _::PromiseNode::to<_::ReducePromises<T>>(kj::mv(node)), kj::mv(fulfiller) };
 }
 
@@ -2340,7 +2347,7 @@ private:
   // -------------------------------------------------------
   // Event implementation
 
-  Maybe<Own<Event>> fire() override;
+  void fire() override;
   void traceEvent(TraceBuilder& builder) override;
 
   stdcoro::coroutine_handle<> coroutine;

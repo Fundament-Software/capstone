@@ -42,9 +42,7 @@ namespace {
 
 class AsyncMessageReader: public MessageReader {
 public:
-  inline AsyncMessageReader(ReaderOptions options): MessageReader(options) {
-    memset(firstWord, 0, sizeof(firstWord));
-  }
+  inline AsyncMessageReader(ReaderOptions options): MessageReader(options), firstWord{} {}
   ~AsyncMessageReader() noexcept(false) {}
 
   kj::Promise<bool> read(kj::AsyncInputStream& inputStream, kj::ArrayPtr<word> scratchSpace);
@@ -83,6 +81,25 @@ private:
 
 kj::Promise<bool> AsyncMessageReader::read(kj::AsyncInputStream& inputStream,
                                            kj::ArrayPtr<word> scratchSpace) {
+  // Fast path: read the first word synchronously if it is already buffered. The subsequent reads
+  // in readAfterFirstWord() / readSegments() use AsyncInputStream::read(), which has its own
+  // synchronous fast path, so a message whose bytes are all buffered avoids suspending entirely.
+  KJ_IF_SOME(n, inputStream.tryReadSync(
+      kj::arrayPtr(reinterpret_cast<kj::byte*>(firstWord), sizeof(firstWord)),
+      sizeof(firstWord))) {
+    if (n == 0) {
+      return false;
+    } else if (n < sizeof(firstWord)) {
+      // EOF in first word.
+      return kj::evalNow([]() -> kj::Promise<bool> {
+        kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "Premature EOF."));
+        return false;
+      });
+    }
+
+    return readAfterFirstWord(inputStream, scratchSpace).then([]() { return true; });
+  }
+
   return inputStream.tryRead(firstWord, sizeof(firstWord), sizeof(firstWord))
       .then([this,&inputStream,KJ_CPCAP(scratchSpace)](size_t n) mutable -> kj::Promise<bool> {
     if (n == 0) {
@@ -141,7 +158,7 @@ kj::Promise<void> AsyncMessageReader::readAfterFirstWord(kj::AsyncInputStream& i
 
 kj::Promise<void> AsyncMessageReader::readSegments(kj::AsyncInputStream& inputStream,
                                                    kj::ArrayPtr<word> scratchSpace) {
-  size_t totalWords = segment0Size();
+  uint64_t totalWords = segment0Size();
 
   if (segmentCount() > 1) {
     for (uint i = 0; i < segmentCount() - 1; i++) {

@@ -138,10 +138,14 @@ Exception::Type typeOfErrno(int error) {
 #if _WIN32 || __CYGWIN__
 
 Exception::Type typeOfWin32Error(DWORD error) {
+  // Winsock and Win32 have separate spellings for most of these conditions, and which one a given
+  // failure reports depends on how it was discovered: a direct Winsock call yields WSAE*, while an
+  // overlapped operation's completion status yields ERROR_*. Both spellings must be classified.
   switch (error) {
     // TODO(someday): This needs more work.
 
     case WSAETIMEDOUT:
+    case ERROR_SEM_TIMEOUT:
       return Exception::Type::OVERLOADED;
 
     case WSAENOTCONN:
@@ -154,6 +158,16 @@ Exception::Type typeOfWin32Error(DWORD error) {
     case WSAENETRESET:
     case WSAENETUNREACH:
     case WSAESHUTDOWN:
+    case ERROR_NETNAME_DELETED:  // What a reset connection looks like to overlapped I/O.
+    case ERROR_CONNECTION_ABORTED:
+    case ERROR_CONNECTION_REFUSED:
+    case ERROR_CONNECTION_INVALID:
+    case ERROR_HOST_UNREACHABLE:
+    case ERROR_NETWORK_UNREACHABLE:
+    case ERROR_PORT_UNREACHABLE:
+    case ERROR_BROKEN_PIPE:
+    case ERROR_NO_DATA:
+    case ERROR_PIPE_NOT_CONNECTED:
       return Exception::Type::DISCONNECTED;
 
     case WSAEOPNOTSUPP:
@@ -440,32 +454,57 @@ uint Debug::getWin32ErrorCode() {
 Debug::Context::Context(): logged(false) {}
 Debug::Context::~Context() noexcept(false) {}
 
-Debug::Context::Value Debug::Context::ensureInitialized() {
+Maybe<Debug::Context::Value> Debug::Context::ensureInitialized() {
+  if (evaluationFailed || evaluating) {
+    // Either a previous evaluation attempt threw, or we are being called re-entrantly from within
+    // evaluate() itself (because evaluating the context parameters threw an exception, which
+    // re-entered the exception callback chain -- see the comments in debug.h). In either case we
+    // must drop the context to avoid infinite recursion / stack overflow.
+    evaluationFailed = true;
+    return kj::none;
+  }
+
+  if (value == kj::none) {
+    // Evaluating the context parameters could itself throw (e.g. if a parameter's stringification
+    // throws). We must catch such exceptions here; otherwise the thrown exception would re-enter
+    // this same Context callback, calling ensureInitialized() again, leading to infinite recursion
+    // and eventually a stack overflow. If evaluation throws, `value` won't be set and we'll drop
+    // the context below.
+    evaluating = true;
+    KJ_DEFER(evaluating = false);
+    kj::runCatchingExceptions([&]() {
+      value = evaluate();
+    });
+  }
+
   KJ_IF_SOME(v, value) {
     return Value(v.file, v.line, heapString(v.description));
   } else {
-    Value result = evaluate();
-    value = Value(result.file, result.line, heapString(result.description));
-    return result;
+    // Our attempt to call `evaluate()` must have thrown an exception. Drop the context.
+    evaluationFailed = true;
+    return kj::none;
   }
 }
 
 void Debug::Context::onRecoverableException(Exception&& exception) {
-  Value v = ensureInitialized();
-  exception.wrapContext(v.file, v.line, mv(v.description));
+  KJ_IF_SOME(v, ensureInitialized()) {
+    exception.wrapContext(v.file, v.line, mv(v.description));
+  }
   next.onRecoverableException(kj::mv(exception));
 }
 void Debug::Context::onFatalException(Exception&& exception) {
-  Value v = ensureInitialized();
-  exception.wrapContext(v.file, v.line, mv(v.description));
+  KJ_IF_SOME(v, ensureInitialized()) {
+    exception.wrapContext(v.file, v.line, mv(v.description));
+  }
   next.onFatalException(kj::mv(exception));
 }
 void Debug::Context::logMessage(LogSeverity severity, const char* file, int line, int contextDepth,
                                 String&& text) {
   if (!logged) {
-    Value v = ensureInitialized();
-    next.logMessage(LogSeverity::INFO, trimSourceFilename(v.file).cStr(), v.line, 0,
-                    str("context: ", mv(v.description), '\n'));
+    KJ_IF_SOME(v, ensureInitialized()) {
+      next.logMessage(LogSeverity::INFO, trimSourceFilename(v.file).cStr(), v.line, 0,
+                      str("context: ", mv(v.description), '\n'));
+    }
     logged = true;
   }
 

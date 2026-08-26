@@ -1250,10 +1250,14 @@ public:
   // Helper that builds a trace and stringifies it.
 
 protected:
-  virtual Maybe<Own<Event>> fire() = 0;
-  // Fire the event.  Possibly returns a pointer to itself, which will be discarded by the
-  // caller.  This is the only way that an event can delete itself as a result of firing, as
-  // doing so from within fire() will throw an exception.
+  virtual void fire() = 0;
+  // Fire the event. Possibly deletes itself, so event shouldn't be used after calling this.
+  // To aid debugging promises that cancel itself the event that is going to delete itself in `fire`
+  // needs to call `permitSelfDestruction` before doing so.
+  // Otherwise deleting currently firing event will result in exception.
+
+  void permitSelfDestruction();
+  // Must be called from within `fire()` method if Event intends to self-destroy after fire.
 
 private:
   friend class kj::EventLoop;
@@ -1279,10 +1283,6 @@ private:
   Event* next;
   Event** prev;
 
-  bool firing = false;
-
-  static constexpr uint MAGIC_LIVE_VALUE = 0x1e366381u;
-  uint live = MAGIC_LIVE_VALUE;
   SourceLocation location;
 };
 
@@ -1364,6 +1364,31 @@ public:
   // Same as WaitScope::cancelAllDetached(). Sometimes it's easier to call on the EventLoop. (A
   // WaitScope still must exist, i.e., this EventLoop must be current.)
 
+  class Id {
+    // Unique event loop identifier.
+    // Implemented as a monotonically increasing counter value assigned to each EventLoop on
+    // construction, so it stays unique even after an EventLoop is destroyed and its memory reused.
+
+  public:
+    static Id current();
+    // Obtain the id of the EventLoop currently running on this thread. Requires that an EventLoop
+    // is running on the current thread.
+
+    inline bool operator==(const Id& other) const = default;
+
+    void assertCurrentEventLoop() const;
+    // KJ_ASSERTs that the current thread's EventLoop matches this identifier.
+
+  private:
+    inline explicit Id(size_t id): id(id) {}
+    size_t id;
+
+    friend class EventLoop;
+  };
+
+  Id id() const;
+  // Returns the unique identifier of this EventLoop.
+
 private:
   inline _::Event* head() const {
     _::Event* event = headSentinel.next;
@@ -1386,9 +1411,13 @@ private:
       prev = nullptr;
     }
 
-    Maybe<Own<_::Event>> fire() override { KJ_UNREACHABLE; }
+    void fire() override { KJ_UNREACHABLE; }
     void traceEvent(_::TraceBuilder& builder) override { KJ_UNREACHABLE; }
   };
+
+  size_t loopId;
+  // Unique identifier for this EventLoop, assigned from a global atomic counter on construction.
+  // See id().
 
   kj::Maybe<EventPort&> port;
   // If null, this thread doesn't receive I/O events from the OS. It can potentially receive
@@ -1428,8 +1457,6 @@ private:
   // For EventLoopLocal. Allocated separately to avoid including HashMap here.
 
   Own<TaskSet> daemons;
-
-  _::Event* currentlyFiring = nullptr;
 
   void resetDepthFirstQueue();
   bool turn();

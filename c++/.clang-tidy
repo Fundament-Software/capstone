@@ -1,0 +1,111 @@
+---
+# We prefer to enable useful checks one by one.
+Checks: >
+  -*,
+  modernize-use-nullptr,
+  custom-arrayptr-as-bytes,
+  custom-arrayptr-first-copyfrom,
+  custom-arrayptr-singleton,
+  custom-arrayptr-slice-zero,
+  custom-use-rc-arc-deref
+
+
+HeaderFilterRegex: '.*'
+WarningsAsErrors: '*'
+
+
+####
+# Custom checks.
+#
+# These checks enforce custom KJ code style and idiomatic code. We recommend to enable these
+# in all projects that use KJ.
+#
+# Requires clang-tidy's --experimental-custom-checks flag.
+#
+# References:
+# - https://clang.llvm.org/extra/clang-tidy/QueryBasedCustomChecks.html
+# - https://clang.llvm.org/docs/LibASTMatchersReference.html
+CustomChecks:
+  - Name: arrayptr-slice-zero
+    Query: |
+      match cxxMemberCallExpr(
+        callee(cxxMethodDecl(
+          hasName("slice"),
+          ofClass(classTemplateSpecializationDecl(hasName("::kj::ArrayPtr")))
+        )),
+        argumentCountIs(2),
+        hasArgument(0, ignoringParenImpCasts(integerLiteral(equals(0))))
+      ).bind("call")
+    Diagnostic:
+      - BindName: call
+        Message: "use first() instead of slice(0, ...)"
+        Level: Warning
+
+  - Name: arrayptr-as-bytes
+    Query: |
+      match cxxMemberCallExpr(
+        on(expr(anyOf(
+          callExpr(
+            callee(functionDecl(hasName("kj::arrayPtr")))
+          ).bind("arrayPtr"),
+          cxxConstructExpr(
+            hasDeclaration(cxxConstructorDecl(
+              ofClass(classTemplateSpecializationDecl(hasName("::kj::ArrayPtr")))
+            ))
+          ).bind("arrayPtr")
+        ))),
+        callee(cxxMethodDecl(hasName("asBytes")))
+      ).bind("asBytes")
+    Diagnostic:
+      - BindName: asBytes
+        Message: ArrayPtr construction followed by asBytes() can be simplified to kj::asBytes()
+        Level: Warning
+
+  - Name: arrayptr-first-copyfrom
+    Query: |
+      match cxxMemberCallExpr(
+        callee(cxxMethodDecl(
+          hasName("copyFrom"),
+          ofClass(classTemplateSpecializationDecl(hasName("::kj::ArrayPtr")))
+        )),
+        argumentCountIs(1),
+        on(ignoringParenImpCasts(cxxMemberCallExpr(
+          callee(cxxMethodDecl(
+            hasName("first"),
+            ofClass(classTemplateSpecializationDecl(hasName("::kj::ArrayPtr")))
+          ))
+        )))
+      ).bind("copyFrom")
+    Diagnostic:
+      - BindName: copyFrom
+        Message: replace first(...).copyFrom(value) with write(value)
+        Level: Warning
+
+  - Name: arrayptr-singleton
+    Query: |
+      match callExpr(
+        callee(functionDecl(hasName("kj::arrayPtr"))),
+        argumentCountIs(2),
+        hasArgument(0, unaryOperator(hasOperatorName("&"))),
+        hasArgument(1, integerLiteral(equals(1)))
+      ).bind("arrayPtr")
+    Diagnostic:
+      - BindName: arrayPtr
+        Message: kj::arrayPtr(&, 1) can be simplified to kj::arrayPtr(item)
+        Level: Warning
+        
+  - Name: use-rc-arc-deref
+    Query: |
+      match unaryOperator(
+        hasOperatorName("*"),
+        hasUnaryOperand(ignoringParenImpCasts(cxxMemberCallExpr(
+          callee(cxxMethodDecl(hasName("get"))),
+          on(expr(hasType(qualType(hasDeclaration(
+            classTemplateSpecializationDecl(hasAnyName("::kj::Rc", "::kj::Arc"))
+          )))))
+        )))
+      ).bind("deref")
+    Diagnostic:
+      - BindName: deref
+        Message: use operator* instead of dereferencing Rc::get() or Arc::get()
+        Level: Warning

@@ -288,6 +288,10 @@ public:
   // The file descriptor will remain open at least as long as the Capability::Client remains alive.
   // If you need it to last longer, you will need to `dup()` it.
 
+  kj::String debugInfo();
+  // For debugging purposes, return what kind of capability this is, including layers of wrapping
+  // (promises, membranes, etc.). This is suitable for debug logging only; do NOT parse this.
+
   // TODO(someday):  method(s) for Join
 
 protected:
@@ -518,6 +522,11 @@ public:
   // If this capability is backed by a file descriptor that is safe to directly expose to clients,
   // returns that FD. When FD passing has been enabled in the RPC layer, this FD may be sent to
   // other processes along with the capability.
+  //
+  // The descriptor must stay open for at least as long as the capability itself. The RPC layer may
+  // hold a reference to the capability in order to keep the descriptor valid until it has finished
+  // sending it, so a server which closes its descriptor early can cause the peer to receive a
+  // descriptor that has been closed, or that now refers to some unrelated file.
 
   virtual kj::Maybe<kj::Promise<Capability::Client>> shortenPath();
   // If this returns non-null, then it is a promise which, when resolved, points to a new
@@ -870,6 +879,10 @@ public:
   virtual kj::Maybe<int> getFd() = 0;
   // Implements Capability::Client::getFd(). If this returns null but whenMoreResolved() returns
   // non-null, then Capability::Client::getFd() waits for resolution and tries again.
+
+  virtual void debugInfo(kj::Vector<kj::ConstString>& chain);
+  // For debugging purposes, follows the chain of ClientHooks appending information about each
+  // to `chain`.
 
   static kj::Own<ClientHook> from(Capability::Client client) { return kj::mv(client.hook); }
 
