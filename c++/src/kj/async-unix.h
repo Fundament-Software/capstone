@@ -25,15 +25,18 @@
 #error "This file is Unix-specific. On Windows, include async-win32.h instead."
 #endif
 
-#include "async.h"
-#include "timer.h"
+#include <kj/async.h>
+#include <kj/timer.h>
 #include <kj/io.h>
 #include <signal.h>
 
 KJ_BEGIN_HEADER
 
 #if !defined(KJ_USE_EPOLL) && !defined(KJ_USE_KQUEUE)
-#if __linux__
+
+// Android NDK less than API version 23 doesn't have sigtimedwait
+// sigtimedwait is used in async-unix.c++ if KJ_USE_EPOLL is defined
+#if __linux__ && !(__ANDROID__ && __ANDROID_API__ < 23)
 // Default to epoll on Linux.
 #define KJ_USE_EPOLL 1
 #elif __APPLE__ || __FreeBSD__ || __NetBSD__ || __DragonFly__

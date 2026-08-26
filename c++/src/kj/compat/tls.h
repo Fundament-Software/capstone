@@ -30,6 +30,10 @@
 
 #include <kj/async-io.h>
 
+typedef struct evp_pkey_st EVP_PKEY;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct x509_st X509;
+
 KJ_BEGIN_HEADER
 
 namespace kj {
@@ -161,7 +165,7 @@ public:
   // addresses). It will automatically use SNI and verify certificates based on these hostnames.
 
 private:
-  void* ctx;  // actually type SSL_CTX, but we don't want to #include the OpenSSL headers here
+  SSL_CTX* ctx;
   kj::Maybe<kj::Timer&> timer;
   kj::Maybe<kj::Duration> acceptTimeout;
   kj::Maybe<TlsErrorHandler> acceptErrorHandler;
@@ -189,14 +193,14 @@ public:
   TlsPrivateKey& operator=(const TlsPrivateKey& other);
   // Copy-by-refcount.
 
-  inline TlsPrivateKey(TlsPrivateKey&& other): pkey(other.pkey) { other.pkey = nullptr; }
-  inline TlsPrivateKey& operator=(TlsPrivateKey&& other) {
+  inline TlsPrivateKey(TlsPrivateKey&& other) noexcept: pkey(other.pkey) { other.pkey = nullptr; }
+  inline TlsPrivateKey& operator=(TlsPrivateKey&& other) noexcept {
     pkey = other.pkey; other.pkey = nullptr;
     return *this;
   }
 
 private:
-  void* pkey;  // actually type EVP_PKEY*
+  EVP_PKEY* pkey;
 
   friend class TlsContext;
 
@@ -223,20 +227,19 @@ public:
   TlsCertificate& operator=(const TlsCertificate& other);
   // Copy-by-refcount.
 
-  inline TlsCertificate(TlsCertificate&& other) {
-    memcpy(chain, other.chain, sizeof(chain));
-    memset(other.chain, 0, sizeof(chain));
+  inline TlsCertificate(TlsCertificate&& other) noexcept {
+    kj::arrayPtr(chain).copyFrom(kj::arrayPtr(other.chain));
+    kj::arrayPtr(other.chain).fill(nullptr);
   }
-  inline TlsCertificate& operator=(TlsCertificate&& other) {
-    memcpy(chain, other.chain, sizeof(chain));
-    memset(other.chain, 0, sizeof(chain));
+  inline TlsCertificate& operator=(TlsCertificate&& other) noexcept {
+    kj::arrayPtr(chain).copyFrom(kj::arrayPtr(other.chain));
+    kj::arrayPtr(other.chain).fill(nullptr);
     return *this;
   }
 
 private:
-  void* chain[10];
-  // Actually type X509*[10].
-  //
+  X509* chain[10];
+
   // Note that OpenSSL has a default maximum cert chain length of 10. Although configurable at
   // runtime, you'd actually have to convince the _peer_ to reconfigure, which is unlikely except
   // in specific use cases. So to avoid excess allocations we just assume a max of 10 certs.
@@ -301,11 +304,11 @@ public:
   //   Key fingerprint? Other certificate fields?
 
 private:
-  void* cert;  // actually type X509*, but we don't want to #include the OpenSSL headers here.
+  X509* cert;
   kj::Own<kj::PeerIdentity> inner;
 
 public:  // (not really public, only TlsConnection can call this)
-  TlsPeerIdentity(void* cert, kj::Own<kj::PeerIdentity> inner, kj::Badge<TlsConnection>)
+  TlsPeerIdentity(X509* cert, kj::Own<kj::PeerIdentity> inner, kj::Badge<TlsConnection>)
       : cert(cert), inner(kj::mv(inner)) {}
 };
 

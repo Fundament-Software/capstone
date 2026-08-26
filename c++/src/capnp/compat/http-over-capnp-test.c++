@@ -20,6 +20,7 @@
 // THE SOFTWARE.
 
 #include "http-over-capnp.h"
+#include <capnp/message.h>
 #include <kj/test.h>
 
 #ifndef TEST_PEER_OPTIMIZATION_LEVEL
@@ -28,6 +29,58 @@
 
 namespace capnp {
 namespace {
+
+KJ_TEST("HttpOverCapnpFactory::capnpToKj rejects out of range common values") {
+  MallocMessageBuilder message;
+  auto orphanage = message.getOrphanage();
+
+  kj::HttpHeaderTable::Builder headerBuilder;
+
+  ByteStreamFactory streamFactory;
+  HttpOverCapnpFactory factory(streamFactory, headerBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+
+  auto headerTable = headerBuilder.build();
+
+  {
+    auto invalidName = orphanage.newOrphan<List<HttpHeader>>(1);
+    auto invalidNameHeader = invalidName.get()[0];
+    auto common = invalidNameHeader.initCommon();
+    common.setName(static_cast<CommonHeaderName>(999));
+    common.setValue("value");
+
+    KJ_EXPECT_THROW_MESSAGE("unknown common header name", factory.capnpToKj(invalidName.get()));
+  }
+
+  {
+    auto invalidName = orphanage.newOrphan<List<HttpHeader>>(1);
+    auto invalidNameHeader = invalidName.get()[0];
+    auto common = invalidNameHeader.initCommon();
+    common.setName(CommonHeaderName::INVALID);
+    common.setValue("value");
+
+    KJ_EXPECT_THROW_MESSAGE("unknown common header name", factory.capnpToKj(invalidName.get()));
+  }
+
+  {
+    auto invalidValue = orphanage.newOrphan<List<HttpHeader>>(1);
+    auto invalidValueHeader = invalidValue.get()[0];
+    auto common = invalidValueHeader.initCommon();
+    common.setName(CommonHeaderName::ACCEPT_CHARSET);
+    common.setCommonValue(static_cast<CommonHeaderValue>(999));
+
+    KJ_EXPECT_THROW_MESSAGE("unknown common header value", factory.capnpToKj(invalidValue.get()));
+  }
+  
+  {
+    auto invalidValue = orphanage.newOrphan<List<HttpHeader>>(1);
+    auto invalidValueHeader = invalidValue.get()[0];
+    auto common = invalidValueHeader.initCommon();
+    common.setName(CommonHeaderName::ACCEPT_CHARSET);
+    common.setCommonValue(CommonHeaderValue::INVALID);
+
+    KJ_EXPECT_THROW_MESSAGE("unknown common header value", factory.capnpToKj(invalidValue.get()));
+  }
+}
 
 KJ_TEST("KJ and RPC HTTP method enums match") {
 #define EXPECT_MATCH(METHOD) \
@@ -590,6 +643,56 @@ void runWebSocketTests(kj::HttpHeaderTable& headerTable,
   }
 }
 
+void runWebSocketOverloadTest(kj::HttpHeaderTable& headerTable,
+                              HttpOverCapnpFactory& clientFactory,
+                              HttpOverCapnpFactory& serverFactory,
+                              kj::WaitScope& waitScope) {
+  enum class Scenario { IDLE, PENDING_WRITE, CLOSED };
+  for (auto scenario: {Scenario::IDLE, Scenario::PENDING_WRITE, Scenario::CLOSED}) {
+    auto wsPaf = kj::newPromiseAndFulfiller<kj::Own<kj::WebSocket>>();
+    auto donePaf = kj::newPromiseAndFulfiller<void>();
+
+    auto back = serverFactory.kjToCapnp(kj::heap<WebSocketAccepter>(
+        headerTable, kj::mv(wsPaf.fulfiller), kj::mv(donePaf.promise)));
+    auto front = clientFactory.capnpToKj(back);
+    auto client = kj::newHttpClient(*front);
+
+    auto resp = client->openWebSocket("/ws", kj::HttpHeaders(headerTable)).wait(waitScope);
+    KJ_ASSERT(resp.webSocketOrBody.is<kj::Own<kj::WebSocket>>());
+
+    auto clientWs = kj::mv(resp.webSocketOrBody.get<kj::Own<kj::WebSocket>>());
+    auto serverWs = wsPaf.promise.wait(waitScope);
+    if (scenario == Scenario::PENDING_WRITE) {
+      auto send = serverWs->send("message before overload"_kj);
+      KJ_EXPECT(!send.poll(waitScope));
+      donePaf.fulfiller->reject(KJ_EXCEPTION(OVERLOADED, "backend overloaded"));
+
+      auto message = clientWs->receive().wait(waitScope);
+      KJ_ASSERT(message.is<kj::String>());
+      KJ_EXPECT(message.get<kj::String>() == "message before overload");
+      send.wait(waitScope);
+      KJ_EXPECT_THROW(DISCONNECTED, clientWs->receive().wait(waitScope));
+    } else if (scenario == Scenario::CLOSED) {
+      auto close = serverWs->close(1234, "closed before overload"_kj);
+      auto message = clientWs->receive().wait(waitScope);
+      KJ_ASSERT(message.is<kj::WebSocket::Close>());
+      KJ_EXPECT(message.get<kj::WebSocket::Close>().code == 1234);
+      KJ_EXPECT(message.get<kj::WebSocket::Close>().reason == "closed before overload");
+      close.wait(waitScope);
+
+      donePaf.fulfiller->reject(KJ_EXCEPTION(OVERLOADED, "backend overloaded"));
+      KJ_EXPECT_THROW(DISCONNECTED, clientWs->receive().wait(waitScope));
+    } else {
+      donePaf.fulfiller->reject(KJ_EXCEPTION(OVERLOADED, "backend overloaded"));
+
+      auto message = clientWs->receive().wait(waitScope);
+      KJ_ASSERT(message.is<kj::WebSocket::Close>());
+      KJ_EXPECT(message.get<kj::WebSocket::Close>().code == 1013);
+      KJ_EXPECT(message.get<kj::WebSocket::Close>().reason == "Service overloaded; retry later.");
+    }
+  }
+}
+
 KJ_TEST("HTTP-over-Cap'n Proto WebSocket, no path shortening") {
   kj::EventLoop eventLoop;
   kj::WaitScope waitScope(eventLoop);
@@ -614,6 +717,20 @@ KJ_TEST("HTTP-over-Cap'n Proto WebSocket, with path shortening") {
   auto headerTable = tableBuilder.build();
 
   runWebSocketTests(*headerTable, factory, factory, waitScope);
+}
+
+KJ_TEST("HTTP-over-Cap'n Proto WebSocket reports overload") {
+  kj::EventLoop eventLoop;
+  kj::WaitScope waitScope(eventLoop);
+
+  ByteStreamFactory streamFactory1;
+  ByteStreamFactory streamFactory2;
+  kj::HttpHeaderTable::Builder tableBuilder;
+  HttpOverCapnpFactory factory1(streamFactory1, tableBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+  HttpOverCapnpFactory factory2(streamFactory2, tableBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+  auto headerTable = tableBuilder.build();
+
+  runWebSocketOverloadTest(*headerTable, factory1, factory2, waitScope);
 }
 
 // =======================================================================================
@@ -960,7 +1077,7 @@ KJ_TEST("HTTP-over-Cap'n-Proto Connect with startTls") {
   auto request = frontCapnpHttpClient->connect(
       "https://example.org"_kj, kj::HttpHeaders(*table), settings);
 
-  KJ_ASSERT_NONNULL(*tlsStarter);
+  KJ_ASSERT(*tlsStarter != kj::none);
 
   request.status.then(
       [io=kj::mv(request.connection), &tlsStarter](auto status) mutable {

@@ -150,6 +150,23 @@ public:
     });
   }
 
+  enum class OverloadCloseStatus { READY, WRITE_IN_PROGRESS, CLOSED };
+
+  // Reports whether it's safe to send an overload Close frame. The caller (ClientRequestContextImpl)
+  // performs the close/abort itself because it, not this adapter, owns the underlying WebSocket.
+  OverloadCloseStatus prepareForOverloadClose() {
+    if (webSocket == kj::none) {
+      return OverloadCloseStatus::CLOSED;
+    }
+    if (activeWriteCount > 0) {
+      return OverloadCloseStatus::WRITE_IN_PROGRESS;
+    }
+
+    // Prevent any later RPCs from starting another write while the context sends the Close frame.
+    webSocket = kj::none;
+    return OverloadCloseStatus::READY;
+  }
+
 private:
   kj::Maybe<kj::WebSocket&> webSocket;  // becomes none when canceled
   kj::Own<kj::WebSocket> ownWebSocket;
@@ -161,6 +178,7 @@ private:
   kj::Maybe<kj::Own<kj::Exception>> error;
 
   bool shortened = false;
+  uint activeWriteCount = 0;
 
   kj::WebSocket& getWebSocket() {
     return KJ_REQUIRE_NONNULL(webSocket, "request canceled");
@@ -169,12 +187,15 @@ private:
   template <typename Func>
   kj::Promise<void> wrap(Func&& func) {
     KJ_IF_SOME(e, error) {
-      kj::throwFatalException(kj::cp(*e));
+      kj::throwFatalException(e->clone());
     }
+
+    ++activeWriteCount;
 
     // Detect cancellation (of the operation) and mark the object broken in this case.
     bool done = false;
     KJ_DEFER({
+      --activeWriteCount;
       if (!done && error == kj::none) {
         error = kj::heap(KJ_EXCEPTION(FAILED,
             "a write was canceled before completing, breaking the WebSocket"));
@@ -188,7 +209,7 @@ private:
         kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "request canceled"));
       }
     } KJ_CATCH(e) {
-      error = kj::heap(kj::cp(e));
+      error = kj::heap(e.clone());
       kj::throwFatalException(kj::mv(e));
     }
 
@@ -221,7 +242,7 @@ public:
   kj::Promise<void> send(kj::ArrayPtr<const char> message) override {
     auto req = KJ_REQUIRE_NONNULL(out, "already called disconnect()").sendTextRequest(
         MessageSize { 8 + message.size() / sizeof(word), 0 });
-    memcpy(req.initText(message.size()).begin(), message.begin(), message.size());
+    req.initText(message.size()).asArray().copyFrom(message);
     sentBytes += message.size();
     return req.send();
   }
@@ -356,11 +377,23 @@ public:
     auto upWrapper = kj::heap<KjToCapnpWebSocketAdapter>(
         kj::none, params.getUpSocket(), kj::mv(shorteningPaf.fulfiller));
     responsePumpTask = webSocket->pumpTo(*upWrapper).attach(kj::mv(upWrapper))
-        .catch_([&webSocket=*webSocket](kj::Exception&& e) -> kj::Promise<void> {
+        .catch_([this, &webSocket=*webSocket](kj::Exception&& e) -> kj::Promise<void> {
       // The pump in the client -> server direction failed. The error may have originated from
       // either the client or the server. In case it came from the server, we want to call .abort()
       // to propagate the problem back to the client. If the error came from the client, then
       // .abort() probably is a noop.
+      if (e.getType() == kj::Exception::Type::OVERLOADED) {
+        if (closingForOverload) {
+          return kj::mv(e);
+        }
+
+        // Send a Close frame to the client before propagating, rather than aborting into a raw
+        // disconnect.
+        return closeWebSocketForOverload()
+            .then([e = kj::mv(e)]() mutable -> kj::Promise<void> {
+          return kj::mv(e);
+        });
+      }
       webSocket.abort();
       return kj::mv(e);
     });
@@ -406,6 +439,39 @@ public:
     return sentResponse;
   }
 
+  bool hasStartedWebSocket() {
+    return ownWebSocket != kj::none;
+  }
+
+  kj::Promise<void> closeWebSocketForOverload() {
+    if (closingForOverload) {
+      return finishPump().catch_([](kj::Exception&&) {});
+    }
+
+    closingForOverload = true;
+    auto& webSocket = *KJ_ASSERT_NONNULL(ownWebSocket);
+    KJ_IF_SOME(adapter, maybeWebSocket) {
+      switch (adapter.prepareForOverloadClose()) {
+        case CapnpToKjWebSocketAdapter::OverloadCloseStatus::READY:
+          break;
+        case CapnpToKjWebSocketAdapter::OverloadCloseStatus::WRITE_IN_PROGRESS:
+          webSocket.abort();
+          return kj::READY_NOW;
+        case CapnpToKjWebSocketAdapter::OverloadCloseStatus::CLOSED:
+          return kj::READY_NOW;
+      }
+    } else {
+      webSocket.abort();
+      return kj::READY_NOW;
+    }
+
+    // 1013 ("Try Again Later") is the WebSocket protocol's standard signal to retry later.
+    return webSocket.close(1013, "Service overloaded; retry later.")
+        .catch_([&webSocket](kj::Exception&&) {
+      webSocket.abort();
+    });
+  }
+
 private:
   HttpOverCapnpFactory& factory;
   kj::Maybe<kj::Own<kj::WebSocket>> ownWebSocket;
@@ -414,10 +480,14 @@ private:
 
   kj::HttpService::Response& kjResponse;
   bool sentResponse = false;
+  bool closingForOverload = false;
 
   kj::Promise<void> finishPumpInner() {
     KJ_IF_SOME(r, responsePumpTask) {
-      return kj::mv(r);
+      auto promise = kj::mv(r);
+      // Null out the task so a second call can't await the moved-from (null) promise.
+      responsePumpTask = kj::none;
+      return promise;
     } else {
       return kj::READY_NOW;
     }
@@ -580,7 +650,18 @@ public:
 
     // Wait for the server to indicate completion. Meanwhile, if the
     // promise is canceled from the client side, we propagate cancellation naturally.
-    co_await pipeline.ignoreResult();
+    KJ_TRY {
+      co_await pipeline;
+    } KJ_CATCH(exception) {
+      if (exception.getType() == kj::Exception::Type::OVERLOADED &&
+          context.hasStartedWebSocket()) {
+        // Keep the upgraded transport alive until the Close frame has been written.
+        auto originalException = kj::mv(exception);
+        co_await context.closeWebSocketForOverload();
+        kj::throwFatalException(kj::mv(originalException));
+      }
+      kj::throwFatalException(kj::mv(exception));
+    }
 
     // Once the server indicates it is done, then we can cancel pumping the request, because
     // obviously the server won't use it. We should not cancel pumping the response since there
@@ -663,7 +744,7 @@ public:
       return kj::NEVER_DONE;
     });
 
-    co_await pipeline.ignoreResult();
+    co_await pipeline;
   }
 
 
@@ -895,7 +976,7 @@ public:
 
     class EofDetector final: public kj::AsyncOutputStream {
     public:
-      EofDetector(kj::Own<kj::AsyncIoStream> inner)
+      EofDetector(kj::Rc<kj::AsyncIoStream> inner)
           : inner(kj::mv(inner)) {}
       ~EofDetector() {
         inner->shutdownWrite();
@@ -918,29 +999,27 @@ public:
         return inner->whenWriteDisconnected();
       }
     private:
-      kj::Own<kj::AsyncIoStream> inner;
+      kj::Rc<kj::AsyncIoStream> inner;
     };
 
     auto stream = factory.streamFactory.capnpToKjExplicitEnd(context.getParams().getDown());
 
     // We want to keep the stream alive even after EofDetector is destroyed, so we need to create
     // a refcounted AsyncIoStream.
-    auto refcounted = kj::refcountedWrapper(kj::mv(pipe.ends[1]));
-    kj::Own<kj::AsyncIoStream> ref1 = refcounted->addWrappedRef();
-    kj::Own<kj::AsyncIoStream> ref2 = refcounted->addWrappedRef();
+    kj::Rc<kj::AsyncIoStream> refcounted(kj::mv(pipe.ends[1]));
 
     // We write to the `down` pipe.
-    auto pumpTask = ref1->pumpTo(*stream)
+    auto pumpTask = refcounted->pumpTo(*stream)
           .then([&stream = *stream](uint64_t) mutable {
       return stream.end();
-    }).then([httpProxyStream = kj::mv(ref1), stream = kj::mv(stream)]() mutable
+    }).then([httpProxyStream = refcounted.addRef(), stream = kj::mv(stream)]() mutable
         -> kj::Promise<void> {
       return kj::NEVER_DONE;
     });
 
     {
       PipelineBuilder<ConnectResults> pb;
-      auto eofWrapper = kj::heap<EofDetector>(kj::mv(ref2));
+      auto eofWrapper = kj::heap<EofDetector>(refcounted.addRef());
       auto up = factory.streamFactory.kjToCapnp(kj::mv(eofWrapper), kj::mv(tlsStarter));
       pb.setUp(kj::cp(up));
 
@@ -1065,12 +1144,12 @@ kj::HttpHeaders HttpOverCapnpFactory::capnpToKj(
       case capnp::HttpHeader::COMMON: {
         auto nv = header.getCommon();
         auto nameInt = static_cast<uint>(nv.getName());
-        KJ_REQUIRE(nameInt < nameCapnpToKj.size(), "unknown common header name", nv.getName());
+        KJ_REQUIRE(nameInt > 0 && nameInt < nameCapnpToKj.size(), "unknown common header name", nv.getName());
 
         switch (nv.which()) {
           case capnp::HttpHeader::Common::COMMON_VALUE: {
             auto cvInt = static_cast<uint>(nv.getCommonValue());
-            KJ_REQUIRE(nameInt < valueCapnpToKj.size(),
+            KJ_REQUIRE(cvInt > 0 && cvInt < valueCapnpToKj.size(),
                 "unknown common header value", nv.getCommonValue());
             result.setPtr(nameCapnpToKj[nameInt], valueCapnpToKj[cvInt]);
             break;

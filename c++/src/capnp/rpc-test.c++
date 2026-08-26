@@ -259,7 +259,7 @@ public:
   ~TestVat() {
     kj::Exception exception = KJ_EXCEPTION(FAILED, "Network was destroyed.");
     for (auto& entry: connections) {
-      entry.value->disconnect(kj::cp(exception));
+      entry.value->disconnect(exception.clone());
     }
   }
 
@@ -335,7 +335,7 @@ public:
     }
 
     void disconnect(kj::Exception&& exception) {
-      messageQueue.rejectAll(kj::cp(exception));
+      messageQueue.rejectAll(exception.clone());
       networkException = kj::mv(exception);
       tasks = nullptr;
     }
@@ -382,7 +382,7 @@ public:
         // Uncomment to get a debug dump.
 //        connection.dumper.dump(message.getRoot<rpc::Message>());
 
-        auto incomingMessage = kj::heap<IncomingRpcMessageImpl>(messageToFlatArray(message));
+        auto incomingMessage = kj::rc<IncomingRpcMessageImpl>(messageToFlatArray(message));
 
         kj::Promise<void> blocker = nullptr;
         KJ_IF_SOME(b, connection.currentBlock) {
@@ -403,7 +403,7 @@ public:
         connection.tasks->add(blocker.then(
             [connectionPtr,message=kj::mv(incomingMessage)]() mutable {
           KJ_IF_SOME(p, connectionPtr->partner) {
-            p.messageQueue.push(kj::Own<IncomingRpcMessage>(kj::mv(message)));
+            p.messageQueue.push(kj::Own<IncomingRpcMessage>(message.toOwn()));
           }
         }));
       }
@@ -428,7 +428,7 @@ public:
     }
     kj::Promise<kj::Maybe<kj::Own<IncomingRpcMessage>>> receiveIncomingMessage() override {
       KJ_IF_SOME(e, networkException) {
-        kj::throwFatalException(kj::cp(e));
+        kj::throwFatalException(e.clone());
       }
 
       if (initiatedIdleShutdown) {
@@ -449,7 +449,7 @@ public:
     }
     kj::Promise<void> shutdown() override {
       KJ_IF_SOME(e, vat.shutdownExceptionToThrow) {
-        return kj::cp(e);
+        return e.clone();
       }
       KJ_IF_SOME(p, partner) {
         if (p.initiatedIdleShutdown) {
@@ -991,6 +991,22 @@ private:
   kj::Promise<void> unblock;
 };
 
+class TestQueuedTailCaller final: public test::TestTailCaller::Server {
+public:
+  TestQueuedTailCaller(kj::Promise<void> unblock)
+      : unblock(kj::mv(unblock).fork()) {}
+
+  kj::Promise<void> foo(FooContext context) override {
+    return unblock.addBranch().then([context]() mutable {
+      auto tailRequest = context.getParams().getCallee().fooRequest();
+      return context.tailCall(kj::mv(tailRequest));
+    });
+  }
+
+private:
+  kj::ForkedPromise<void> unblock;
+};
+
 KJ_TEST("cancel tail call") {
   TestContext context;
 
@@ -1054,6 +1070,66 @@ KJ_TEST("tail call cancellation race") {
 
   KJ_ASSERT(callCount == 1);
   KJ_ASSERT(cancelCount == 1);
+}
+
+KJ_TEST("takeFromOtherQuestion reuse after canceled redirect") {
+  // Regresses a stale-state bug in `handleReturn()`:
+  // - Return #1 targets a canceled question and uses takeFromOtherQuestion=A.
+  // - Return #2 targets a live question and is rewritten to also use A.
+  // Historically, Return #1 moved out `answer.task` but didn't reset it to Finished,
+  // leaving a stale Redirected tag with moved-from payload. Return #2 would then crash
+  // when trying to consume that moved-from promise.
+
+  TestContext context;
+  auto paf = kj::newPromiseAndFulfiller<void>();
+  auto& carol = context.initVat("carol", kj::heap<TestQueuedTailCaller>(kj::mv(paf.promise)));
+
+  uint takeFromOtherQuestionReturnCount = 0;
+  kj::Maybe<uint32_t> firstTakeFromOtherQuestion = kj::none;
+  carol.vatNetwork.onSend([&](MessageBuilder& builder) {
+    auto message = builder.getRoot<rpc::Message>();
+    if (message.isReturn()) {
+      auto ret = message.getReturn();
+      if (ret.isTakeFromOtherQuestion()) {
+        if (takeFromOtherQuestionReturnCount == 0) {
+          firstTakeFromOtherQuestion = ret.getTakeFromOtherQuestion();
+        } else if (takeFromOtherQuestionReturnCount == 1) {
+          ret.setTakeFromOtherQuestion(KJ_ASSERT_NONNULL(firstTakeFromOtherQuestion));
+        }
+        ++takeFromOtherQuestionReturnCount;
+      }
+    }
+    return true;
+  });
+
+  auto caller = context.alice.connect<test::TestTailCaller>("carol");
+
+  int calleeCallCount = 0;
+  test::TestTailCallee::Client callee(kj::heap<TestTailCalleeImpl>(calleeCallCount));
+
+  {
+    auto request = caller.fooRequest();
+    request.setCallee(callee);
+    auto promise = request.send();
+    KJ_ASSERT(!promise.poll(context.waitScope));
+
+    // Unblock Carol and cancel in the same turn to force the canceled-question race path while
+    // still ensuring the call executes.
+    paf.fulfiller->fulfill();
+    promise = nullptr;
+  }
+
+  for (uint i = 0; i < 16 && takeFromOtherQuestionReturnCount < 1; i++) {
+    kj::yield().wait(context.waitScope);
+  }
+  KJ_ASSERT(takeFromOtherQuestionReturnCount == 1);
+
+  auto request = caller.fooRequest();
+  request.setCallee(callee);
+  auto livePromise = request.send();
+
+  KJ_EXPECT_THROW(DISCONNECTED, livePromise.wait(context.waitScope));
+  KJ_EXPECT(takeFromOtherQuestionReturnCount >= 2);
 }
 
 KJ_TEST("cancellation") {
@@ -1356,6 +1432,210 @@ KJ_TEST("embargos block CapabilityServerSet") {
   KJ_EXPECT(unwrappedAt >= 3, unwrappedAt);
 }
 
+class TestPromiseEchoer final: public test::TestMoreStuff::Server {
+  // Helper for constructing the receiverHosted version of the CapabilityServerSet unwrap test.
+  // The first echo() returns a promise and saves the input capability. fulfill() resolves that
+  // promise to the saved input, while the second echo() behaves like a normal echo server.
+
+public:
+  kj::Promise<void> echo(EchoContext context) override {
+    auto params = context.getParams();
+
+    if (fulfiller == kj::none) {
+      capToResolve = params.getCap();
+      auto paf = kj::newPromiseAndFulfiller<test::TestCallOrder::Client>();
+      fulfiller = kj::mv(paf.fulfiller);
+      context.getResults().setCap(kj::mv(paf.promise));
+    } else {
+      context.getResults().setCap(params.getCap());
+    }
+
+    return kj::READY_NOW;
+  }
+
+  void fulfill() {
+    KJ_ASSERT_NONNULL(fulfiller)->fulfill(kj::mv(capToResolve));
+  }
+
+private:
+  kj::Maybe<kj::Own<kj::PromiseFulfiller<test::TestCallOrder::Client>>> fulfiller;
+  test::TestCallOrder::Client capToResolve = nullptr;
+};
+
+KJ_TEST("RequireEmbargoWrapper shouldn't block CapabilityServerSet unwrap (RECEIVER_HOSTED)") {
+  // This test verifies that RequireEmbargoWrapper's use in the RECEIVER_HOSTED case of receiveCap()
+  // does not interfece with CapabilityServerSet unwrapping.
+
+  TestContext context;
+
+  capnp::CapabilityServerSet<test::TestCallOrder> capSet;
+
+  // Use a custom server so that Alice first receives a promise hosted by Carol, then later sends
+  // that same promise back to Carol after Carol has locally resolved it.
+  auto ownServer = kj::heap<TestPromiseEchoer>();
+  auto server = ownServer.get();
+  auto& carol = context.initVat("carol", kj::mv(ownServer));
+  auto client = context.alice.connect<test::TestMoreStuff>("carol");
+
+  // Create the local capability that should survive the round trip and remain unwrappable by
+  // CapabilityServerSet after all promise resolution has completed.
+  TestCallOrderImpl* ptr;
+  auto ownCap = kj::heap<TestCallOrderImpl>();
+  ptr = ownCap;
+  auto cap = capSet.add(kj::mv(ownCap));
+
+  // The first echo() returns a Carol-hosted promise to Alice and saves Alice's local capability as
+  // the eventual resolution of that promise.
+  auto echoRequest = client.echoRequest();
+  echoRequest.setCap(cap);
+  auto echo = echoRequest.send();
+
+  auto reflectedPromise = echo.wait(context.waitScope).getCap();
+
+  // Block Carol's Resolve message to Alice. Carol will update its own export table entry to point
+  // back at Alice's local capability, but Alice will still believe reflectedPromise is unresolved.
+  auto& carolToAlice = KJ_ASSERT_NONNULL(
+      carol.vatNetwork.getConnectionTo(context.alice.vatNetwork));
+  carolToAlice.block();
+
+  server->fulfill();
+  context.waitScope.poll();
+
+  // Send the unresolved promise back to Carol. Since Carol's export table entry for that promise
+  // has already resolved to an ImportClient pointing back to Alice, Carol receives this as a
+  // receiverHosted descriptor that gets a RequireEmbargoWrapper in the RECEIVER_HOSTED case of
+  // receiveCap().
+  auto echoAgainRequest = client.echoRequest();
+  echoAgainRequest.setCap(reflectedPromise);
+  auto echoAgain = echoAgainRequest.send();
+  context.waitScope.poll();
+
+  // Now let Alice learn about the promise resolution and verify that the reflected capability can
+  // still resolve through to the local server. A RequireEmbargoWrapper here prevents that final
+  // resolution and makes CapabilityServerSet fail to unwrap.
+  carolToAlice.unblock();
+  auto roundTripCap = echoAgain.wait(context.waitScope).getCap();
+
+  auto& roundTripObj = KJ_ASSERT_NONNULL(capSet.getLocalServer(roundTripCap).wait(
+      context.waitScope));
+  KJ_EXPECT(&roundTripObj == ptr);
+}
+
+KJ_TEST("RequireEmbargoWrapper shouldn't block CapabilityServerSet unwrap (RECEIVER_ANSWER)") {
+  // This test verifies that RequireEmbargoWrapper's use in the RECEIVER_ANSWER case of receiveCap()
+  // does not interfece with CapabilityServerSet unwrapping.
+
+  TestContext context;
+
+  capnp::CapabilityServerSet<test::TestCallOrder> capSet;
+
+  auto client = context.connect().getTestMoreStuffRequest().send().getCap();
+
+  // Create a local capability registered with CapabilityServerSet. If the RPC machinery fully
+  // resolves a reflected promise back to this local capability, getLocalServer() should be able to
+  // unwrap it at the end of the test.
+  TestCallOrderImpl* ptr;
+  auto ownCap = kj::heap<TestCallOrderImpl>();
+  ptr = ownCap;
+  auto cap = capSet.add(kj::mv(ownCap));
+
+  // Send the local capability to Bob, who will just echo it back. But, immediately use the
+  // pipelined result before Bob's response arrives. The pipelined capability is represented by a
+  // receiverAnswer descriptor when reflected back to Alice below.
+  auto echoRequest = client.echoRequest();
+  echoRequest.setCap(cap);
+  auto echo = echoRequest.send();
+
+  auto pipeline = echo.getCap();
+
+  // Reflect the pipelined capability through a second echo(). Alice receives a capability that
+  // should eventually resolve all the way back to the local TestCallOrderImpl.
+  auto echoAgainRequest = client.echoRequest();
+  echoAgainRequest.setCap(pipeline);
+  auto echoAgain = echoAgainRequest.send();
+
+  auto roundTripCap = echoAgain.getCap();
+
+  // Wait for both RPCs to complete so there are no outstanding protocol messages left to make the
+  // capability appear more local later. If RequireEmbargoWrapper hides further resolution here,
+  // CapabilityServerSet incorrectly concludes the capability is not one of its local servers.
+  echo.wait(context.waitScope);
+  echoAgain.wait(context.waitScope);
+
+  auto& roundTripObj = KJ_ASSERT_NONNULL(capSet.getLocalServer(roundTripCap).wait(
+      context.waitScope));
+  KJ_EXPECT(&roundTripObj == ptr);
+}
+
+KJ_TEST("RequireEmbargoWrapper has its intended effect (RECEIVER_HOSTED)") {
+  // This test verifies that RequireEmbargoWrapper is used properly in the RECEIVER_HOSTED case of
+  // receiveCap(). Commenting out the creation of the RequireEmbargoWrapper wrapper there should
+  // break this test.
+
+  TestContext context;
+
+  auto client = context.connect().getTestMoreStuffRequest().send().getCap();
+
+  // Export a promise to Bob. Alice will later resolve it to Bob's own TestMoreStuff capability,
+  // creating a reflected-hosted version of the Tribble race.
+  auto paf = kj::newPromiseAndFulfiller<test::TestCallOrder::Client>();
+  auto cap = test::TestCallOrder::Client(kj::mv(paf.promise));
+
+  auto echoRequest = client.echoRequest();
+  echoRequest.setCap(cap);
+  auto echo = echoRequest.send();
+
+  // Block Bob's response so Alice continues using the promise pipeline while Bob still holds a
+  // reference to Alice's exported promise.
+  auto& bobToAlice = KJ_ASSERT_NONNULL(
+      context.bob.vatNetwork.getConnectionTo(context.alice.vatNetwork));
+  bobToAlice.block();
+
+  context.waitScope.poll();
+
+  // Block Alice's Resolve message to Bob, then resolve the exported promise to Bob's own
+  // capability. Alice updates her export table entry before Bob learns about the resolution.
+  auto& aliceToBob = KJ_ASSERT_NONNULL(
+      context.alice.vatNetwork.getConnectionTo(context.bob.vatNetwork));
+  aliceToBob.block();
+
+  paf.fulfiller->fulfill(client.castAs<test::TestCallOrder>());
+  context.waitScope.poll();
+
+  // This call goes to Bob through the original promise pipeline and is held behind Alice's blocked
+  // connection.
+  auto pipeline = echo.getCap();
+  auto call0 = getCallSequence(pipeline, 1);
+
+  // Let Alice receive Bob's echo result while Bob still has not received Alice's Resolve. The
+  // echoed capability refers to Alice's export table via receiverHosted, and receiveCap()'s
+  // `receiverHosetd` switch case needs to force an embargo because that export now points back at
+  // Bob.
+  bobToAlice.unblock();
+  echo.wait(context.waitScope);
+
+  // Allow the first call to proceed but prevent the disembargo response from returning yet.
+  bobToAlice.block();
+  aliceToBob.unblock();
+
+  // This second call goes through the reflected receiverHosted capability. It must not overtake
+  // call0 even though the reflected capability appears to point directly back to Bob.
+  auto call1 = getCallSequence(pipeline, 2);
+
+  // Both calls should wait until Bob's disembargo response reaches Alice.
+  KJ_EXPECT(!call0.poll(context.waitScope));
+  KJ_EXPECT(!call1.poll(context.waitScope));
+
+  bobToAlice.unblock();
+
+  KJ_EXPECT(call0.wait(context.waitScope).getN() == 1);
+  KJ_EXPECT(call1.wait(context.waitScope).getN() == 2);
+}
+
+// Neither GPT 5.5 nor Opus 4.7 were able to come up with any test to verify RequireEmbargoWrapper's
+// behavior in the RECEIVER_ANSWER case in receiveCap(). It may be that there is no reasonable
+// way to test this case. I certainly can't think of one.
+
 template <typename T>
 void expectPromiseThrows(kj::Promise<T>&& promise, kj::WaitScope& waitScope) {
   KJ_EXPECT(promise.then([](T&&) { return false; }, [](kj::Exception&&) { return true; })
@@ -1517,6 +1797,43 @@ KJ_TEST("abort") {
   KJ_EXPECT(conn->receiveIncomingMessage().wait(context.waitScope) == kj::none);
 }
 
+KJ_TEST("abort with invalid exception type") {
+  // Regression test: a peer sends an abort message with an out-of-range Exception::type.
+  // Cap'n Proto enums are raw UInt16 on the wire, so any value 0-65535 is possible.
+  // The server must handle this gracefully (clamp to FAILED) rather than crashing
+  // due to an out-of-bounds array access in KJ_STRINGIFY(Exception::Type).
+
+  TestContext context;
+
+  MallocMessageBuilder refMessage(128);
+  auto hostId = refMessage.initRoot<test::TestSturdyRefHostId>();
+  hostId.setHost("bob");
+
+  auto conn = KJ_ASSERT_NONNULL(context.alice.vatNetwork.connect(hostId));
+  conn->setIdle(false);
+
+  {
+    // Send an abort with an out-of-range exception type (0xFFFF).
+    auto msg = conn->newOutgoingMessage(128);
+    auto abort = msg->getBody().initAs<rpc::Message>().initAbort();
+    abort.setReason("malformed type test");
+    abort.setType(static_cast<rpc::Exception::Type>(0xFFFF));
+    msg->send();
+  }
+
+  // The server should handle the malformed abort without crashing. It disconnects and
+  // sends its own abort back (with the clamped exception type).
+  auto reply = KJ_ASSERT_NONNULL(conn->receiveIncomingMessage().wait(context.waitScope));
+  KJ_EXPECT(reply->getBody().getAs<rpc::Message>().which() == rpc::Message::ABORT);
+
+  // Verify the abort response has a valid (clamped) exception type.
+  auto responseException = reply->getBody().getAs<rpc::Message>().getAbort();
+  KJ_EXPECT(responseException.getType() == rpc::Exception::Type::FAILED);
+
+  // Connection should then close.
+  KJ_EXPECT(conn->receiveIncomingMessage().wait(context.waitScope) == kj::none);
+}
+
 KJ_TEST("handles exceptions thrown during disconnect") {
   // This is similar to the earlier "abort" test, but throws an exception on
   // connection shutdown, to exercise the RpcConnectionState error handler.
@@ -1587,7 +1904,7 @@ KJ_TEST("method throws exception") {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
 
-  auto exception = KJ_ASSERT_NONNULL(maybeException);
+  auto& exception = KJ_ASSERT_NONNULL(maybeException);
   KJ_EXPECT(exception.getDescription() == "remote exception: test exception");
   KJ_EXPECT(exception.getRemoteTrace() == nullptr);
 }
@@ -1603,7 +1920,7 @@ KJ_TEST("method throws exception won't redundantly add remote exception prefix")
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
 
-  auto exception = KJ_ASSERT_NONNULL(maybeException);
+  auto& exception = KJ_ASSERT_NONNULL(maybeException);
   KJ_EXPECT(exception.getDescription() == "remote exception: test exception");
   KJ_EXPECT(exception.getRemoteTrace() == nullptr);
 }
@@ -1623,7 +1940,7 @@ KJ_TEST("method throws exception with trace encoder") {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
 
-  auto exception = KJ_ASSERT_NONNULL(maybeException);
+  auto& exception = KJ_ASSERT_NONNULL(maybeException);
   KJ_EXPECT(exception.getDescription() == "remote exception: test exception");
   KJ_EXPECT(exception.getRemoteTrace() == "trace for test exception");
 }
@@ -1639,7 +1956,7 @@ KJ_TEST("method throws exception with detail") {
     maybeException = kj::mv(e);
   }).wait(context.waitScope);
 
-  auto exception = KJ_ASSERT_NONNULL(maybeException);
+  auto& exception = KJ_ASSERT_NONNULL(maybeException);
   KJ_EXPECT(exception.getDescription() == "remote exception: test exception");
   KJ_EXPECT(exception.getRemoteTrace() == nullptr);
   auto detail = KJ_ASSERT_NONNULL(exception.getDetail(1));
@@ -2174,7 +2491,7 @@ private:
 
     auto req = next.holdRequest();
     req.setCap(kj::mv(cap));
-    co_await req.send();
+    co_await req.sendIgnoringResult();
 
     // (hold() has no results)
   }
@@ -2690,6 +3007,52 @@ KJ_TEST("AdaptiveFlowController: minimum window is enforced") {
   KJ_EXPECT(estimatedWindow <= 96 * 1024, estimatedWindow);
   KJ_EXPECT(estimatedWindow >= 64 * 1024, estimatedWindow);
 }
+
+KJ_TEST("AdaptiveFlowController: destroying with blocked senders fulfills them") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  TestClock clock;
+  auto fc = RpcFlowController::newAdaptiveController(256 * 1024, clock);
+
+  // Send a 256KB message to fill most of the window. The ack never arrives (NEVER_DONE),
+  // simulating a dead follower.
+  auto msg1 = kj::heap<MockMessage>(256 * 1024);
+  fc->send(kj::mv(msg1), kj::NEVER_DONE).poll(waitScope);
+
+  // Second send blocks — window is full since the first ack never arrived.
+  auto msg2 = kj::heap<MockMessage>(256 * 1024);
+  auto blockedPromise = fc->send(kj::mv(msg2), kj::NEVER_DONE);
+  KJ_EXPECT(!blockedPromise.poll(waitScope));
+
+  // Destroy the flow controller while a sender is blocked.
+  fc = nullptr;
+
+  // The blocked promise should be fulfilled (not rejected).
+  blockedPromise.wait(waitScope);
+}
+
+KJ_TEST("WindowFlowController: destroying with blocked senders fulfills them") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  auto fc = RpcFlowController::newFixedWindowController(256 * 1024);
+
+  // Send a 256KB message to fill most of the window. The ack never arrives,
+  // simulating a dead follower.
+  auto msg1 = kj::heap<MockMessage>(256 * 1024);
+  fc->send(kj::mv(msg1), kj::NEVER_DONE).poll(waitScope);
+
+  // Second send blocks — window is full since the first ack never arrived.
+  auto msg2 = kj::heap<MockMessage>(256 * 1024);
+  auto blockedPromise = fc->send(kj::mv(msg2), kj::NEVER_DONE);
+  KJ_EXPECT(!blockedPromise.poll(waitScope));
+
+  // Destroy the flow controller while a sender is blocked.
+  fc = nullptr;
+
+  // The blocked promise should be fulfilled (not rejected).
+  blockedPromise.wait(waitScope);
+}
+
 
 }  // namespace
 }  // namespace _ (private)

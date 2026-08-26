@@ -40,6 +40,7 @@
 #endif
 
 #include "async.h"
+#include "atomic.h"
 #include "debug.h"
 #include "vector.h"
 #include "mutex.h"
@@ -47,8 +48,8 @@
 #include "function.h"
 #include "list.h"
 #include "map.h"
-#include <deque>
 #include <atomic>
+#include <deque>
 
 #if __linux__
 #include <sys/prctl.h>
@@ -93,27 +94,6 @@
 // Nop the hints so that we don't have to put #ifdefs around every use.
 #define __sanitizer_start_switch_fiber(...)
 #define __sanitizer_finish_switch_fiber(...)
-#endif
-
-#if _MSC_VER && !__clang__
-// MSVC's atomic intrinsics are weird and different, whereas the C++ standard atomics match the GCC
-// builtins -- except for requiring the obnoxious std::atomic<T> wrapper. So, on MSVC let's just
-// #define the builtins based on the C++ library, reinterpret-casting native types to
-// std::atomic... this is cheating but ugh, whatever.
-template <typename T>
-static std::atomic<T>* reinterpretAtomic(T* ptr) { return reinterpret_cast<std::atomic<T>*>(ptr); }
-#define __atomic_store_n(ptr, val, order) \
-    std::atomic_store_explicit(reinterpretAtomic(ptr), val, order)
-#define __atomic_load_n(ptr, order) \
-    std::atomic_load_explicit(reinterpretAtomic(ptr), order)
-#define __atomic_compare_exchange_n(ptr, expected, desired, weak, succ, fail) \
-    std::atomic_compare_exchange_strong_explicit( \
-        reinterpretAtomic(ptr), expected, desired, succ, fail)
-#define __atomic_exchange_n(ptr, val, order) \
-    std::atomic_exchange_explicit(reinterpretAtomic(ptr), val, order)
-#define __ATOMIC_RELAXED std::memory_order_relaxed
-#define __ATOMIC_ACQUIRE std::memory_order_acquire
-#define __ATOMIC_RELEASE std::memory_order_release
 #endif
 
 namespace kj {
@@ -166,6 +146,7 @@ AllowAsyncDestructorsScope::~AllowAsyncDestructorsScope() {
 namespace {
 
 thread_local EventLoop* threadLocalEventLoop = nullptr;
+thread_local _::Event* threadLocalCurrentlyFiring = nullptr;
 
 #define _kJ_ALREADY_READY reinterpret_cast< ::kj::_::Event*>(1)
 
@@ -182,10 +163,7 @@ public:
 
   bool fired = false;
 
-  Maybe<Own<_::Event>> fire() override {
-    fired = true;
-    return kj::none;
-  }
+  void fire() override { fired = true; }
 
   void traceEvent(_::TraceBuilder& builder) override {
     node->tracePromise(builder, true);
@@ -224,7 +202,7 @@ void Canceler::cancel(const Exception& exception) {
   for (;;) {
     KJ_IF_SOME(a, list) {
       a.unlink();
-      a.cancel(kj::cp(exception));
+      a.cancel(exception.clone());
     } else {
       break;
     }
@@ -315,7 +293,7 @@ public:
   }
 
 protected:
-  Maybe<Own<Event>> fire() override {
+  void fire() override {
     // Get the result.
     _::ExceptionOr<_::Void> result;
     node->get(result);
@@ -330,6 +308,8 @@ protected:
     // Remove from the task list. Do this before calling taskFailed(), so that taskFailed() can
     // safely call clear().
     auto self = pop();
+    // self will be destroyed on scope exit.
+    self->permitSelfDestruction();
 
     // We'll also process onEmpty() now, just in case `taskFailed()` actually destroys the whole
     // `TaskSet`.
@@ -351,8 +331,6 @@ protected:
         taskSet.errorHandler.taskFailed(kj::mv(e));
       })();
     }
-
-    return Own<Event>(mv(self));
   }
 
   void traceEvent(_::TraceBuilder& builder) override {
@@ -600,7 +578,7 @@ public:
 #if USE_CORE_LOCAL_FREELISTS
     KJ_IF_SOME(core, lookupCoreLocalFreelist()) {
       for (auto& stackPtr: core.stacks) {
-        _::FiberStack* result = __atomic_exchange_n(&stackPtr, nullptr, __ATOMIC_ACQUIRE);
+        _::FiberStack* result = kj::atomicExchange(&stackPtr, nullptr, kj::AtomicMemoryOrder::ACQUIRE);
         if (result != nullptr) {
           // Found a stack in this slot!
           return { result, *this };
@@ -675,7 +653,7 @@ private:
 #if USE_CORE_LOCAL_FREELISTS
       KJ_IF_SOME(core, lookupCoreLocalFreelist()) {
         for (auto& stackPtr: core.stacks) {
-          stack = __atomic_exchange_n(&stackPtr, stack, __ATOMIC_RELEASE);
+          stack = kj::atomicExchange(&stackPtr, stack, kj::AtomicMemoryOrder::RELEASE);
           if (stack == nullptr) {
             // Cool, we inserted the stack into an unused slot. We're done.
             return;
@@ -797,7 +775,8 @@ struct Executor::Impl {
 
       for (auto& event: fulfilled) {
         fulfilled.remove(event);
-        event.state = _::XThreadPaf::DISPATCHED;
+        kj::atomicStore(&event.control->state, _::XThreadPafControl::DISPATCHED,
+            kj::AtomicMemoryOrder::RELEASE);
         event.onReadyEvent.armBreadthFirst();
       }
     }
@@ -892,7 +871,8 @@ struct Executor::Impl {
       KJ_LOG(ERROR, "EventLoop destroyed with cross-thread fulfiller replies outstanding");
       for (auto& event: s.fulfilled) {
         s.fulfilled.remove(event);
-        event.state = _::XThreadPaf::DISPATCHED;
+        kj::atomicStore(&event.control->state, _::XThreadPafControl::DISPATCHED,
+            kj::AtomicMemoryOrder::RELEASE);
       }
     }
   }};
@@ -911,7 +891,7 @@ void XThreadEvent::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 }
 
 void XThreadEvent::ensureDoneOrCanceled() {
-  if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != DONE) {
+  if (kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) != DONE) {
     auto lock = targetExecutor->impl->state.lockExclusive();
 
     const EventLoop* loop;
@@ -920,7 +900,9 @@ void XThreadEvent::ensureDoneOrCanceled() {
     } else {
       // Target event loop is already dead, so we know it's already working on transitioning all
       // events to the DONE state. We can just wait.
-      lock.wait([&](auto&) { return state == DONE; });
+      lock.wait([&](auto&) {
+        return kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) == DONE;
+      });
       return;
     }
 
@@ -975,7 +957,7 @@ void XThreadEvent::ensureDoneOrCanceled() {
             // after this scope.
           });
 
-          while (state != DONE) {
+          while (kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) != DONE) {
             bool otherThreadIsWaiting = lock->waitingForCancel;
 
             // Make sure our waitingForCancel is on and dispatch any pending cancellations on this
@@ -1014,7 +996,8 @@ void XThreadEvent::ensureDoneOrCanceled() {
             // OK, now we can wait for the other thread to either process our cancellation or
             // indicate that it is waiting for remote cancellation.
             lock.wait([&](const Executor::Impl::State& executorState) {
-              return state == DONE || executorState.waitingForCancel;
+              return kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) == DONE ||
+                  executorState.waitingForCancel;
             });
           }
         } else {
@@ -1023,7 +1006,9 @@ void XThreadEvent::ensureDoneOrCanceled() {
           //
           // NOTE: I don't think we can actually get here, because it implies that this is a
           //   synchronous execution, which means there's no way to cancel it.
-          lock.wait([&](auto&) { return state == DONE; });
+          lock.wait([&](auto&) {
+            return kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) == DONE;
+          });
         }
         KJ_DASSERT(!targetLink.isLinked());
         break;
@@ -1106,7 +1091,7 @@ void XThreadEvent::done() {
 }
 
 inline void XThreadEvent::setDoneState() {
-  __atomic_store_n(&state, DONE, __ATOMIC_RELEASE);
+  kj::atomicStore(&state, DONE, kj::AtomicMemoryOrder::RELEASE);
 }
 
 void XThreadEvent::setDisconnected() {
@@ -1114,34 +1099,13 @@ void XThreadEvent::setDisconnected() {
       "Executor's event loop exited before cross-thread event could complete"));
 }
 
-class XThreadEvent::DelayedDoneHack: public Disposer {
-  // Crazy hack: In fire(), we want to call done() if the event is finished. But done() signals
-  // the requesting thread to wake up and possibly delete the XThreadEvent. But the caller (the
-  // EventLoop) still has to set `event->firing = false` after `fire()` returns, so this would be
-  // a race condition use-after-free.
-  //
-  // It just so happens, though, that fire() is allowed to return an optional `Own<Event>` to drop,
-  // and the caller drops that pointer immediately after setting event->firing = false. So we
-  // return a pointer whose disposer calls done().
-  //
-  // It's not quite as much of a hack as it seems: The whole reason fire() returns an Own<Event> is
-  // so that the event can delete itself, but do so after the caller sets event->firing = false.
-  // It just happens to be that in this case, the event isn't deleting itself, but rather releasing
-  // itself back to the other thread.
-
-protected:
-  void disposeImpl(void* pointer) const override {
-    reinterpret_cast<XThreadEvent*>(pointer)->done();
-  }
-};
-
-Maybe<Own<Event>> XThreadEvent::fire() {
-  static constexpr DelayedDoneHack DISPOSER {};
-
+void XThreadEvent::fire() {
   KJ_IF_SOME(n, promiseNode) {
     n->get(result);
     promiseNode = kj::none;  // make sure to destroy in the thread that created it
-    return Own<Event>(this, DISPOSER);
+    // Done might delete this.
+    permitSelfDestruction();
+    done();
   } else {
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
       promiseNode = execute();
@@ -1151,11 +1115,11 @@ Maybe<Own<Event>> XThreadEvent::fire() {
     KJ_IF_SOME(n, promiseNode) {
       n->onReady(this);
     } else {
-      return Own<Event>(this, DISPOSER);
+      // Done might delete this.
+      permitSelfDestruction();
+      done();
     }
   }
-
-  return kj::none;
 }
 
 void XThreadEvent::traceEvent(TraceBuilder& builder) {
@@ -1171,27 +1135,33 @@ void XThreadEvent::onReady(Event* event) noexcept {
   onReadyEvent.init(event);
 }
 
-XThreadPaf::XThreadPaf(Own<const Executor> executor)
-    : state(WAITING), executor(kj::mv(executor)) {}
+XThreadPaf::XThreadPaf(Own<const Executor> executor, Arc<XThreadPafControl> control)
+    : executor(kj::mv(executor)), control(kj::mv(control)) {}
 XThreadPaf::~XThreadPaf() noexcept(false) {}
 
 void XThreadPaf::destroy() {
-  auto oldState = WAITING;
+  auto oldState = XThreadPafControl::WAITING;
 
-  if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == DISPATCHED) {
+  if (kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::ACQUIRE) == XThreadPafControl::DISPATCHED) {
     // Common case: Promise was fully fulfilled and dispatched, no need for locking.
     delete this;
-  } else if (__atomic_compare_exchange_n(&state, &oldState, CANCELED, false,
-                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+  } else if (kj::atomicCompareExchange(
+                 &control->state, &oldState, XThreadPafControl::CANCELED, false,
+                 kj::AtomicMemoryOrder::ACQUIRE_RELEASE,
+                 kj::AtomicMemoryOrder::ACQUIRE)) {
     // State transitioned from WAITING to CANCELED, so now it's the fulfiller's job to destroy the
-    // object.
+    // object. The successful CAS must have release semantics, not merely acquire semantics: this
+    // publishes this thread's preceding accesses to the object (including the virtual destroy()
+    // dispatch) before the fulfiller observes CANCELED and deletes the object.
   } else {
     // Whoops, another thread is already in the process of fulfilling this promise. We'll have to
     // wait for it to finish and transition the state to FULFILLED.
     executor->impl->state.when([&](auto&) {
-      return state == FULFILLED || state == DISPATCHED;
+      auto state = kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::ACQUIRE);
+      return state == XThreadPafControl::FULFILLED || state == XThreadPafControl::DISPATCHED;
     }, [&](Executor::Impl::State& exState) {
-      if (state == FULFILLED) {
+      if (kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::ACQUIRE) ==
+          XThreadPafControl::FULFILLED) {
         // The object is on the queue but was not yet dispatched. Remove it.
         exState.fulfilled.remove(*this);
       }
@@ -1214,16 +1184,17 @@ void XThreadPaf::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 }
 
 XThreadPaf::FulfillScope::FulfillScope(XThreadPaf** pointer) {
-  obj = __atomic_exchange_n(pointer, static_cast<XThreadPaf*>(nullptr), __ATOMIC_ACQUIRE);
-  auto oldState = WAITING;
+  obj = kj::atomicExchange(pointer, static_cast<XThreadPaf*>(nullptr), kj::AtomicMemoryOrder::ACQUIRE);
+  auto oldState = XThreadPafControl::WAITING;
   if (obj == nullptr) {
     // Already fulfilled (possibly by another thread).
-  } else if (__atomic_compare_exchange_n(&obj->state, &oldState, FULFILLING, false,
-                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+  } else if (kj::atomicCompareExchange(
+                 &obj->control->state, &oldState, XThreadPafControl::FULFILLING, false,
+                 kj::AtomicMemoryOrder::ACQUIRE, kj::AtomicMemoryOrder::ACQUIRE)) {
     // Transitioned to FULFILLING, good.
   } else {
     // The waiting thread must have canceled.
-    KJ_ASSERT(oldState == CANCELED);
+    KJ_ASSERT(oldState == XThreadPafControl::CANCELED);
 
     // It's our responsibility to clean up, then.
     delete obj;
@@ -1236,7 +1207,7 @@ XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
   if (obj != nullptr) {
     auto lock = obj->executor->impl->state.lockExclusive();
     lock->fulfilled.add(*obj);
-    __atomic_store_n(&obj->state, FULFILLED, __ATOMIC_RELEASE);
+    kj::atomicStore(&obj->control->state, XThreadPafControl::FULFILLED, kj::AtomicMemoryOrder::RELEASE);
     KJ_IF_SOME(l, lock->loop) {
       // TODO(perf): It's annoying we have to call wake() with the lock held, but we have to
       //   prevent the destination EventLoop from being destroyed first.
@@ -1452,7 +1423,7 @@ struct FiberStack::Impl {
     // reuse. When we're done with the fiber, we just destroy it, without switching to it's
     // stack. This is safe since the start routine doesn't allocate any memory or RAII objects
     // before looping.
-    context->uc_link = 0;
+    context->uc_link = nullptr;
 
     return impl;
   }
@@ -1646,11 +1617,10 @@ void FiberBase::cancel() {
   }
 }
 
-Maybe<Own<Event>> FiberBase::fire() {
+void FiberBase::fire() {
   KJ_ASSERT(state == WAITING);
   state = RUNNING;
   stack->switchToFiber();
-  return kj::none;
 }
 
 void FiberStack::switchToFiber() {
@@ -1750,8 +1720,14 @@ void EventPort::wake() const {
       "cross-thread wake() not implemented by this EventPort implementation"));
 }
 
+namespace {
+std::atomic<size_t> nextEventLoopId(0);
+// Global counter used to assign a unique id to each EventLoop.
+}  // namespace
+
 EventLoop::EventLoop(kj::Maybe<EventLoopObserver&> observer)
-    : observer(observer), daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {
+    : loopId(nextEventLoopId.fetch_add(1, std::memory_order_relaxed)),
+      observer(observer), daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {
   auto link = [](_::Event& prev, _::Event& next) {
     prev.next = &next;
     next.prev = &prev.next;
@@ -1845,13 +1821,10 @@ bool EventLoop::turn() {
   };
   resetDepthFirstInsertPoint();
 
-  Maybe<Own<_::Event>> eventToDestroy;
   {
-    event->firing = true;
-    KJ_DEFER(event->firing = false);
-    currentlyFiring = event;
-    KJ_DEFER(currentlyFiring = nullptr);
-    eventToDestroy = event->fire();
+    threadLocalCurrentlyFiring = event;
+    KJ_DEFER(threadLocalCurrentlyFiring = nullptr);
+    event->fire();
   }
 
   resetDepthFirstInsertPoint();
@@ -1882,6 +1855,15 @@ void EventLoop::setRunnable(bool runnable) {
 void EventLoop::enterScope() {
   KJ_REQUIRE(threadLocalEventLoop == nullptr, "This thread already has an EventLoop.");
   threadLocalEventLoop = this;
+}
+
+EventLoop::Id EventLoop::id() const { return Id(loopId); }
+
+EventLoop::Id EventLoop::Id::current() { return currentEventLoop().id(); }
+
+void EventLoop::Id::assertCurrentEventLoop() const {
+  EventLoop* loop = threadLocalEventLoop;
+  KJ_ASSERT(loop != nullptr && loop->loopId == id);
 }
 
 void EventLoop::leaveScope() {
@@ -2197,74 +2179,46 @@ kj::EventLoop& Event::requireEventLoop() {
 }
 
 Event::~Event() noexcept {  // intentionally noexcept
-  live = 0;
-
-  // Prevent compiler from eliding this store above. This line probably isn't needed because there
-  // are complex calls later in this destructor, and the compiler probably can't prove that they
-  // won't come back and examine `live`, so it won't elide the write anyway. However, an
-  // atomic_signal_fence is also sufficient to tell the compiler that a signal handler might access
-  // `live`, so it won't optimize away the write. Note that a signal fence does not produce
-  // any instructions, it just blocks compiler optimizations.
-  std::atomic_signal_fence(std::memory_order_acq_rel);
-
+  if (KJ_UNLIKELY(threadLocalCurrentlyFiring == this)) {
+    // If this fails, we'll abort due to `noexcept`. That's good because otherwise we're likely to
+    // be in a use-after-free situation.
+    KJ_FAIL_REQUIRE("Promise callback destroyed itself.");
+  }
   disarm();
+}
 
-  // If this fails, we'll abort due to `noexcept`. That's good because otherwise we're likely to
-  // be in a use-after-free situation.
-  KJ_REQUIRE(!firing, "Promise callback destroyed itself.");
+void Event::permitSelfDestruction() {
+  KJ_REQUIRE(threadLocalCurrentlyFiring == this, "Event needs to be firing.");
+  threadLocalCurrentlyFiring = nullptr;
 }
 
 void Event::armDepthFirst() {
-  auto& loop = requireEventLoop();
-  if (live != MAGIC_LIVE_VALUE) {
-    ([this]() noexcept {
-      KJ_FAIL_ASSERT("tried to arm Event after it was destroyed", location);
-    })();
-  }
-
   if (prev == nullptr) {
+    auto& loop = requireEventLoop();
     insertBefore(loop.depthFirstInsertPoint);
     loop.setRunnable(true);
   }
 }
 
 void Event::armBreadthFirst() {
-  auto& loop = requireEventLoop();
-  if (live != MAGIC_LIVE_VALUE) {
-    ([this]() noexcept {
-      KJ_FAIL_ASSERT("tried to arm Event after it was destroyed", location);
-    })();
-  }
-
   if (prev == nullptr) {
+    auto& loop = requireEventLoop();
     insertBefore(loop.breadthFirstInsertPoint);
     loop.setRunnable(true);
   }
 }
 
 void Event::armLast() {
-  auto& loop = requireEventLoop();
-  if (live != MAGIC_LIVE_VALUE) {
-    ([this]() noexcept {
-      KJ_FAIL_ASSERT("tried to arm Event after it was destroyed", location);
-    })();
-  }
-
   if (prev == nullptr) {
+    auto& loop = requireEventLoop();
     insertAfter(loop.breadthFirstInsertPoint);
     loop.setRunnable(true);
   }
 }
 
 void Event::armWhenWouldSleep() {
-  auto& loop = requireEventLoop();
-  if (live != MAGIC_LIVE_VALUE) {
-    ([this]() noexcept {
-      KJ_FAIL_ASSERT("tried to arm Event after it was destroyed", location);
-    })();
-  }
-
   if (prev == nullptr) {
+    auto& loop = requireEventLoop();
     insertAfter(loop.wouldSleepHead);
     loop.setRunnable(true);
   }
@@ -2295,12 +2249,10 @@ String TraceBuilder::toString() {
 }  // namespace _ (private)
 
 ArrayPtr<void* const> getAsyncTrace(ArrayPtr<void*> space) {
-  EventLoop* loop = threadLocalEventLoop;
-  if (loop == nullptr) return nullptr;
-  if (loop->currentlyFiring == nullptr) return nullptr;
+  if (threadLocalCurrentlyFiring == nullptr) return nullptr;
 
   _::TraceBuilder builder(space);
-  loop->currentlyFiring->traceEvent(builder);
+  threadLocalCurrentlyFiring->traceEvent(builder);
   return builder.finish();
 }
 
@@ -2519,7 +2471,7 @@ ForkHubBase::ForkHubBase(OwnPromiseNode&& innerParam, ExceptionOrValue& resultRe
   inner->onReady(this);
 }
 
-Maybe<Own<Event>> ForkHubBase::fire() {
+void ForkHubBase::fire() {
   // Dependency is ready.  Fetch its result and then delete the node.
   inner->get(resultRef);
   KJ_IF_SOME(exception, kj::runCatchingExceptions([this]() {
@@ -2537,8 +2489,6 @@ Maybe<Own<Event>> ForkHubBase::fire() {
 
   // Indicate that the list is no longer active.
   tailBranch = nullptr;
-
-  return kj::none;
 }
 
 void ForkHubBase::traceEvent(TraceBuilder& builder) {
@@ -2601,7 +2551,7 @@ void ChainPromiseNode::tracePromise(TraceBuilder& builder, bool stopAtNextEvent)
   inner->tracePromise(builder, stopAtNextEvent);
 }
 
-Maybe<Own<Event>> ChainPromiseNode::fire() {
+void ChainPromiseNode::fire() {
   KJ_REQUIRE(state != STEP2);
 
   static_assert(sizeof(Promise<int>) == sizeof(PromiseBase),
@@ -2635,21 +2585,19 @@ Maybe<Own<Event>> ChainPromiseNode::fire() {
   if (selfPtr != nullptr) {
     // Hey, we can shorten the chain here.
     auto chain = selfPtr->downcast<ChainPromiseNode>();
+    // self will be destroyed on scope exit.
+    chain->permitSelfDestruction();
+
     *selfPtr = kj::mv(inner);
     selfPtr->get()->setSelfPointer(selfPtr);
     if (onReadyEvent != nullptr) {
       selfPtr->get()->onReady(onReadyEvent);
     }
-
-    // Return our self-pointer so that the caller takes care of deleting it.
-    return Own<Event>(kj::Own<ChainPromiseNode>(kj::mv(chain)));
   } else {
     inner->setSelfPointer(&inner);
     if (onReadyEvent != nullptr) {
       inner->onReady(onReadyEvent);
     }
-
-    return kj::none;
   }
 }
 
@@ -2722,7 +2670,7 @@ bool ExclusiveJoinPromiseNode::Branch::get(ExceptionOrValue& output) {
   }
 }
 
-Maybe<Own<Event>> ExclusiveJoinPromiseNode::Branch::fire() {
+void ExclusiveJoinPromiseNode::Branch::fire() {
   if (dependency) {
     // Cancel the branch that didn't return first.  Ignore exceptions caused by cancellation.
     if (this == &joinNode.left) {
@@ -2736,7 +2684,6 @@ Maybe<Own<Event>> ExclusiveJoinPromiseNode::Branch::fire() {
     // The other branch already fired, and this branch was canceled. It's possible for both
     // branches to fire if both were armed simultaneously.
   }
-  return kj::none;
 }
 
 void ExclusiveJoinPromiseNode::Branch::traceEvent(TraceBuilder& builder) {
@@ -2815,7 +2762,7 @@ ArrayJoinPromiseNodeBase::Branch::Branch(
 
 ArrayJoinPromiseNodeBase::Branch::~Branch() noexcept(false) {}
 
-Maybe<Own<Event>> ArrayJoinPromiseNodeBase::Branch::fire() {
+void ArrayJoinPromiseNodeBase::Branch::fire() {
   if (--joinNode.countLeft == 0 && !joinNode.armed) {
     joinNode.onReadyEvent.arm();
     joinNode.armed = true;
@@ -2829,8 +2776,6 @@ Maybe<Own<Event>> ArrayJoinPromiseNodeBase::Branch::fire() {
       joinNode.armed = true;
     }
   }
-
-  return kj::none;
 }
 
 void ArrayJoinPromiseNodeBase::Branch::traceEvent(TraceBuilder& builder) {
@@ -2904,11 +2849,11 @@ RaceSuccessfulPromiseNodeBase::Branch::Branch(
 
 RaceSuccessfulPromiseNodeBase::Branch::~Branch() noexcept(false) {}
 
-Maybe<Own<Event>> RaceSuccessfulPromiseNodeBase::Branch::fire() {
+void RaceSuccessfulPromiseNodeBase::Branch::fire() {
   if (parent.armed) {
     // the parent node has already received the value, no need to bother with
     // anything
-    return kj::none;
+    return;
   }
 
   auto count = --parent.countLeft;
@@ -2933,8 +2878,6 @@ Maybe<Own<Event>> RaceSuccessfulPromiseNodeBase::Branch::fire() {
     parent.armed = true;
     parent.onReadyEvent.arm();
   }
-
-  return kj::none;
 }
 
 void RaceSuccessfulPromiseNodeBase::Branch::traceEvent(TraceBuilder &builder) {
@@ -3055,7 +2998,7 @@ void EagerPromiseNodeBase::traceEvent(TraceBuilder& builder) {
   onReadyEvent.traceEvent(builder);
 }
 
-Maybe<Own<Event>> EagerPromiseNodeBase::fire() {
+void EagerPromiseNodeBase::fire() {
   dependency->get(resultRef);
   KJ_IF_SOME(exception, kj::runCatchingExceptions([this]() {
     dependency = nullptr;
@@ -3064,7 +3007,6 @@ Maybe<Own<Event>> EagerPromiseNodeBase::fire() {
   }
 
   onReadyEvent.arm();
-  return kj::none;
 }
 
 // -------------------------------------------------------------------
@@ -3166,7 +3108,7 @@ void CoroutineBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
   builder.add(GetFunctorStartAddress<>::apply(coroutine));
 };
 
-Maybe<Own<Event>> CoroutineBase::fire() {
+void CoroutineBase::fire() {
   // Call PromiseAwaiter::await_resume() and proceed with the coroutine. Note that this will not
   // destroy the coroutine if control flows off the end of it, because we return suspend_always()
   // from final_suspend().
@@ -3177,8 +3119,6 @@ Maybe<Own<Event>> CoroutineBase::fire() {
   // try-catch block, so we have no choice but to resume and throw later.
 
   coroutine.resume();
-
-  return kj::none;
 }
 
 void CoroutineBase::traceEvent(TraceBuilder& builder) {

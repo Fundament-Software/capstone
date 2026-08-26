@@ -21,6 +21,7 @@
 
 #define CAPNP_PRIVATE
 #include "layout.h"
+#include <kj/atomic.h>
 #include <kj/debug.h>
 #include "arena.h"
 #include <string.h>
@@ -28,6 +29,9 @@
 
 #if !CAPNP_LITE
 #include "capability.h"
+#if !KJ_NO_RTTI
+#include <typeinfo>
+#endif  // !KJ_NO_RTTI
 #endif  // !CAPNP_LITE
 
 namespace capnp {
@@ -41,23 +45,13 @@ static BrokenCapFactory* globalBrokenCapFactory = nullptr;
 void setGlobalBrokenCapFactoryForLayoutCpp(BrokenCapFactory& factory) {
   // Called from capability.c++ when the capability API is used, to make sure that layout.c++
   // is ready for it.  May be called multiple times but always with the same value.
-#if __GNUC__ || defined(__clang__)
-  __atomic_store_n(&globalBrokenCapFactory, &factory, __ATOMIC_RELAXED);
-#elif _MSC_VER
-  *static_cast<BrokenCapFactory* volatile*>(&globalBrokenCapFactory) = &factory;
-#else
-#error "Platform not supported"
-#endif
+  kj::atomicStore(&globalBrokenCapFactory, &factory, kj::AtomicMemoryOrder::RELAXED);
 }
 
 static BrokenCapFactory* readGlobalBrokenCapFactoryForLayoutCpp() {
-#if __GNUC__ || defined(__clang__)
   // Thread-sanitizer doesn't have the right information to know this is safe without doing an
   // atomic read. https://groups.google.com/g/capnproto/c/634juhn5ap0/m/pyRiwWl1AAAJ
-  return __atomic_load_n(&globalBrokenCapFactory, __ATOMIC_RELAXED);
-#else
-  return globalBrokenCapFactory;
-#endif
+  return kj::atomicLoad(&globalBrokenCapFactory, kj::AtomicMemoryOrder::RELAXED);
 }
 
 }  // namespace _ (private)
@@ -65,6 +59,19 @@ static BrokenCapFactory* readGlobalBrokenCapFactoryForLayoutCpp() {
 const uint ClientHook::NULL_CAPABILITY_BRAND = 0;
 const uint ClientHook::BROKEN_CAPABILITY_BRAND = 0;
 // Defined here rather than capability.c++ so that we can safely call isNull() in this file.
+
+void ClientHook::debugInfo(kj::Vector<kj::ConstString>& chain) {
+  // Defined here rather than capability.c++ because when compiling in UBSAN mode specifically,
+  // the compiler emits references to the type info block for ClientHook in some translation units
+  // that #include capability.h even if they don't explicitly use ClientHook, so we need it to be
+  // emitted as part of libcapnp rather than libcapnp-rpc.
+
+#if KJ_NO_RTTI
+  chain.add("unknown"_kjc);
+#else
+  chain.add(kj::str(typeid(*this).name()));
+#endif
+}
 
 namespace _ {  // private
 
@@ -394,7 +401,7 @@ struct WireHelpers {
 #endif
 
   static KJ_ALWAYS_INLINE(void zeroMemory(byte* ptr, ByteCount32 count)) {
-    if (count != ZERO * BYTES) memset(ptr, 0, unbound(count / BYTES));
+    if (count != ZERO * BYTES) kj::arrayPtr(ptr, unbound(count / BYTES)).fill(0);
   }
 
   static KJ_ALWAYS_INLINE(void zeroMemory(word* ptr, WordCountN<29> count)) {
@@ -411,7 +418,7 @@ struct WireHelpers {
 
   template <typename T>
   static inline void zeroMemory(kj::ArrayPtr<T> array) {
-    if (array.size() != 0u) memset(array.begin(), 0, array.size() * sizeof(array[0]));
+    if (array.size() != 0u) array.asBytes().fill(0);
   }
 
   static KJ_ALWAYS_INLINE(void copyMemory(byte* to, const byte* from, ByteCount32 count)) {

@@ -360,7 +360,7 @@ public:
   Array<const byte> mmap(uint64_t offset, uint64_t size) const {
     if (size == 0) return nullptr;  // zero-length mmap() returns EINVAL, so avoid it
     auto range = getMmapRange(offset, size);
-    const void* mapping = ::mmap(NULL, range.size, PROT_READ, MAP_SHARED, fd, range.offset);
+    const void* mapping = ::mmap(nullptr, range.size, PROT_READ, MAP_SHARED, fd, range.offset);
     if (mapping == MAP_FAILED) {
       KJ_FAIL_SYSCALL("mmap", errno);
     }
@@ -371,7 +371,7 @@ public:
   Array<byte> mmapPrivate(uint64_t offset, uint64_t size) const {
     if (size == 0) return nullptr;  // zero-length mmap() returns EINVAL, so avoid it
     auto range = getMmapRange(offset, size);
-    void* mapping = ::mmap(NULL, range.size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, range.offset);
+    void* mapping = ::mmap(nullptr, range.size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, range.offset);
     if (mapping == MAP_FAILED) {
       KJ_FAIL_SYSCALL("mmap", errno);
     }
@@ -500,7 +500,7 @@ public:
       return heap<WritableFileMappingImpl>(nullptr);
     }
     auto range = getMmapRange(offset, size);
-    void* mapping = ::mmap(NULL, range.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, range.offset);
+    void* mapping = ::mmap(nullptr, range.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, range.offset);
     if (mapping == MAP_FAILED) {
       KJ_FAIL_SYSCALL("mmap", errno);
     }
@@ -558,8 +558,7 @@ public:
           return stat().size;
         }
       } else if (size > 0) {    // src_length = 0 has special meaning for the syscall, so avoid.
-        struct file_clone_range range;
-        memset(&range, 0, sizeof(range));
+        struct file_clone_range range = {};
         range.src_fd = otherFd;
         range.dest_offset = offset;
         range.src_offset = fromOffset;

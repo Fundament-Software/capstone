@@ -241,7 +241,7 @@ public:
     return result;
   }
 
-  inline bool operator==(decltype(nullptr)) const { return size_ == 0; }
+  inline constexpr bool operator==(decltype(nullptr)) const { return size_ == 0; }
 
   inline Array& operator=(decltype(nullptr)) {
     dispose();
@@ -271,6 +271,10 @@ public:
   inline auto as() const { return asImpl((U*)nullptr, *this); }
   // Syntax sugar for invoking asImpl(U*, const Array&).
   // Used to chain conversion calls rather than wrap with function.
+
+  auto clone() requires (Cloneable<T> || Copyable<T>);
+  auto clone() const requires (Cloneable<const T> || Copyable<const T>);
+  // Deep-clone or copy to a new heap array element-by-element.
 
   inline bool hasNullDisposer() const {return disposer == &NullArrayDisposer::instance; }
   // Returns true if array uses NullArrayDisposer, intended for use with string literal
@@ -371,13 +375,13 @@ public:
                         const ArrayDisposer& disposer)
       : ptr(firstElement), pos(firstElement), endPtr(firstElement + capacity),
         disposer(&disposer) {}
-  ArrayBuilder(ArrayBuilder&& other)
+  ArrayBuilder(ArrayBuilder&& other) noexcept
       : ptr(other.ptr), pos(other.pos), endPtr(other.endPtr), disposer(other.disposer) {
     other.ptr = nullptr;
     other.pos = nullptr;
     other.endPtr = nullptr;
   }
-  ArrayBuilder(Array<T>&& other)
+  ArrayBuilder(Array<T>&& other) noexcept
       : ptr(other.ptr), pos(other.ptr + other.size_), endPtr(pos), disposer(other.disposer) {
     // Create an already-full ArrayBuilder from an Array of the same type. This constructor
     // primarily exists to enable Vector<T> to be constructed from Array<T>.
@@ -749,7 +753,8 @@ struct ArrayDisposer::Dispose_ {
 };
 
 template <typename T>
-void ArrayDisposer::dispose(T* firstElement, size_t elementCount, size_t capacity) const {
+KJ_DISPOSE_ATTR void ArrayDisposer::dispose(
+    T* firstElement, size_t elementCount, size_t capacity) const {
   if constexpr (KJ_HAS_TRIVIAL_DESTRUCTOR(T)) {
     disposeImpl(const_cast<RemoveConst<T>*>(firstElement),
                          sizeof(T), elementCount, capacity, nullptr);
@@ -800,7 +805,7 @@ template <typename T, bool move>
 struct CopyConstructArray_<T, T*, move, true> {
   static inline T* apply(T* __restrict__ pos, T* start, T* end) {
     if (end != start) {
-      memcpy(pos, start, reinterpret_cast<byte*>(end) - reinterpret_cast<byte*>(start));
+      kj::arrayPtr(pos, end - start).copyFrom(kj::arrayPtr(start, end));
     }
     return pos + (end - start);
   }
@@ -810,7 +815,7 @@ template <typename T>
 struct CopyConstructArray_<T, const T*, false, true> {
   static inline T* apply(T* __restrict__ pos, const T* start, const T* end) {
     if (end != start) {
-      memcpy(pos, start, reinterpret_cast<const byte*>(end) - reinterpret_cast<const byte*>(start));
+      kj::arrayPtr(pos, end - start).copyFrom(kj::arrayPtr(start, end));
     }
     return pos + (end - start);
   }
@@ -947,6 +952,26 @@ heapArray(Iterator begin, Iterator end) {
 template <typename T>
 inline Array<T> heapArray(std::initializer_list<T> init) {
   return heapArray<T>(init.begin(), init.end());
+}
+
+template <typename T>
+inline auto ArrayPtr<T>::clone() requires (Cloneable<T> || Copyable<T>) {
+  return KJ_MAP(value, *this) { return _::copyOrClone(value); };
+}
+
+template <typename T>
+inline auto ArrayPtr<T>::clone() const requires (Cloneable<const T> || Copyable<const T>) {
+  return KJ_MAP(value, *this) { return _::copyOrClone(value); };
+}
+
+template <typename T>
+inline auto Array<T>::clone() requires (Cloneable<T> || Copyable<T>) {
+  return asPtr().clone();
+}
+
+template <typename T>
+inline auto Array<T>::clone() const requires (Cloneable<const T> || Copyable<const T>) {
+  return asPtr().clone();
 }
 
 template <typename T, typename... Params>

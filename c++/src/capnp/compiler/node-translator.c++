@@ -1791,8 +1791,8 @@ void NodeTranslator::compileDefaultDefaultValue(
     // TODO(cleanup):  Create a cleaner way to do this.
     case schema::Type::TEXT: target.adoptText(Orphan<Text>()); break;
     case schema::Type::DATA: target.adoptData(Orphan<Data>()); break;
-    case schema::Type::STRUCT: target.initStruct(); break;
-    case schema::Type::LIST: target.initList(); break;
+    case schema::Type::STRUCT: target.adoptStruct(Orphan<AnyStruct>()); break;
+    case schema::Type::LIST: target.adoptList(Orphan<AnyList>()); break;
     case schema::Type::ANY_POINTER: target.initAnyPointer(); break;
   }
 }
@@ -2080,7 +2080,7 @@ Orphan<DynamicValue> ValueTranslator::compileValueInner(Expression::Reader src, 
           case schema::Type::TEXT: {
             // Sadly, we need to make a copy to add the NUL terminator.
             auto text = orphanage.newOrphan<Text>(data.size());
-            memcpy(text.get().begin(), data.begin(), data.size());
+            text.get().asBytes().copyFrom(data);
             return kj::mv(text);
           }
           case schema::Type::DATA:
@@ -2112,7 +2112,7 @@ Orphan<DynamicValue> ValueTranslator::compileValueInner(Expression::Reader src, 
             } else {
               // Ugh, data not aligned. Make a copy.
               copy = kj::heapArray<word>(data.size() / sizeof(word));
-              memcpy(copy.begin(), data.begin(), data.size());
+              copy.asBytes().copyFrom(data);
               words = copy;
             }
             ReaderOptions options;

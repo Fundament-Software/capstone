@@ -29,6 +29,10 @@
 #include <kj/vector.h>
 #include "generated-header-support.h"
 
+#if !KJ_NO_RTTI
+#include <typeinfo>
+#endif
+
 namespace capnp {
 
 namespace _ {
@@ -79,6 +83,12 @@ kj::Promise<kj::Maybe<int>> Capability::Client::getFd() {
   } else {
     return kj::Maybe<int>(kj::none);
   }
+}
+
+kj::String Capability::Client::debugInfo() {
+  kj::Vector<kj::ConstString> vec;
+  hook->debugInfo(vec);
+  return kj::strArray(vec, ":");
 }
 
 kj::Maybe<kj::Promise<Capability::Client>> Capability::Server::shortenPath() {
@@ -463,6 +473,15 @@ public:
     }
   }
 
+  void debugInfo(kj::Vector<kj::ConstString>& chain) override {
+    KJ_IF_SOME(r, redirect) {
+      chain.add("resolved"_kjc);
+      r->debugInfo(chain);
+    } else {
+      chain.add("promise"_kjc);
+    }
+  }
+
 private:
   typedef kj::ForkedPromise<kj::Own<ClientHook>> ClientHookPromiseFork;
 
@@ -736,6 +755,24 @@ public:
     }
   }
 
+  void debugInfo(kj::Vector<kj::ConstString>& chain) override {
+    KJ_IF_SOME(e, brokenException) {
+      chain.add("broken"_kjc);
+      chain.add(kj::str(e));
+    } else KJ_IF_SOME(r, resolved) {
+      chain.add("shortened"_kjc);
+      r->debugInfo(chain);
+    } else KJ_IF_SOME(s, server) {
+      chain.add("local"_kjc);
+#if !KJ_NO_RTTI
+      auto& ref = *s;
+      chain.add(kj::str(typeid(ref).name()));
+#endif
+    } else {
+      chain.add("revoked"_kjc);
+    }
+  }
+
 private:
   kj::Maybe<kj::Own<Capability::Server>> server;
   _::CapabilityServerSetBase* capServerSet = nullptr;
@@ -865,7 +902,7 @@ private:
 
     KJ_IF_SOME(e, brokenException) {
       // Previous streaming call threw, so everything fails from now on.
-      return kj::cp(e);
+      return e.clone();
     }
 
     // `server` can't be null here since `brokenException` is null.
@@ -889,7 +926,7 @@ private:
     if (result.isStreaming) {
       return result.promise
           .catch_([this](kj::Exception&& e) {
-        brokenException = kj::cp(e);
+        brokenException = e.clone();
         kj::throwRecoverableException(kj::mv(e));
       }).attach(BlockingScope(*this));
     } else {
@@ -989,7 +1026,7 @@ namespace {
 
 class BrokenPipeline final: public PipelineHook, public kj::Refcounted {
 public:
-  BrokenPipeline(const kj::Exception& exception): exception(exception) {}
+  BrokenPipeline(const kj::Exception& exception): exception(exception.clone()) {}
 
   kj::Own<PipelineHook> addRef() override {
     return kj::addRef(*this);
@@ -1004,15 +1041,15 @@ private:
 class BrokenRequest final: public RequestHook {
 public:
   BrokenRequest(const kj::Exception& exception, kj::Maybe<MessageSize> sizeHint)
-      : exception(exception), message(firstSegmentSize(sizeHint)) {}
+      : exception(exception.clone()), message(firstSegmentSize(sizeHint)) {}
 
   RemotePromise<AnyPointer> send() override {
-    return RemotePromise<AnyPointer>(kj::cp(exception),
+    return RemotePromise<AnyPointer>(exception.clone(),
         AnyPointer::Pipeline(kj::refcounted<BrokenPipeline>(exception)));
   }
 
   kj::Promise<void> sendStreaming() override {
-    return kj::cp(exception);
+    return exception.clone();
   }
 
   AnyPointer::Pipeline sendForPipeline() override {
@@ -1026,7 +1063,7 @@ public:
 class BrokenClient final: public ClientHook, public kj::Refcounted {
 public:
   BrokenClient(const kj::Exception& exception, bool resolved, const void* brand)
-      : ClientHook(brand), exception(exception), resolved(resolved) {}
+      : ClientHook(brand), exception(exception.clone()), resolved(resolved) {}
   BrokenClient(const kj::StringPtr description, bool resolved, const void* brand)
       : ClientHook(brand), exception(kj::Exception::Type::FAILED, "", 0, kj::str(description)),
         resolved(resolved) {}
@@ -1034,12 +1071,12 @@ public:
   Request<AnyPointer, AnyPointer> newCall(
       uint64_t interfaceId, uint16_t methodId, kj::Maybe<MessageSize> sizeHint,
       CallHints hints) override {
-    return newBrokenRequest(kj::cp(exception), sizeHint);
+    return newBrokenRequest(exception.clone(), sizeHint);
   }
 
   VoidPromiseAndPipeline call(uint64_t interfaceId, uint16_t methodId,
                               kj::Own<CallContextHook>&& context, CallHints hints) override {
-    return VoidPromiseAndPipeline { kj::cp(exception), kj::refcounted<BrokenPipeline>(exception) };
+    return VoidPromiseAndPipeline { exception.clone(), kj::refcounted<BrokenPipeline>(exception) };
   }
 
   kj::Maybe<ClientHook&> getResolved() override {
@@ -1050,7 +1087,7 @@ public:
     if (resolved) {
       return kj::none;
     } else {
-      return kj::Promise<kj::Own<ClientHook>>(kj::cp(exception));
+      return kj::Promise<kj::Own<ClientHook>>(exception.clone());
     }
   }
 
@@ -1060,6 +1097,11 @@ public:
 
   kj::Maybe<int> getFd() override {
     return kj::none;
+  }
+
+  void debugInfo(kj::Vector<kj::ConstString>& chain) override {
+    chain.add("broken"_kjc);
+    chain.add(kj::str(exception));
   }
 
 private:

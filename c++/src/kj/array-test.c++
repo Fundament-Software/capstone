@@ -29,6 +29,40 @@
 namespace kj {
 namespace {
 
+struct CloneableElement {
+  int clone() const { return 123; }
+};
+
+struct NonConstCloneableElement {
+  int clone() { return 123; }
+};
+
+struct NonCloneableElement {};
+
+struct NonCloneableNonCopyableElement {
+  NonCloneableNonCopyableElement() = default;
+  NonCloneableNonCopyableElement(const NonCloneableNonCopyableElement&) = delete;
+};
+
+static_assert(Cloneable<Array<CloneableElement>>);
+static_assert(Cloneable<const Array<CloneableElement>>);
+static_assert(Cloneable<ArrayPtr<CloneableElement>>);
+static_assert(Cloneable<const ArrayPtr<CloneableElement>>);
+static_assert(Cloneable<Array<NonConstCloneableElement>>);
+static_assert(Cloneable<const Array<NonConstCloneableElement>>);
+static_assert(Cloneable<ArrayPtr<NonConstCloneableElement>>);
+static_assert(Cloneable<const ArrayPtr<NonConstCloneableElement>>);
+static_assert(Cloneable<Array<NonCloneableElement>>);
+static_assert(Cloneable<const Array<NonCloneableElement>>);
+static_assert(Cloneable<ArrayPtr<NonCloneableElement>>);
+static_assert(Cloneable<const ArrayPtr<NonCloneableElement>>);
+static_assert(Cloneable<Array<int>>);
+static_assert(Cloneable<const Array<int>>);
+static_assert(Cloneable<ArrayPtr<int>>);
+static_assert(Cloneable<const ArrayPtr<int>>);
+static_assert(!Cloneable<Array<NonCloneableNonCopyableElement>>);
+static_assert(!Cloneable<ArrayPtr<NonCloneableNonCopyableElement>>);
+
 struct TestObject {
   TestObject() {
     index = count;
@@ -404,6 +438,46 @@ TEST(Array, HeapCopy) {
   }
 }
 
+KJ_TEST("ArrayPtr clone") {
+  StringPtr values[] = {"foo", "bar"};
+  ArrayPtr<const StringPtr> original(values);
+  Array<String> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], "foo");
+  EXPECT_EQ(cloned[1], "bar");
+  EXPECT_NE(cloned[0].begin(), original[0].begin());
+  EXPECT_NE(cloned[1].begin(), original[1].begin());
+}
+
+KJ_TEST("Array clone") {
+  Array<const StringPtr> original = heapArray<const StringPtr>({"baz", "qux"});
+  Array<String> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], "baz");
+  EXPECT_EQ(cloned[1], "qux");
+  EXPECT_NE(cloned[0].begin(), original[0].begin());
+  EXPECT_NE(cloned[1].begin(), original[1].begin());
+}
+
+KJ_TEST("ArrayPtr clone copies copyable elements") {
+  int values[] = {12, 34};
+  ArrayPtr<const int> original(values);
+  Array<int> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], 12);
+  EXPECT_EQ(cloned[1], 34);
+  EXPECT_NE(cloned.begin(), original.begin());
+}
+
+KJ_TEST("Array clone copies copyable elements") {
+  Array<int> original = heapArray<int>({56, 78});
+  Array<int> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], 56);
+  EXPECT_EQ(cloned[1], 78);
+  EXPECT_NE(cloned.begin(), original.begin());
+}
+
 TEST(Array, OwnConst) {
   ArrayBuilder<int> builder = heapArrayBuilder<int>(2);
   int x[2] = {123, 234};
@@ -702,6 +776,85 @@ KJ_TEST("Array::slice(start) const") {
   // start > size
   KJ_EXPECT_THROW(FAILED, arr.slice(5));
 #endif
+}
+
+KJ_TEST("ArrayPtr::split") {
+  {
+    const char text[] = "foo,,bar,";
+    StringPtr expected[] = {"foo", "", "bar", ""};
+
+    size_t i = 0;
+    for (auto part: kj::arrayPtr(text, sizeof(text) - 1).split(',')) {
+      ASSERT_LT(i, kj::size(expected));
+      KJ_EXPECT(part == expected[i], i, part, expected[i]);
+      ++i;
+    }
+
+    KJ_EXPECT(i == kj::size(expected));
+  }
+
+  {
+    const char text[] = "foobar";
+    size_t i = 0;
+    for (auto part: kj::arrayPtr(text, sizeof(text) - 1).split(',')) {
+      KJ_EXPECT(i == 0);
+      KJ_EXPECT(part == "foobar"_kj);
+      ++i;
+    }
+
+    KJ_EXPECT(i == 1);
+  }
+
+  {
+    size_t i = 0;
+    for (auto part: kj::ArrayPtr<const char>().split(',')) {
+      KJ_EXPECT(i == 0);
+      KJ_EXPECT(part == ""_kj);
+      ++i;
+    }
+
+    KJ_EXPECT(i == 1);
+  }
+}
+
+KJ_TEST("ArrayPtr::findFirst empty optimized types") {
+  KJ_EXPECT(kj::ArrayPtr<const char>().findFirst(',') == kj::none);
+  KJ_EXPECT(kj::ArrayPtr<char>().findFirst(',') == kj::none);
+  KJ_EXPECT(kj::ArrayPtr<const byte>().findFirst(byte{123}) == kj::none);
+  KJ_EXPECT(kj::ArrayPtr<byte>().findFirst(byte{123}) == kj::none);
+}
+
+KJ_TEST("ArrayPtr::split mutable") {
+  int values[] = {1, 0, 2, 3, 0, 4};
+  int expectedFirst[] = {11, 12, 14};
+
+  size_t i = 0;
+  for (auto part: kj::arrayPtr(values).split(0)) {
+    if (part.size() > 0) {
+      ASSERT_LT(i, kj::size(expectedFirst));
+      part[0] += 10;
+      KJ_EXPECT(part[0] == expectedFirst[i]);
+    }
+    ++i;
+  }
+
+  KJ_EXPECT(i == 3);
+  KJ_EXPECT(kj::ArrayPtr<const int>(values) == kj::arr(11, 0, 12, 3, 0, 14));
+}
+
+KJ_TEST("ArrayPtr::split const") {
+  const int values[] = {1, 0, 2};
+  const auto split = kj::arrayPtr(values).split(0);
+  static_assert(kj::isSameType<decltype(*split.begin()), kj::ArrayPtr<const int>>());
+
+  size_t i = 0;
+  for (auto part: split) {
+    KJ_ASSERT(i < 2);
+    KJ_EXPECT(part == kj::arr(i == 0 ? 1 : 2));
+    ++i;
+  }
+
+  KJ_EXPECT(i == 2);
 }
 
 KJ_TEST("FixedArray::fill") {

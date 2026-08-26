@@ -22,10 +22,7 @@
 #pragma once
 
 #include "memory.h"
-
-#if _MSC_VER && !defined(__clang__)
-#include <intrin0.h> // _InterlockedXX
-#endif
+#include "atomic.h"
 
 KJ_BEGIN_HEADER
 
@@ -36,6 +33,44 @@ namespace kj {
 
 template<typename T>
 class Rc;
+
+template<typename T>
+class WeakRc;
+
+template <typename T, typename... Params>
+Rc<T> rc(Params&&... params);
+
+class Refcounted;
+
+namespace _ {  // private
+
+template <typename T> class RcWrapper;
+template <typename T> class RcOwnWrapper;
+
+class RcWeakCell {
+  // Shared validity cell backing kj::WeakRc<T>, the weak companion of kj::Rc<T>.
+  //
+  // The strong side (the Refcounted object) owns one reference while the referent is alive; each
+  // WeakRc owns one reference. When the last strong reference is dropped, `refcounted` is nulled
+  // before the strong-side reference is released, allowing outstanding WeakRc pointers to observe
+  // expiration safely. The cell outlives the referent so that expiration can be detected, and is
+  // freed once both the strong side and all WeakRc references are gone.
+
+public:
+  explicit RcWeakCell(Refcounted* refcounted): refcounted(refcounted) {}
+
+  inline void addRef() { ++refcount; }
+  inline void decRef() { if (--refcount == 0) { delete this; } }
+
+  Refcounted* refcounted;
+  // The live Refcounted object, or nullptr once the last strong reference has been dropped.
+
+private:
+  size_t refcount = 1;
+  // Starts at 1 to account for the strong-side reference held while `refcounted` is non-null.
+};
+
+}  // namespace _ (private)
 
 class Refcounted: private Disposer {
   // Subclass this to create a class that contains a reference count. Then, use
@@ -77,17 +112,41 @@ protected:
     return addRcRefInternal(&self);
   }
 
+  inline auto addWeakToThis(this auto&& self) {
+    return addWeakRefInternal(&self);
+  }
+
 private:
-  mutable uint refcount = 0;
+  mutable uint refcount = 1;
+  // A Refcounted object is born with a reference count of 1: it always comes into existence owned
+  // by exactly one strong reference (the Own<T>/Rc<T> returned by kj::refcounted()/kj::rc()). This
+  // means the object is in a valid, fully-counted state throughout its constructor, so addRefToThis()
+  // and addWeakToThis() may be called from within the constructor.
   // "mutable" because disposeImpl() is const.  Bleh.
 
+  mutable _::RcWeakCell* weakCell = nullptr;
+  // Lazily-allocated shared cell backing any kj::WeakRc<T> referencing this object. Nulled and
+  // released when the last strong reference is dropped (see disposeImpl()).
+  // "mutable" because disposeImpl() is const.
+
   void disposeImpl(void* pointer) const override;
+
+  inline _::RcWeakCell* getWeakCell() {
+    // Lazily allocate (or return the existing) weak cell for this object.
+    if (weakCell == nullptr) {
+      weakCell = new _::RcWeakCell(this);
+    }
+    return weakCell;
+  }
 
   template <typename T>
   static Own<T> addRefInternal(T* object);
 
   template <typename T>
   static Rc<T> addRcRefInternal(T* object);
+
+  template <typename T>
+  static WeakRc<T> addWeakRefInternal(T* object);
 
   template <typename T>
   friend Own<T> addRef(T& object);
@@ -102,22 +161,20 @@ private:
 
   template <typename T>
   friend class Rc;
+
+  template <typename T>
+  friend class WeakRc;
+
+  template <typename T> friend class _::RcWrapper;
+  template <typename T> friend class _::RcOwnWrapper;
 };
 
 template <typename T, typename... Params>
 inline Own<T> refcounted(Params&&... params) {
   // Allocate a new refcounted instance of T, passing `params` to its constructor.  Returns an
   // initial reference to the object.  More references can be created with `kj::addRef()`.
-
-  return Refcounted::addRefInternal(new T(kj::fwd<Params>(params)...));
-}
-
-template <typename T, typename... Params>
-inline Rc<T> rc(Params&&... params) {
-  // Allocate a new refcounted instance of T, passing `params` to its constructor.
-  // Returns smart pointer that can be used to manage references.
-
-  return Refcounted::addRcRefInternal(new T(kj::fwd<Params>(params)...));
+  T* object = new T(kj::fwd<Params>(params)...);
+  return Own<T>(object, *static_cast<Refcounted*>(object));
 }
 
 template <typename T>
@@ -142,85 +199,384 @@ Rc<T> Refcounted::addRcRefInternal(T* object) {
   static_assert(kj::canConvert<T&, Refcounted&>());
   Refcounted* refcounted = object;
   ++refcounted->refcount;
-  return Rc<T>(object);
+  return Rc<T>(refcounted, object);
 }
+
+namespace _ {  // private
+
+template <typename T>
+class RcWrapper final: public Refcounted {
+public:
+  template <typename... Params>
+  explicit RcWrapper(Params &&...params) : wrapped(kj::fwd<Params>(params)...) {}
+  T* getWrappedPtr() { return &wrapped; }
+  const T *getWrappedPtr() const { return &wrapped; }
+
+private:
+  T wrapped;
+};
+
+template <typename T>
+class RcOwnWrapper final: public Refcounted {
+public:
+  explicit RcOwnWrapper(Own<T> &&wrapped) : wrapped(kj::mv(wrapped)) {}
+  T* getWrappedPtr() { return wrapped.get(); }
+  const T *getWrappedPtr() const { return wrapped.get(); }
+
+private:
+  Own<T> wrapped;
+};
+
+}  // namespace _ (private)
 
 template<typename T>
 class Rc {
-  // Smart pointer for reference counted objects.
+  // Rc<T> is a smart pointer providing reference counting capabilities for all kinds of Ts.
   //
-  // There are only three ways to obtain new Rc instances:
-  // - use kj::rc<T>(...) function to create new T.
-  // - use kj::Rc::addRef() and the existing Rc instance.
+  // The primary way to obtain new `Rc<T>` instance is to use `kj::rc<T>(...)`, which allocates
+  // a new T on the heap. If T extends Refcounted, T's `refcount` field is used for counting.
+  // Otherwise, `kj::rc` allocates `RcWrapper<T>` to provide a `refcount`.
+  //
+  // Rc<T> can also be constructed from:
+  // - kj::Own<T> for all types of T. Allocates a wrapper.
+  // - T for non-`Refcounted` Ts with move constructor. Allocates a wrapper.
+  //
+  // Once you have `Rc<T>` you can `addRef` or `clone` it to increment the refcount and obtain new
+  // smart pointer.
   //
   // Suggested usage patterns are:
   // - return kj::Rc as value from factory functions:
-  //     kj::Rc<MyService> createMyService();
-  // - pass kj::Rc as rvalue to functions that need to extend T's lifetime:
-  //     void setMyService(kj::Rc<MyService>&& service)
+  //     `kj::Rc<MyService> createMyService();`
+  // - pass kj::Rc as value to functions that need to extend T's lifetime:
+  //     void setMyService(kj::Rc<MyService> service)
   // - store kj::Rc as data member:
   //     struct MyComputation { kj::Rc<MyService> service; };
   // - use toOwn to convert kj::Rc<T> instance to kj::Own<T> and use it
   //     without being concerned of reference counting behavior.
   //     To improve the transparency of the code, kj::Own<T> shouldn't be used
   //     to call addRef() without kj::Rc.
-
+  // - convert kj::Own<T> to kj::Rc<T> to wrap an object into refcounted hold.
 public:
   KJ_DISALLOW_COPY(Rc);
   Rc() { }
   Rc(decltype(nullptr)) { }
-  inline Rc(Rc&& other) noexcept = default;
-
-  template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
-  inline Rc(Rc<U>&& other) noexcept : own(kj::mv(other.own)) { }
-
-  kj::Own<T> toOwn() {
-    // Convert Rc<T> to Own<T>.
-    // Nullifies the original Rc<T>.
-    return kj::mv(own);
+  inline Rc(Rc&& other) noexcept : refcounted(other.refcounted), ptr(other.ptr) {
+    other.refcounted = nullptr;
+    other.ptr = nullptr;
   }
 
-  kj::Rc<T> addRef() {
-    T* refcounted = own.get();
-    if (refcounted != nullptr) {
-      return Refcounted::addRcRefInternal(refcounted);
+  ~Rc() noexcept(false) { dispose(); }
+
+  template <typename U = T, typename = EnableIf<canConvert<U*, T*>()>>
+  inline Rc(Rc<U>&& other) noexcept : refcounted(other.refcounted), ptr(other.ptr) {
+    other.refcounted = nullptr;
+    other.ptr = nullptr;
+  }
+
+  template <typename U, typename = EnableIf<isSameType<U, T>()>>
+  inline Rc(U t) noexcept {
+    // This and below do not use concepts, but templates and static_asserts.
+    // Concepts require T to be fully defined, but Rc<T> is often used with forward-declared T.
+    // This function is declared as template to help msvc in polymorphic base class case.
+    static_assert(!canConvert<T*, Refcounted*>());
+    auto wrapper = new _::RcWrapper<U>(mv(t));
+    refcounted = wrapper;
+    ptr = wrapper->getWrappedPtr();
+  }
+
+  inline Rc(Own<T> t) noexcept {
+    if (t.get() == nullptr) return;
+    auto wrapper = new _::RcOwnWrapper<T>(mv(t));
+    refcounted = wrapper;
+    ptr = wrapper->getWrappedPtr();
+  }
+
+  Own<T> toOwn() {
+    // Convert Rc<T> to Own<T>.
+    // Nullifies the original Rc<T>.
+    if (ptr == nullptr) return Own<T>();
+    auto result = Own<T>(ptr, *refcounted);
+    refcounted = nullptr;
+    ptr = nullptr;
+    return result;
+  }
+
+  Rc<T> addRef() {
+    if (ptr != nullptr) {
+      ++refcounted->refcount;
+      return Rc(refcounted, ptr);
     } else {
-      return kj::Rc<T>();
+      return Rc<T>();
     }
   }
 
+  Rc<T> clone() {
+    return addRef();
+  }
+
+  // Surrenders ownership of the underlying object to the caller. Unlike Own<T>::disown(), there
+  // is no need for the caller to prove they know how to dispose of the object, because the object
+  // is its own Disposer.
+  T* disown() {
+    static_assert(canConvert<T*, Refcounted*>());
+    T* result = ptr;
+    refcounted = nullptr;
+    ptr = nullptr;
+    return result;
+  }
+
+  // Assume ownership of an object without incrementing its refcount. Opposite of disown().
+  static Rc reown(T* ptr) {
+    static_assert(canConvert<T*, Refcounted*>());
+    return Rc(static_cast<Refcounted*>(ptr), ptr);
+  }
+
+  WeakRc<T> downgrade();
+  // Create a weak reference to the referent. The weak reference does not keep the object alive;
+  // it expires once the last strong Rc<T> is dropped, but can be upgraded back to an Rc<T> while
+  // the object is still alive. See kj::WeakRc<T>.
+
+  WeakRc<T> addWeakRef() { return downgrade(); }
+  // Synonym for downgrade().
+
   Rc& operator=(decltype(nullptr)) {
-    own = nullptr;
+    dispose();
     return *this;
   }
 
-  Rc& operator=(Rc&& other) = default;
+  Rc& operator=(Rc&& other) {
+    if (this == &other) return *this;
+    swp(refcounted, other.refcounted);
+    swp(ptr, other.ptr);
+    other.dispose();
+    return *this;
+  }
 
   template <typename U>
   Rc<U> downcast() {
-    return Rc<U>(own.template downcast<U>());
+    Rc<U> result(refcounted, &kj::downcast<U>(*ptr));
+    refcounted = nullptr;
+    ptr = nullptr;
+    return result;
   }
 
-  inline bool operator==(const Rc<T>& other) const { return own.get() == other.own.get(); }
-  inline bool operator==(decltype(nullptr)) const { return own.get() == nullptr; }
+  inline bool operator==(const Rc<T>& other) const { return ptr == other.ptr; }
+  inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
 
-  inline T* operator->() { return own.get(); }
-  inline const T* operator->() const { return own.get(); }
+  inline T* operator->() { KJ_IREQUIRE(ptr != nullptr, "null Rc<> dereference"); return ptr; }
+  inline const T* operator->() const { KJ_IREQUIRE(ptr != nullptr, "null Rc<> dereference"); return ptr; }
+  inline T& operator*() { KJ_IREQUIRE(ptr != nullptr, "null Rc<> dereference"); return *ptr; }
+  inline const T& operator*() const { KJ_IREQUIRE(ptr != nullptr, "null Rc<> dereference"); return *ptr; }
 
-  inline T* get() { return own.get(); }
-  inline const T* get() const { return own.get(); }
+  inline T* get() { return ptr; }
+  inline const T* get() const { return ptr; }
 
 private:
-  Rc(T* t) : own(t, *t) { }
-  Rc(Own<T>&& t) : own(kj::mv(t)) { }
+  Rc(Refcounted *wrapper, T *ptr) : refcounted(wrapper), ptr(ptr) {}
+  void dispose() {
+    if (ptr == nullptr) return;
+    auto refcountedCopy = refcounted;
+    refcounted = nullptr;
+    ptr = nullptr;
+    // refcounted dispose ignores the pointer
+    refcountedCopy->dispose(static_cast<Refcounted*>(nullptr));
+  }
 
-  Own<T> own;
+  Refcounted* refcounted = nullptr;
+  T* ptr = nullptr;
 
   friend class Refcounted;
 
+  template <typename U, typename... Params>
+  friend Rc<U> rc(Params&&... params);
+
   template <typename>
   friend class Rc;
+
+  template <typename>
+  friend class WeakRc;
 };
+
+template <typename T, typename... Params>
+inline Rc<T> rc(Params&&... params) {
+  // Allocate a new refcounted instance of T, passing `params` to its constructor.
+  // Returns smart pointer that can be used to manage references.
+
+  if constexpr (canConvert<T*, Refcounted*>()) {
+    T* object = new T(fwd<Params>(params)...);
+    return Rc<T>(static_cast<Refcounted*>(object), object);
+  } else {
+    auto wrapper = new _::RcWrapper<T>(fwd<Params>(params)...);
+    return Rc<T>(wrapper, wrapper->getWrappedPtr());
+  }
+}
+
+template <typename T>
+class WeakRc {
+  // WeakRc<T> is a weak reference companion to kj::Rc<T>.
+  //
+  // A WeakRc<T> does not keep its referent alive: it expires once the last strong Rc<T> is
+  // dropped. While the referent is still alive, a WeakRc<T> can be upgraded back to a strong
+  // Rc<T>. This is useful for breaking reference cycles or for holding a non-owning reference that
+  // can detect when the referent has gone away.
+  //
+  // Obtain a WeakRc<T> via Rc<T>::downgrade() (or its synonym Rc<T>::addWeakRef()). Common usage:
+  // - KJ_IF_SOME on WeakRc<T> upgrades to Rc<T>
+  // - assertLive() obtains T& and throws on expired WeakRc<T>
+  // - tryGet() obtains Maybe<T&> directly
+  // - upgrade() (or its synonym addStrongRef()) upgrades to Maybe<Rc<T>>
+  //
+  // WeakRc<T> is movable but, like kj::Rc<T>, not implicitly copyable; use clone() to make an
+  // additional weak reference explicitly. Like kj::Rc<T> it is NOT threadsafe.
+  //
+  // Upgrading never resurrects a dead object: once the last strong Rc<T> is dropped the referent's
+  // refcount reaches zero and is never incremented again. upgrade() only ever produces a strong
+  // reference while the refcount is still non-zero. See WeakRc<T>::upgrade().
+  //
+  // The relationship between Rc<T> and WeakRc<T> is similar to that between kj::Pin<T>/kj::Ptr<T>
+  // and kj::Weak<T>.
+
+public:
+  KJ_DISALLOW_COPY(WeakRc);
+  inline WeakRc(decltype(nullptr)) noexcept {}
+
+  inline ~WeakRc() noexcept(false) { dispose(); }
+
+  WeakRc(WeakRc&& other) noexcept {
+    kj::swp(cell, other.cell);
+    kj::swp(ptr, other.ptr);
+  }
+
+  template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
+  WeakRc(WeakRc<U>&& other) noexcept: ptr(other.ptr) {
+    kj::swp(cell, other.cell);
+    other.ptr = nullptr;
+  }
+
+  inline WeakRc(Rc<T>& rc): WeakRc(rc.downgrade()) {}
+  inline WeakRc(Rc<T>&& rc): WeakRc(rc.downgrade()) {}
+
+  template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
+  inline WeakRc(Rc<U>& rc): WeakRc(rc.downgrade()) {}
+  template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
+  inline WeakRc(Rc<U>&& rc): WeakRc(rc.downgrade()) {}
+
+  WeakRc<T> clone() {
+    // Make an additional weak reference to the same referent.
+    return WeakRc<T>(cell, ptr);
+  }
+
+  WeakRc<T> addRef() { return clone(); }
+  // Make an additional weak reference to the same referent.
+  
+  WeakRc& operator=(decltype(nullptr)) {
+    dispose();
+    return *this;
+  }
+
+  WeakRc& operator=(WeakRc&& other) {
+    if (this == &other) return *this;
+    kj::swp(cell, other.cell);
+    kj::swp(ptr, other.ptr);
+    other.dispose();
+    return *this;
+  }
+
+  inline bool operator==(decltype(nullptr)) const { return get() == nullptr; }
+  inline bool operator==(const WeakRc<T>& other) const { return get() == other.get(); }
+  inline bool operator==(const Rc<T>& other) const { return get() == other.get(); }
+
+  template <typename U>
+  inline bool operator==(const WeakRc<U>& other) const { return get() == other.get(); }
+
+  inline T& assertLive() const {
+    // Obtain a `T&` reference, checking that the referent is still alive.
+    T* p = get();
+    KJ_IREQUIRE(p != nullptr, "null WeakRc<> dereference");
+    return *p;
+  }
+
+  inline Maybe<T&> tryGet() const { return get(); }
+  // Obtain a reference if the referent is still alive, otherwise return none.
+
+  inline Maybe<Rc<T>> upgrade() const {
+    // Obtain a strong Rc<T> if the referent is still alive, otherwise return none.
+    if (get() == nullptr) {
+      return kj::none;
+    }
+    // No resurrection: when the last strong Rc<T> is dropped, the refcount reaches zero and
+    // Refcounted::disposeImpl() nulls `cell->refcounted` before the object is destroyed. Because
+    // (non-atomic) Rc<T> is single-threaded, a non-null `cell->refcounted` therefore guarantees the
+    // refcount is still non-zero here (confirmed by get() above), so we never increment a refcount
+    // that has already reached zero.
+    KJ_IREQUIRE(cell->refcounted->refcount > 0,
+        "WeakRc<> must not revive an object whose refcount already reached zero.");
+    ++cell->refcounted->refcount;
+    return Rc<T>(cell->refcounted, ptr);
+  }
+
+  inline Maybe<Rc<T>> addStrongRef() const { return upgrade(); }
+  // Synonym for upgrade().
+
+private:
+  _::RcWeakCell* cell = nullptr;
+  T* ptr = nullptr;
+
+  inline WeakRc(_::RcWeakCell* cell, T* ptr): cell(cell), ptr(ptr) {
+    if (cell != nullptr) {
+      cell->addRef();
+    }
+  }
+
+  inline void dispose() {
+    if (cell != nullptr) {
+      cell->decRef();
+      cell = nullptr;
+      ptr = nullptr;
+    }
+  }
+
+  inline T* get() const {
+    if (cell == nullptr || cell->refcounted == nullptr) {
+      return nullptr;
+    }
+    return ptr;
+  }
+
+  template <typename>
+  friend class Rc;
+  template <typename>
+  friend class WeakRc;
+  friend class Refcounted;
+};
+
+template <typename T>
+WeakRc<T> Refcounted::addWeakRefInternal(T* object) {
+  static_assert(kj::canConvert<T&, Refcounted&>());
+  Refcounted* refcounted = object;
+  KJ_IREQUIRE(refcounted->refcount > 0,
+      "Object not allocated with kj::refcounted() or kj::rc().");
+  return WeakRc<T>(refcounted->getWeakCell(), object);
+}
+
+template <typename T>
+WeakRc<T> Rc<T>::downgrade() {
+  if (ptr == nullptr) {
+    return nullptr;
+  }
+  return WeakRc<T>(refcounted->getWeakCell(), ptr);
+}
+
+namespace _ {  // private
+
+template <typename T>
+inline NullableValue<Rc<T>> readMaybe(WeakRc<T>& weak) { return readMaybe(weak.upgrade()); }
+template <typename T>
+inline NullableValue<Rc<T>> readMaybe(const WeakRc<T>& weak) { return readMaybe(weak.upgrade()); }
+template <typename T>
+inline NullableValue<Rc<T>> readMaybe(WeakRc<T>&& weak) { return readMaybe(weak.upgrade()); }
+
+}  // namespace _ (private)
 
 template <typename T>
 class RefcountedWrapper: public Refcounted {
@@ -280,16 +636,18 @@ Own<RefcountedWrapper<Own<T>>> refcountedWrapper(Own<T>&& wrapped) {
 //
 // Warning: Atomic ops are SLOW.
 
-#if _MSC_VER && !defined(__clang__)
-#if _M_ARM
-#define KJ_MSVC_INTERLOCKED(OP, MEM) _Interlocked##OP##_##MEM
-#else
-#define KJ_MSVC_INTERLOCKED(OP, MEM) _Interlocked##OP
-#endif
-#endif
-
 template<typename T>
 class Arc;
+
+template <typename T, typename... Params>
+Arc<T> arc(Params&&... params);
+
+namespace _ {  // private
+
+template <typename T> class ArcWrapper;
+template <typename T> class ArcOwnWrapper;
+
+}  // namespace _ (private)
 
 class AtomicRefcounted: private kj::Disposer {
 public:
@@ -298,11 +656,7 @@ public:
   KJ_DISALLOW_COPY_AND_MOVE(AtomicRefcounted);
 
   inline bool isShared() const {
-#if _MSC_VER && !defined(__clang__)
-    return KJ_MSVC_INTERLOCKED(Or, acq)(&refcount, 0) > 1;
-#else
-    return __atomic_load_n(&refcount, __ATOMIC_ACQUIRE) > 1;
-#endif
+    return kj::atomicLoad(&refcount, kj::AtomicMemoryOrder::ACQUIRE) > 1;
   }
 
 protected:
@@ -311,13 +665,17 @@ protected:
   }
 
 private:
-#if _MSC_VER && !defined(__clang__)
-  mutable volatile long refcount = 0;
-#else
   mutable volatile uint refcount = 0;
-#endif
 
   bool addRefWeakInternal() const;
+
+  inline bool hasRefs() const {
+    return kj::atomicLoad(&refcount, kj::AtomicMemoryOrder::RELAXED) > 0;
+  }
+
+  inline void incRefcount() const {
+    kj::atomicAddFetch(&refcount, 1, kj::AtomicMemoryOrder::RELAXED);
+  }
 
   void disposeImpl(void* pointer) const override;
   template <typename T>
@@ -339,6 +697,8 @@ private:
 
   template <typename T>
   friend class Arc;
+  template <typename T> friend class _::ArcWrapper;
+  template <typename T> friend class _::ArcOwnWrapper;
   template <typename T, typename... Params>
   friend kj::Arc<T> arc(Params&&... params);
 };
@@ -348,21 +708,16 @@ inline kj::Own<T> atomicRefcounted(Params&&... params) {
   return AtomicRefcounted::addRefInternal(new T(kj::fwd<Params>(params)...));
 }
 
-template <typename T, typename... Params>
-inline kj::Arc<T> arc(Params&&... params) {
-  return AtomicRefcounted::addRcRefInternal(new T(kj::fwd<Params>(params)...));
-}
-
 template <typename T>
 kj::Own<T> atomicAddRef(T& object) {
-  KJ_IREQUIRE(object.AtomicRefcounted::refcount > 0,
+  KJ_IREQUIRE(object.AtomicRefcounted::hasRefs(),
       "Object not allocated with kj::atomicRefcounted().");
   return AtomicRefcounted::addRefInternal(&object);
 }
 
 template <typename T>
 kj::Own<const T> atomicAddRef(const T& object) {
-  KJ_IREQUIRE(object.AtomicRefcounted::refcount > 0,
+  KJ_IREQUIRE(object.AtomicRefcounted::hasRefs(),
       "Object not allocated with kj::atomicRefcounted().");
   return AtomicRefcounted::addRefInternal(&object);
 }
@@ -387,34 +742,63 @@ kj::Maybe<kj::Own<const T>> atomicAddRefWeak(const T& object) {
 template <typename T>
 kj::Own<T> AtomicRefcounted::addRefInternal(T* object) {
   AtomicRefcounted* refcounted = object;
-#if _MSC_VER && !defined(__clang__)
-  KJ_MSVC_INTERLOCKED(Increment, nf)(&refcounted->refcount);
-#else
-  __atomic_add_fetch(&refcounted->refcount, 1, __ATOMIC_RELAXED);
-#endif
+  refcounted->incRefcount();
   return kj::Own<T>(object, *refcounted);
 }
 
 template <typename T>
 kj::Own<const T> AtomicRefcounted::addRefInternal(const T* object) {
   const AtomicRefcounted* refcounted = object;
-#if _MSC_VER && !defined(__clang__)
-  KJ_MSVC_INTERLOCKED(Increment, nf)(&refcounted->refcount);
-#else
-  __atomic_add_fetch(&refcounted->refcount, 1, __ATOMIC_RELAXED);
-#endif
+  refcounted->incRefcount();
   return kj::Own<const T>(object, *refcounted);
 }
 
 template <typename T>
 kj::Arc<T> AtomicRefcounted::addRcRefInternal(const T* object) {
   static_assert(kj::canConvert<T&, AtomicRefcounted&>());
-  return kj::Arc<T>(addRefInternal(object));
+  const AtomicRefcounted* refcounted = object;
+  refcounted->incRefcount();
+  return kj::Arc<T>(refcounted, object);
 }
+
+namespace _ {  // private
+
+template <typename T>
+class ArcWrapper final: public AtomicRefcounted {
+public:
+  template <typename... Params>
+  explicit ArcWrapper(Params&&... params): wrapped(kj::fwd<Params>(params)...) {
+    incRefcount();
+  }
+
+  const T* getWrappedPtr() const { return &wrapped; }
+
+private:
+  T wrapped;
+};
+
+template <typename T>
+class ArcOwnWrapper final: public AtomicRefcounted {
+public:
+  explicit ArcOwnWrapper(Own<const T>&& wrapped): wrapped(kj::mv(wrapped)) {
+    incRefcount();
+  }
+
+  const T* getWrappedPtr() const { return wrapped.get(); }
+
+private:
+  Own<const T> wrapped;
+};
+
+}  // namespace _ (private)
 
 template<typename T>
 class Arc {
-  // Smart pointer for atomic reference counted objects.
+  // Smart pointer providing atomic reference-counted ownership.
+  //
+  // The primary way to obtain a new `Arc<T>` is `kj::arc<T>(...)`, which allocates a new T on the
+  // heap. If T extends AtomicRefcounted, T's `refcount` field is used for counting. Otherwise,
+  // `kj::arc` allocates `ArcWrapper<T>` to provide a `refcount`.
   //
   // The usage is similar to `kj::Rc<T>` but with a "const"-ness twist:
   // since in kj multithreaded code "const" means "thread-safe", `Arc<T>`
@@ -424,67 +808,141 @@ public:
   KJ_DISALLOW_COPY(Arc);
   Arc() { }
   Arc(decltype(nullptr)) { }
-  inline Arc(Arc&& other) noexcept = default;
+  inline Arc(Arc&& other) noexcept: refcounted(other.refcounted), ptr(other.ptr) {
+    other.refcounted = nullptr;
+    other.ptr = nullptr;
+  }
 
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
-  inline Arc(Arc<U>&& other) noexcept : own(kj::mv(other.own)) { }
+  inline Arc(Arc<U>&& other) noexcept: refcounted(other.refcounted), ptr(other.ptr) {
+    other.refcounted = nullptr;
+    other.ptr = nullptr;
+  }
+
+  template <typename U = T, typename = EnableIf<isSameType<U, T>()>>
+  inline Arc(U t) {
+    static_assert(!canConvert<const T*, const AtomicRefcounted*>());
+    auto wrapper = new _::ArcWrapper<U>(kj::mv(t));
+    refcounted = wrapper;
+    ptr = wrapper->getWrappedPtr();
+  }
+
+  inline Arc(Own<const T> t) {
+    static_assert(!canConvert<const T*, const AtomicRefcounted*>());
+    if (t.get() == nullptr) return;
+    auto wrapper = new _::ArcOwnWrapper<T>(kj::mv(t));
+    refcounted = wrapper;
+    ptr = wrapper->getWrappedPtr();
+  }
+
+  ~Arc() noexcept(false) { dispose(); }
 
   kj::Own<const T> toOwn() {
     // Convert Arc<T> to Own<const T>.
     // Nullifies the original Arc<T>.
-    return kj::mv(own);
+    if (ptr == nullptr) return Own<const T>();
+    auto result = Own<const T>(ptr, *refcounted);
+    refcounted = nullptr;
+    ptr = nullptr;
+    return result;
   }
 
   kj::Arc<T> addRef() const {
-    const T* refcounted = own.get();
-    if (refcounted != nullptr) {
-      return AtomicRefcounted::addRcRefInternal(refcounted);
+    if (ptr != nullptr) {
+      refcounted->incRefcount();
+      return Arc(refcounted, ptr);
     } else {
       return kj::Arc<T>();
     }
+  }
+
+  kj::Arc<T> clone() const {
+    return addRef();
   }
 
   // Surrenders ownership of the underlying object to the caller. Unlike Own<T>::disown(), there
   // is no need for the caller to prove they know how to dispose of the object, because the object
   // is its own Disposer.
   const T* disown() {
-    return own.disown(own.get());
+    static_assert(canConvert<const T*, const AtomicRefcounted*>());
+    const T* result = ptr;
+    refcounted = nullptr;
+    ptr = nullptr;
+    return result;
   }
 
   // Assume ownership of an object without incrementing its refcount. Opposite of disown().
   static Arc reown(const T* ptr) {
-    return Arc(ptr);
+    static_assert(canConvert<const T*, const AtomicRefcounted*>());
+    return Arc(static_cast<const AtomicRefcounted*>(ptr), ptr);
   }
 
   Arc& operator=(decltype(nullptr)) {
-    own = nullptr;
+    dispose();
     return *this;
   }
 
-  Arc& operator=(Arc&& other) = default;
+  Arc& operator=(Arc&& other) {
+    if (this == &other) return *this;
+    swp(refcounted, other.refcounted);
+    swp(ptr, other.ptr);
+    other.dispose();
+    return *this;
+  }
 
   template <typename U>
   Arc<U> downcast() {
-    return Arc<U>(own.template downcast<const U>());
+    Arc<U> result;
+    if (ptr != nullptr) {
+      result = Arc<U>(refcounted, &kj::downcast<const U>(*ptr));
+      refcounted = nullptr;
+      ptr = nullptr;
+    }
+    return result;
   }
 
-  inline bool operator==(const Arc<T>& other) const { return own.get() == other.own.get(); }
-  inline bool operator==(decltype(nullptr)) const { return own.get() == nullptr; }
+  inline bool operator==(const Arc<T>& other) const { return ptr == other.ptr; }
+  inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
 
-  inline const T* operator->() const { return own.get(); }
-  inline const T* get() const { return own.get(); }
+#define NULLCHECK KJ_IREQUIRE(ptr != nullptr, "null Arc<> dereference")
+  inline const T* operator->() const { NULLCHECK; return ptr; }
+  inline const T& operator*() const { NULLCHECK; return *ptr; }
+#undef NULLCHECK
+  inline const T* get() const { return ptr; }
 
 private:
-  Arc(const T* t) : own(t, *t) { }
-  Arc(Own<const T>&& t) : own(kj::mv(t)) { }
+  Arc(const AtomicRefcounted* refcounted, const T* ptr): refcounted(refcounted), ptr(ptr) {}
 
-  Own<const T> own;
+  void dispose() {
+    if (ptr == nullptr) return;
+    const AtomicRefcounted* refcountedCopy = refcounted;
+    refcounted = nullptr;
+    ptr = nullptr;
+    // AtomicRefcounted dispose ignores the pointer.
+    refcountedCopy->dispose(static_cast<AtomicRefcounted*>(nullptr));
+  }
+
+  const AtomicRefcounted* refcounted = nullptr;
+  const T* ptr = nullptr;
 
   friend class AtomicRefcounted;
+
+  template <typename U, typename... Params>
+  friend Arc<U> arc(Params&&... params);
 
   template <typename>
   friend class Arc;
 };
+
+template <typename T, typename... Params>
+inline Arc<T> arc(Params&&... params) {
+  if constexpr (canConvert<T*, AtomicRefcounted*>()) {
+    return AtomicRefcounted::addRcRefInternal(new T(kj::fwd<Params>(params)...));
+  } else {
+    auto wrapper = new _::ArcWrapper<T>(kj::fwd<Params>(params)...);
+    return Arc<T>(wrapper, wrapper->getWrappedPtr());
+  }
+}
 
 
 }  // namespace kj

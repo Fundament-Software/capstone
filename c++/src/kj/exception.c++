@@ -196,8 +196,7 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount,
     return nullptr;
   }
 
-  STACKFRAME64 frame;
-  memset(&frame, 0, sizeof(frame));
+  STACKFRAME64 frame = {};
 
   frame.AddrPC.Offset = context.Rip;
   frame.AddrPC.Mode = AddrModeFlat;
@@ -443,8 +442,7 @@ String stringifyStackTrace(ArrayPtr<void* const> trace) {
   KJ_STACK_ARRAY(String, lines, trace.size(), 32, 32);
 
   for (auto i: kj::indices(trace)) {
-    IMAGEHLP_LINE64 lineInfo;
-    memset(&lineInfo, 0, sizeof(lineInfo));
+    IMAGEHLP_LINE64 lineInfo = {};
     lineInfo.SizeOfStruct = sizeof(lineInfo);
     DWORD displacement;
     if (dbghelp.symGetLineFromAddr64(process, reinterpret_cast<DWORD64>(trace[i]), &displacement, &lineInfo)) {
@@ -636,9 +634,21 @@ namespace {
                                      stringifyStackTrace(trace), '\n');
     }
   } else {
-    message = kj::str("*** std::terminate() called with no exception"
-                      "\nstack: ", stringifyStackTraceAddresses(trace),
-                                   stringifyStackTrace(trace), '\n');
+    // std::current_exception() only reports an exception that is "currently being handled". When
+    // terminate() is reached because an exception escaped a noexcept function, some ABIs -- the
+    // MSVC one in particular -- have not begun handling it yet, so nothing is reported here even
+    // though an exception is very much in flight. KJ tracks its own exceptions independently of
+    // the C++ runtime, so fall back to that rather than reporting nothing at all. Unlike a stack
+    // trace taken here, a kj::Exception names the throw site and carries its own trace, so this
+    // stays useful even when the binary has no symbols.
+    InFlightExceptionIterator iter;
+    KJ_IF_SOME(exception, iter.next()) {
+      message = kj::str("*** Fatal uncaught kj::Exception: ", exception, '\n');
+    } else {
+      message = kj::str("*** std::terminate() called with no exception"
+                        "\nstack: ", stringifyStackTraceAddresses(trace),
+                                     stringifyStackTrace(trace), '\n');
+    }
   }
 
   kj::FdOutputStream(STDERR_FILENO).write(message.asBytes());
@@ -659,8 +669,7 @@ BOOL WINAPI breakHandler(DWORD type) {
       HANDLE thread = OpenThread(THREAD_ALL_ACCESS, FALSE, mainThreadId);
       if (thread != NULL) {
         if (SuspendThread(thread) != (DWORD)-1) {
-          CONTEXT context;
-          memset(&context, 0, sizeof(context));
+          CONTEXT context = {};
           context.ContextFlags = CONTEXT_FULL;
           if (GetThreadContext(thread, &context)) {
             void* traceSpace[32];
@@ -746,6 +755,31 @@ void printStackTraceOnCrash() {
 #else
 namespace {
 
+StringPtr signalName(int signo) {
+#if defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 32)
+  const char* desc = sigdescr_np(signo);
+  if (desc != nullptr) return desc;
+#endif
+#endif
+
+#if defined(SIGRTMIN) && defined(SIGRTMAX)
+  // sigdescr_np() returns null for real-time signals. The number is already printed separately.
+  if (signo >= SIGRTMIN && signo <= SIGRTMAX) return "Real-time signal"_kjc;
+#endif
+
+  // Fallback for platforms which don't provide sigdescr_np().
+  switch (signo) {
+    case SIGSEGV: return "Segmentation fault"_kjc;
+    case SIGBUS: return "Bus error"_kjc;
+    case SIGFPE: return "Floating-point exception"_kjc;
+    case SIGABRT: return "Aborted"_kjc;
+    case SIGILL: return "Illegal instruction"_kjc;
+    case SIGSYS: return "Bad system call"_kjc;
+    default: return "Unknown signal"_kjc;
+  }
+}
+
 [[noreturn]] void crashHandler(int signo, siginfo_t* info, void* context) {
   void* traceSpace[32]{};
 
@@ -806,20 +840,43 @@ namespace {
   auto trace = getStackTrace(traceSpace, 2);
 #endif
 
-  auto message = kj::str("*** Received signal #", signo, ": ", strsignal(signo),
-                         "\nstack: ", stringifyStackTraceAddresses(trace),
-                         stringifyStackTrace(trace), '\n');
+  char addressBuffer[4096]{};
+  auto addresses = stringifyStackTraceAddresses(trace, addressBuffer);
 
-  FdOutputStream(STDERR_FILENO).write(message.asBytes());
+  char messageBuffer[sizeof(addressBuffer)+1024]{};
+  auto message = kj::strPreallocated(messageBuffer,
+      "*** Received signal #", signo, ": ", signalName(signo),
+      "\nstack: ", addresses, '\n');
+
+  // Do not use FdOutputStream here: its error handling can allocate and throw. write() itself is
+  // async-signal-safe.
+  const char* pos = message.begin();
+  size_t remaining = message.size();
+  while (remaining > 0) {
+    auto n = miniposix::write(STDERR_FILENO, pos, remaining);
+    if (n > 0) {
+      pos += n;
+      remaining -= n;
+    } else if (n < 0 && errno == EINTR) {
+      continue;
+    } else {
+      break;
+    }
+  }
   _exit(1);
 }
 
 }  // namespace
 
 void printStackTraceOnCrash() {
+  // getStackTrace() lazily initializes the root exception callback, and on glibc the first call to
+  // backtrace() dynamically loads libgcc. Both operations allocate memory, so do them before
+  // installing the signal handlers.
+  void* warmupSpace[1]{};
+  getStackTrace(warmupSpace, 0);
+
   // Set up alternate signal stack so that stack overflows can be handled.
-  stack_t stack;
-  memset(&stack, 0, sizeof(stack));
+  stack_t stack = {};
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
@@ -836,8 +893,7 @@ void printStackTraceOnCrash() {
   KJ_SYSCALL(sigaltstack(&stack, nullptr));
 
   // Catch all relevant signals.
-  struct sigaction action;
-  memset(&action, 0, sizeof(action));
+  struct sigaction action = {};
 
   action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER | SA_RESETHAND;
   action.sa_sigaction = &crashHandler;
@@ -915,8 +971,7 @@ retry:
 
 void resetCrashHandlers() {
 #ifndef _WIN32
-  struct sigaction action;
-  memset(&action, 0, sizeof(action));
+  struct sigaction action = {};
 
   action.sa_handler = SIG_DFL;
   KJ_SYSCALL(sigaction(SIGSEGV, &action, nullptr));
@@ -942,7 +997,11 @@ StringPtr KJ_STRINGIFY(Exception::Type type) {
     "unimplemented"
   };
 
-  return TYPE_STRINGS[static_cast<uint>(type)];
+  uint i = static_cast<uint>(type);
+  if (i >= kj::size(TYPE_STRINGS)) {
+    i = 0;
+  }
+  return TYPE_STRINGS[i];
 }
 
 String KJ_STRINGIFY(const Exception& e) {
@@ -984,7 +1043,7 @@ String KJ_STRINGIFY(const Exception& e) {
              stringifyStackTrace(e.getStackTrace()));
 }
 
-static_assert(sizeof(kj::Exception) == 2 * sizeof(size_t),
+static_assert(sizeof(kj::Exception) == sizeof(size_t),
     "exception type is too big, please keep it lean");
 
 Exception::Exception(Type type, const char* file, int line, String description) noexcept {
@@ -1002,34 +1061,33 @@ Exception::Exception(Type type, String file, int line, String description) noexc
   storage->description = mv(description);
 }
 
-Exception::Exception(const Exception& other) noexcept {
-  storage->file = other.storage->file;
-  storage->line = other.storage->line;
-  storage->type = other.storage->type;
-  storage->description = heapString(other.storage->description);
+Exception Exception::clone() const noexcept {
+  Exception copy(storage->type, storage->file, storage->line, heapString(storage->description));
 
-  if (other.storage->ownFile != nullptr) {
-    storage->ownFile = heapString(other.storage->ownFile);
-    storage->file = trimSourceFilename(storage->ownFile).cStr();
+  if (storage->ownFile != nullptr) {
+    copy.storage->ownFile = heapString(storage->ownFile);
+    copy.storage->file = trimSourceFilename(copy.storage->ownFile).cStr();
   }
 
-  if (other.storage->remoteTrace != nullptr) {
-    storage->remoteTrace = kj::str(other.storage->remoteTrace);
+  if (storage->remoteTrace != nullptr) {
+    copy.storage->remoteTrace = kj::str(storage->remoteTrace);
   }
 
-  storage->traceCount = other.storage->traceCount;
-  memcpy(storage->trace, other.storage->trace, sizeof(storage->trace[0]) * storage->traceCount);
+  copy.storage->traceCount = storage->traceCount;
+  memcpy(copy.storage->trace, storage->trace, sizeof(copy.storage->trace[0]) * copy.storage->traceCount);
 
-  KJ_IF_SOME(c, other.storage->context) {
-    storage->context = heap(*c);
+  KJ_IF_SOME(c, storage->context) {
+    copy.storage->context = heap(*c);
   }
 
-  for (auto& detail: other.storage->details) {
-    storage->details.add(Detail {
+  for (auto& detail: storage->details) {
+    copy.storage->details.add(Detail {
       .id = detail.id,
       .value = kj::heapArray(detail.value.asPtr()),
     });
   }
+
+  return copy;
 }
 
 Exception::~Exception() noexcept {}
@@ -1191,10 +1249,7 @@ public:
   inline ExceptionImpl(Exception&& other): Exception(mv(other)) {
     insertIntoCurrentExceptions();
   }
-  ExceptionImpl(const ExceptionImpl& other): Exception(other) {
-    // No need to copy whatBuffer since it's just to hold the return value of what().
-    insertIntoCurrentExceptions();
-  }
+
   ~ExceptionImpl() noexcept {
     // Look for ourselves in the list.
     validateExceptionPointer(nextCurrentException);
@@ -1252,7 +1307,7 @@ kj::Exception getDestructionReason(void* traceSeparator, kj::Exception::Type def
     const char* defaultFile, int defaultLine, kj::StringPtr defaultDescription) {
   InFlightExceptionIterator iter;
   KJ_IF_SOME(e, iter.next()) {
-    auto copy = kj::cp(e);
+    auto copy = e.clone();
     copy.truncateCommonTrace();
     return copy;
   } else {

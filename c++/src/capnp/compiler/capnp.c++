@@ -1051,7 +1051,7 @@ private:
         // bytes. This is fine because if those bytes are actually part of the message we will
         // hit an error later and if they are not then who cares?
         auto words = kj::heapArray<word>(allBytes.size() / sizeof(word));
-        memcpy(words.begin(), allBytes.begin(), words.size() * sizeof(word));
+        words.asBytes().copyFrom(allBytes.first(words.asBytes().size()));
 
         kj::ArrayPtr<const word> segments[1] = { words };
         SegmentArrayMessageReader message(segments, options);
@@ -1118,14 +1118,14 @@ private:
       }
       case Format::FLAT: {
         auto words = kj::heapArray<word>(reader.totalSize().wordCount + 1);
-        memset(words.begin(), 0, words.asBytes().size());
+        words.asBytes().fill(0);
         copyToUnchecked(reader, words);
         output.write(words.asBytes());
         return;
       }
       case Format::FLAT_PACKED: {
         auto words = kj::heapArray<word>(reader.totalSize().wordCount + 1);
-        memset(words.begin(), 0, words.asBytes().size());
+        words.asBytes().fill(0);
         copyToUnchecked(reader, words);
         kj::BufferedOutputStreamWrapper buffered(output);
         capnp::_::PackedOutputStream packed(buffered);
@@ -1730,8 +1730,7 @@ public:
 
     // Evaluate this schema to a DynamicValue.
     DynamicValue::Reader value;
-    word zeroWord[1];
-    memset(&zeroWord, 0, sizeof(zeroWord));
+    word zeroWord[1]{};
     kj::ArrayPtr<const word> segments[1] = { kj::arrayPtr(zeroWord, 1) };
     SegmentArrayMessageReader emptyMessage(segments);
     switch (schema.getProto().which()) {

@@ -50,8 +50,9 @@ CidrRange::CidrRange(StringPtr pattern) {
   bitCount = pattern.slice(slashPos + 1).parseAs<uint>();
 
   KJ_STACK_ARRAY(char, addr, slashPos + 1, 128, 128);
-  memcpy(addr.begin(), pattern.begin(), slashPos);
-  addr[slashPos] = '\0';
+  auto buf =  addr;
+  buf.write(pattern.first(slashPos));
+  buf[0] = '\0';
 
   if (pattern.findFirst(':') == kj::none) {
     family = AF_INET;
@@ -74,9 +75,9 @@ CidrRange::CidrRange(int family, ArrayPtr<const byte> bits, uint bitCount)
   }
   KJ_REQUIRE(bits.size() * 8 >= bitCount);
   size_t byteCount = (bitCount + 7) / 8;
-  memcpy(this->bits, bits.begin(), byteCount);
-  memset(this->bits + byteCount, 0, sizeof(this->bits) - byteCount);
-
+  auto buf = kj::arrayPtr(this->bits);
+  buf.write(bits.first(byteCount));
+  buf.fill(0);
   zeroIrrelevantBits();
 }
 
@@ -145,8 +146,7 @@ bool CidrRange::matches(const struct sockaddr* addr) const {
 }
 
 bool CidrRange::matches(StringPtr addr) const {
-  struct sockaddr_storage ss;
-  memset(&ss, 0, sizeof(ss));
+  struct sockaddr_storage ss = {};
 
   auto* sin = reinterpret_cast<struct sockaddr_in*>(&ss);
   auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(&ss);
@@ -187,7 +187,7 @@ void CidrRange::zeroIrrelevantBits() {
 
     // Zero the remaining bytes.
     size_t n = bitCount / 8 + 1;
-    memset(bits + n, 0, sizeof(bits) - n);
+    kj::arrayPtr(bits + n, sizeof(bits) - n).fill(0);
   }
 }
 

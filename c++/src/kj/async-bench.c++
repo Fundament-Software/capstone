@@ -25,6 +25,7 @@
 
 #include <kj/async.h>
 #include <kj/debug.h>
+#include <kj/test.h>
 
 // kj::READY_NOW is in its own performance class
 
@@ -90,6 +91,8 @@ static void bm_Promise_ImmediatePromise_Then(benchmark::State &state) {
 
 BENCHMARK(bm_Promise_ImmediatePromise_Then);
 
+// GCC gets compilation errors with promise continuations in lambdas
+#if !(__GNUC__ && !__clang__)
 static void bm_Coro_CoAwait_ImmediatePromise(benchmark::State &state) {
   // Benchmark coro that co_awaits an immediate coroutine
   kj::EventLoop loop;
@@ -117,6 +120,7 @@ static void bm_Coro_CoAwait_ImmediateCoroutine(benchmark::State &state) {
 }
 
 BENCHMARK(bm_Coro_CoAwait_ImmediateCoroutine);
+#endif  // !(__GNUC__ && !__clang__)
 
 ///////////////////////////////
 // Pow benchmarks mean to benchmark promise evaluation when the start of the
@@ -271,5 +275,46 @@ static void bm_Coro_Fib10(benchmark::State &state) {
 }
 
 BENCHMARK(bm_Coro_Fib10);
+
+/////////////////////////////////////////////////////////////////
+// Exception handling benchmarks
+// Exceptions are supposed to be rare, and we mostly care about happy path performance.
+// It is still curious to measure the exception handling overhead.
+
+kj::Promise<void> promiseThrow() {
+  return immediatePromise().then([] (auto x) -> kj::Promise<void> {
+    throw KJ_EXCEPTION(FAILED, "test exception");
+  });
+}
+
+static void bm_Promise_Throw(benchmark::State &state) {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  for (auto _ : state) {
+    auto promise = promiseThrow();
+    KJ_EXPECT_THROW(FAILED, promise.wait(waitScope));
+  }
+}
+
+BENCHMARK(bm_Promise_Throw);
+
+kj::Promise<void> coroThrow() {
+  co_await immediatePromise();
+  throw KJ_EXCEPTION(FAILED, "test exception");
+}
+
+
+static void bm_Coro_Throw(benchmark::State &state) {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  for (auto _ : state) {
+    auto promise = coroThrow();
+    KJ_EXPECT_THROW(FAILED, promise.wait(waitScope));
+  }
+}
+
+BENCHMARK(bm_Coro_Throw);
 
 BENCHMARK_MAIN();

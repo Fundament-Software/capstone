@@ -223,7 +223,7 @@ void SHA1Transform(
     /* Wipe variables */
     a = b = c = d = e = 0;
 #ifdef SHA1HANDSOFF
-    memset(block, '\0', sizeof(block));
+    block[0] = {};
 #endif
 }
 
@@ -323,8 +323,8 @@ void SHA1Final(
             ((context->state[i >> 2] >> ((3 - (i & 3)) * 8)) & 255);
     }
     /* Wipe variables */
-    memset(context, '\0', sizeof(*context));
-    memset(&finalcount, '\0', sizeof(finalcount));
+    *context = {};
+    kj::arrayPtr(finalcount).fill('\0');
 }
 
 // End SHA-1 implementation.
@@ -503,6 +503,40 @@ static void requireValidHeaderName(kj::StringPtr name) {
 static void requireValidHeaderValue(kj::StringPtr value, auto name) {
   KJ_REQUIRE(HttpHeaders::isValidHeaderValue(value), name, "invalid header value",
       kj::encodeCEscape(value));
+}
+
+static bool isValidRequestUrl(kj::StringPtr url) {
+  // The request-target (URL) appears in the request line as `METHOD SP request-target SP version`.
+  // It must not contain whitespace (which would introduce extra tokens into the request line) nor
+  // any control characters (in particular CR or LF, which would allow injecting additional headers
+  // or entire requests). We reject any byte <= 0x20 (this covers space, tab, CR, LF, and NUL) as
+  // well as 0x7f (DEL). Bytes >= 0x80 are permitted since some callers pass pre-encoded or
+  // non-ASCII targets; these cannot cause desync.
+  for (char c: url) {
+    if (static_cast<byte>(c) <= 0x20 || static_cast<byte>(c) == 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void requireValidRequestUrl(kj::StringPtr url) {
+  KJ_REQUIRE(isValidRequestUrl(url), "invalid request URL", kj::encodeCEscape(url));
+}
+
+static bool isValidStatusText(kj::StringPtr text) {
+  // The status text (reason-phrase) appears at the end of the response status line. It must not
+  // contain CR, LF, or NUL, which would allow injecting additional headers or corrupt the framing.
+  for (char c: text) {
+    if (c == '\0' || c == '\r' || c == '\n') {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void requireValidStatusText(kj::StringPtr text) {
+  KJ_REQUIRE(isValidStatusText(text), "invalid status text", kj::encodeCEscape(text));
 }
 
 static const char* BUILTIN_HEADER_NAMES[] = {
@@ -852,7 +886,39 @@ static kj::Maybe<uint> consumeNumber(char*& ptr) {
   return result;
 }
 
-static kj::StringPtr consumeLine(char*& ptr) {
+static kj::Maybe<uint64_t> consumeNumber64(const char*& ptr) {
+  // Like consumeNumber(), but accumulates into a 64-bit value and rejects (rather than silently
+  // wrapping) numbers that don't fit. Used for byte-range positions, which are compared against a
+  // 64-bit content length.
+  const char* start = skipSpace(ptr);
+  const char* p = start;
+
+  constexpr uint64_t MAX = kj::maxValue;
+
+  uint64_t result = 0;
+
+  for (;;) {
+    const char c = *p;
+    if ('0' <= c && c <= '9') {
+      uint digit = c - '0';
+      // Reject before `result * 10 + digit` would exceed a uint64. MAX / 10 and MAX % 10 are
+      // compile-time constants, so this is a couple of comparisons per digit rather than a
+      // division.
+      if (result > MAX / 10 || (result == MAX / 10 && digit > MAX % 10)) return kj::none;
+      result = result * 10 + digit;
+      ++p;
+    } else {
+      if (p == start) return kj::none;
+      ptr = p;
+      return result;
+    }
+  }
+}
+
+static kj::StringPtr consumeLine(char*& ptr, bool* sawFolding = nullptr) {
+  // If `sawFolding` is non-null, it is set to true if an obsolete "line folding" continuation was
+  // encountered. Callers that parse header fields use this to reject the message (see
+  // parseHeaders()).
   char* start = skipSpace(ptr);
   char* p = start;
 
@@ -871,6 +937,7 @@ static kj::StringPtr consumeLine(char*& ptr) {
           // a space was treated as a continuation of the previous line. The behavior should be
           // the same as if the \r\n were replaced with spaces, so let's do that here to prevent
           // confusion later.
+          if (sawFolding != nullptr) *sawFolding = true;
           *end = ' ';
           p[-1] = ' ';
           break;
@@ -889,6 +956,7 @@ static kj::StringPtr consumeLine(char*& ptr) {
           // a space was treated as a continuation of the previous line. The behavior should be
           // the same as if the \n were replaced with spaces, so let's do that here to prevent
           // confusion later.
+          if (sawFolding != nullptr) *sawFolding = true;
           *end = ' ';
           break;
         }
@@ -914,7 +982,11 @@ static kj::Maybe<kj::StringPtr> consumeHeaderName(char*& ptr) {
   while (HTTP_HEADER_NAME_CHARS.contains(*p)) ++p;
   char* end = p;
 
-  p = skipSpace(p);
+  // Note: We intentionally do NOT skip whitespace between the header name and the colon. RFC 9112
+  // section 5.1 requires that no whitespace appear there, and that a message with such whitespace
+  // be rejected with 400 (Bad Request). Historically some HTTP implementations treated the
+  // trailing whitespace as part of the header name, which -- if a message passed through both such
+  // an implementation and a lenient one -- could lead to HTTP desync / request smuggling.
 
   if (end == start || *p != ':') return kj::none;
   ++p;
@@ -1058,7 +1130,15 @@ bool HttpHeaders::tryParse(kj::ArrayPtr<char> content) {
 bool HttpHeaders::parseHeaders(char* ptr, char* end) {
   while (*ptr != '\0') {
     KJ_IF_SOME(name, consumeHeaderName(ptr)) {
-      kj::StringPtr line = consumeLine(ptr);
+      bool sawFolding = false;
+      kj::StringPtr line = consumeLine(ptr, &sawFolding);
+      if (sawFolding) {
+        // Obsolete line folding (a continuation line beginning with whitespace). RFC 9112 section
+        // 7.1.4 says a server MUST either reject such a message with 400 (Bad Request) or replace
+        // the folding with spaces. Folding is never used legitimately and has historically been a
+        // source of HTTP desync, so we reject.
+        return false;
+      }
       addNoCheck(name, line);
     } else {
       return false;
@@ -1073,18 +1153,22 @@ bool HttpHeaders::parseHeaders(char* ptr, char* end) {
 kj::String HttpHeaders::serializeRequest(
     HttpMethod method, kj::StringPtr url,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
+  requireValidRequestUrl(url);
   return serialize(kj::toCharSequence(method), url, "HTTP/1.1"_kj, connectionHeaders);
 }
 
 kj::String HttpHeaders::serializeConnectRequest(
     kj::StringPtr authority,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
+  requireValidRequestUrl(authority);
   return serialize("CONNECT"_kj, authority, "HTTP/1.1"_kj, connectionHeaders);
 }
 
 kj::String HttpHeaders::serializeResponse(
     uint statusCode, kj::StringPtr statusText,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
+  requireValidStatusText(statusText);
+
   auto statusCodeStr = kj::toCharSequence(statusCode);
 
   return serialize("HTTP/1.1"_kj, statusCodeStr, statusText, connectionHeaders);
@@ -1186,8 +1270,8 @@ static bool consumeByteRangeUnit(const char*& ptr) {
 static kj::Maybe<HttpByteRange> consumeIntRange(const char*& ptr, uint64_t contentLength) {
   const char* p = ptr;
   p = skipSpace(p);
-  uint firstPos;
-  KJ_IF_SOME(n, consumeNumber(p)) {
+  uint64_t firstPos;
+  KJ_IF_SOME(n, consumeNumber64(p)) {
     firstPos = n;
   } else {
     return kj::none;
@@ -1195,7 +1279,7 @@ static kj::Maybe<HttpByteRange> consumeIntRange(const char*& ptr, uint64_t conte
   p = skipSpace(p);
   if (*(p++) != '-') return kj::none;
   p = skipSpace(p);
-  auto maybeLastPos = consumeNumber(p);
+  auto maybeLastPos = consumeNumber64(p);
   p = skipSpace(p);
 
   KJ_IF_SOME(lastPos, maybeLastPos) {
@@ -1218,8 +1302,8 @@ static kj::Maybe<HttpByteRange> consumeSuffixRange(const char*& ptr, uint64_t co
   p = skipSpace(p);
   if (*(p++) != '-') return kj::none;
   p = skipSpace(p);
-  uint suffixLength;
-  KJ_IF_SOME(n, consumeNumber(p)) {
+  uint64_t suffixLength;
+  KJ_IF_SOME(n, consumeNumber64(p)) {
     suffixLength = n;
   } else {
     return kj::none;
@@ -1954,6 +2038,17 @@ public:
     }
   }
 
+  Maybe<size_t> tryReadSync(ArrayPtr<byte> buffer, size_t minBytes) override {
+    if (finished) {
+      // Already reached the end of the entity body; EOF is a valid synchronous answer.
+      //
+      // Note that if the underlying connection went away (`weakInner` is none but `finished` is
+      // false), we return kj::none instead, so that the async path can surface the error.
+      return size_t(0);
+    }
+    return kj::none;
+  }
+
 protected:
   HttpInputStreamImpl& getInner() {
     KJ_IF_SOME(i, weakInner) {
@@ -2412,6 +2507,7 @@ public:
     writeQueue = fork.addBranch();
 
     co_await fork;
+    writeQueueDrained = true;
     co_await inner.write(buffer);
 
     // We intentionally don't use KJ_DEFER to clean this up because if an exception is thrown, we
@@ -2428,11 +2524,30 @@ public:
     writeQueue = fork.addBranch();
 
     co_await fork;
+    writeQueueDrained = true;
     co_await inner.write(pieces);
 
     // We intentionally don't use KJ_DEFER to clean this up because if an exception is thrown, we
     // want to block further writes.
     writeInProgress = false;
+  }
+
+  bool tryWriteBodyDataSync(ArrayPtr<const byte> buffer) {
+    // Synchronous counterpart to writeBodyData(): attempt to write the data via the inner
+    // stream's tryWriteSync(). Returns false if queued writes (e.g. headers or chunk boundaries)
+    // have not been observed to drain yet, or if the inner stream cannot accept the data
+    // synchronously. Concurrent writes or writing outside a body are programming errors.
+    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed");
+    KJ_REQUIRE(inBody);
+    if (!writeQueueDrained) return false;
+    return inner.tryWriteSync(buffer);
+  }
+
+  bool tryWriteBodyDataSync(ArrayPtr<const ArrayPtr<const byte>> pieces) {
+    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed");
+    KJ_REQUIRE(inBody);
+    if (!writeQueueDrained) return false;
+    return inner.tryWriteSync(pieces);
   }
 
   Promise<uint64_t> pumpBodyFrom(AsyncInputStream& input, uint64_t amount) {
@@ -2444,6 +2559,7 @@ public:
     writeQueue = fork.addBranch();
 
     co_await fork;
+    writeQueueDrained = true;
     auto actual = co_await input.pumpTo(inner, amount);
 
     // We intentionally don't use KJ_DEFER to clean this up because if an exception is thrown, we
@@ -2466,6 +2582,7 @@ public:
       // Cancel any writes that are still queued.
       writeQueue = KJ_EXCEPTION(FAILED,
           "previous HTTP message body incomplete; can't write more messages");
+      writeQueueDrained = false;
     }
   }
 
@@ -2478,6 +2595,7 @@ public:
     // Cancel any writes that are still queued.
     writeQueue = KJ_EXCEPTION(FAILED,
         "previous HTTP message body incomplete; can't write more messages");
+    writeQueueDrained = false;
   }
 
   kj::Promise<void> flush() {
@@ -2503,6 +2621,12 @@ private:
   // a write throws an exception or is canceled, this remains true forever. In these cases, the
   // underlying stream is in an inconsistent state and cannot be reused.
 
+  bool writeQueueDrained = true;
+  // True if `writeQueue` is known to have fully drained (i.e. it is safe to write body data
+  // directly to `inner` synchronously). We cannot inspect a promise's readiness synchronously,
+  // so this is tracked explicitly: queueWrite() clears it, and the body-write methods set it
+  // after their `co_await` of the queue completes.
+
   void queueWrite(kj::String content) {
     // We only use queueWrite() in cases where we can take ownership of the write buffer, and where
     // it is convenient if we can return `void` rather than a promise.  In particular, this is used
@@ -2515,6 +2639,7 @@ private:
       auto promise = inner.write(content.asBytes());
       return promise.attach(kj::mv(content));
     });
+    writeQueueDrained = false;
   }
 };
 
@@ -2585,6 +2710,12 @@ public:
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
     return kj::READY_NOW;
   }
+  bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+    return true;
+  }
+  bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+    return true;
+  }
   Promise<void> whenWriteDisconnected() override {
     return kj::NEVER_DONE;
   }
@@ -2616,6 +2747,33 @@ public:
 
     co_await getInner().writeBodyData(pieces);
     if (length == 0) doneWriting();
+  }
+
+  bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+    if (buffer == nullptr) return true;  // mirrors write()
+    if (alreadyDone()) return false;     // let the async path surface the error
+    if (buffer.size() > length) return false;  // async path will throw "overwrote Content-Length"
+
+    if (!getInner().tryWriteBodyDataSync(buffer)) return false;
+
+    length -= buffer.size();
+    if (length == 0) doneWriting();
+    return true;
+  }
+
+  bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+    uint64_t size = 0;
+    for (auto& piece: pieces) size += piece.size();
+
+    if (size == 0) return true;  // mirrors write()
+    if (alreadyDone()) return false;
+    if (size > length) return false;
+
+    if (!getInner().tryWriteBodyDataSync(pieces)) return false;
+
+    length -= size;
+    if (length == 0) doneWriting();
+    return true;
   }
 
   Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
@@ -2719,6 +2877,37 @@ public:
     return promise.attach(kj::mv(header), kj::mv(parts));
   }
 
+  bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+    if (buffer == nullptr) return true;  // mirrors write(): can't encode a zero-size chunk
+    if (alreadyDone()) return false;     // let the async path surface the error
+
+    auto header = kj::str(kj::hex(buffer.size()), "\r\n");
+    ArrayPtr<const byte> parts[3] = {header.asBytes(), buffer, "\r\n"_kjb};
+
+    // A synchronous write either completes in full immediately or does nothing, so the
+    // stack-allocated header and parts need not outlive this call.
+    return getInner().tryWriteBodyDataSync(parts);
+  }
+
+  bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+    uint64_t size = 0;
+    for (auto& piece: pieces) size += piece.size();
+
+    if (size == 0) return true;  // mirrors write(): can't encode a zero-size chunk
+    if (alreadyDone()) return false;
+
+    auto header = kj::str(kj::hex(size), "\r\n");
+    auto partsBuilder = kj::heapArrayBuilder<ArrayPtr<const byte>>(pieces.size() + 2);
+    partsBuilder.add(header.asBytes());
+    for (auto& piece: pieces) {
+      partsBuilder.add(piece);
+    }
+    partsBuilder.add("\r\n"_kjb);
+
+    auto parts = partsBuilder.finish();
+    return getInner().tryWriteBodyDataSync(parts.asPtr());
+  }
+
   Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
     KJ_IF_SOME(l, input.tryGetLength()) {
       return pumpImpl(input, kj::min(amount, l));
@@ -2817,260 +3006,300 @@ public:
   }
 
   kj::Promise<Message> receive(size_t maxSize) override {
-    KJ_IF_SOME(ex, receiveException) {
-      return kj::cp(ex);
-    }
-
-    size_t headerSize = Header::headerSize(recvData.begin(), recvData.size());
-
-    if (headerSize > recvData.size()) {
-      if (recvData.begin() != recvBuffer.begin()) {
-        // Move existing data to front of buffer.
-        if (recvData.size() > 0) {
-          memmove(recvBuffer.begin(), recvData.begin(), recvData.size());
-        }
-        recvData = recvBuffer.first(recvData.size());
+    for (;;) {  // To handle ping/pong packets without recursion.
+      KJ_IF_SOME(ex, receiveException) {
+        return ex.clone();
       }
 
-      return stream->tryRead(recvData.end(), 1, recvBuffer.end() - recvData.end())
-          .then([this,maxSize](size_t actual) -> kj::Promise<Message> {
-        receivedBytes += actual;
-        if (actual == 0) {
+      size_t headerSize = Header::headerSize(recvData.begin(), recvData.size());
+
+      if (headerSize > recvData.size()) {
+        if (recvData.begin() != recvBuffer.begin()) {
+          // Move existing data to front of buffer.
           if (recvData.size() > 0) {
-            return KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in frame header");
-          } else {
-            // It's incorrect for the WebSocket to disconnect without sending `Close`.
-            return KJ_EXCEPTION(DISCONNECTED,
-                "WebSocket disconnected between frames without sending `Close`.");
+            memmove(recvBuffer.begin(), recvData.begin(), recvData.size());
           }
+          recvData = recvBuffer.first(recvData.size());
         }
 
-        recvData = recvBuffer.first(recvData.size() + actual);
-        return receive(maxSize);
-      });
-    }
+        return stream->tryRead(recvData.end(), 1, recvBuffer.end() - recvData.end())
+            .then([this,maxSize](size_t actual) -> kj::Promise<Message> {
+          receivedBytes += actual;
+          if (actual == 0) {
+            if (recvData.size() > 0) {
+              return KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in frame header");
+            } else {
+              // It's incorrect for the WebSocket to disconnect without sending `Close`.
+              return KJ_EXCEPTION(DISCONNECTED,
+                  "WebSocket disconnected between frames without sending `Close`.");
+            }
+          }
 
-    auto& recvHeader = *reinterpret_cast<Header*>(recvData.begin());
-    if (recvHeader.hasRsv2or3()) {
-      return sendCloseDueToError(1002, "Received frame had RSV bits 2 or 3 set");
-    }
-
-    recvData = recvData.slice(headerSize, recvData.size());
-
-    size_t payloadLen = recvHeader.getPayloadLen();
-    if (payloadLen > maxSize) {
-      auto description = kj::str("Message is too large: ", payloadLen, " > ", maxSize);
-      return sendCloseDueToError(1009, description.asPtr()).attach(kj::mv(description));
-    }
-
-    auto opcode = recvHeader.getOpcode();
-    bool isData = opcode < OPCODE_FIRST_CONTROL;
-    if (opcode == OPCODE_CONTINUATION) {
-      if (fragments.empty()) {
-        return sendCloseDueToError(1002, "Unexpected continuation frame");
+          recvData = recvBuffer.first(recvData.size() + actual);
+          return receive(maxSize);
+        });
       }
 
-      opcode = fragmentOpcode;
-    } else if (isData) {
-      if (!fragments.empty()) {
-        return sendCloseDueToError(1002, "Missing continuation frame");
-      }
-    }
-
-    bool isFin = recvHeader.isFin();
-    bool isCompressed = false;
-
-    kj::Array<byte> message;           // space to allocate
-    byte* payloadTarget;               // location into which to read payload (size is payloadLen)
-    kj::Maybe<size_t> originalMaxSize; // maxSize from first `receive()` call
-    if (isFin) {
-      size_t amountToAllocate;
-      if (recvHeader.isCompressed() || fragmentCompressed) {
-        // Add 4 since we append 0x00 0x00 0xFF 0xFF to the tail of the payload.
-        // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
-        amountToAllocate = payloadLen + 4;
-        isCompressed = true;
-      } else {
-        // Add space for NUL terminator when allocating text message.
-        amountToAllocate = payloadLen + (opcode == OPCODE_TEXT && isFin);
+      auto& recvHeader = *reinterpret_cast<Header*>(recvData.begin());
+      if (recvHeader.hasRsv2or3()) {
+        return sendCloseDueToError(1002, "Received frame had RSV bits 2 or 3 set");
       }
 
-      if (isData && !fragments.empty()) {
-        // Final frame of a fragmented message. Gather the fragments.
-        size_t offset = 0;
-        for (auto& fragment: fragments) offset += fragment.size();
-        message = kj::heapArray<byte>(offset + amountToAllocate);
-        originalMaxSize = offset + maxSize; // gives us back the original maximum message size.
+      recvData = recvData.slice(headerSize, recvData.size());
 
-        offset = 0;
-        for (auto& fragment: fragments) {
-          memcpy(message.begin() + offset, fragment.begin(), fragment.size());
-          offset += fragment.size();
+      size_t payloadLen = recvHeader.getPayloadLen();
+      if (payloadLen > maxSize) {
+        auto description = kj::str("Message is too large: ", payloadLen, " > ", maxSize);
+        return sendCloseDueToError(1009, description.asPtr()).attach(kj::mv(description));
+      }
+
+      auto opcode = recvHeader.getOpcode();
+      bool isData = opcode < OPCODE_FIRST_CONTROL;
+      if (opcode == OPCODE_CONTINUATION) {
+        if (fragments.empty()) {
+          return sendCloseDueToError(1002, "Unexpected continuation frame");
         }
-        payloadTarget = message.begin() + offset;
 
-        fragments.clear();
-        fragmentOpcode = 0;
-        fragmentCompressed = false;
+        opcode = fragmentOpcode;
+      } else if (isData) {
+        if (!fragments.empty()) {
+          return sendCloseDueToError(1002, "Missing continuation frame");
+        }
+      }
+
+      bool isFin = recvHeader.isFin();
+      bool isCompressed = false;
+
+      kj::Array<byte> message;           // space to allocate
+      byte* payloadTarget;               // location into which to read payload (size is payloadLen)
+      kj::Maybe<size_t> originalMaxSize; // maxSize from first `receive()` call
+      if (isFin) {
+        size_t amountToAllocate;
+        if (recvHeader.isCompressed() || fragmentCompressed) {
+          // Add 4 since we append 0x00 0x00 0xFF 0xFF to the tail of the payload.
+          // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
+          amountToAllocate = payloadLen + 4;
+          isCompressed = true;
+        } else {
+          // Add space for NUL terminator when allocating text message.
+          amountToAllocate = payloadLen + (opcode == OPCODE_TEXT && isFin);
+        }
+
+        if (isData && !fragments.empty()) {
+          // Final frame of a fragmented message. Gather the fragments.
+          size_t offset = 0;
+          for (auto& fragment: fragments) offset += fragment.size();
+          message = kj::heapArray<byte>(offset + amountToAllocate);
+          originalMaxSize = offset + maxSize; // gives us back the original maximum message size.
+
+          offset = 0;
+          for (auto& fragment: fragments) {
+            memcpy(message.begin() + offset, fragment.begin(), fragment.size());
+            offset += fragment.size();
+          }
+          payloadTarget = message.begin() + offset;
+
+          fragments.clear();
+          fragmentOpcode = 0;
+          fragmentCompressed = false;
+        } else {
+          // Single-frame message.
+          message = kj::heapArray<byte>(amountToAllocate);
+          originalMaxSize = maxSize; // gives us back the original maximum message size.
+          payloadTarget = message.begin();
+        }
       } else {
-        // Single-frame message.
-        message = kj::heapArray<byte>(amountToAllocate);
-        originalMaxSize = maxSize; // gives us back the original maximum message size.
+        // Fragmented message, and this isn't the final fragment.
+        if (!isData) {
+          return sendCloseDueToError(1002, "Received fragmented control frame");
+        }
+
+        message = kj::heapArray<byte>(payloadLen);
         payloadTarget = message.begin();
-      }
-    } else {
-      // Fragmented message, and this isn't the final fragment.
-      if (!isData) {
-        return sendCloseDueToError(1002, "Received fragmented control frame");
-      }
-
-      message = kj::heapArray<byte>(payloadLen);
-      payloadTarget = message.begin();
-      if (fragments.empty()) {
-        // This is the first fragment, so set the opcode.
-        fragmentOpcode = opcode;
-        fragmentCompressed = recvHeader.isCompressed();
-      }
-    }
-
-    Mask mask = recvHeader.getMask();
-
-    auto handleMessage =
-        [this,opcode,payloadTarget,payloadLen,mask,isFin,maxSize,originalMaxSize,
-         isCompressed,message=kj::mv(message)]() mutable
-        -> kj::Promise<Message> {
-      if (!mask.isZero()) {
-        mask.apply(kj::arrayPtr(payloadTarget, payloadLen));
-      }
-
-      if (!isFin) {
-        // Add fragment to the list and loop.
-        auto newMax = maxSize - message.size();
-        fragments.add(kj::mv(message));
-        return receive(newMax);
-      }
-
-      // Provide a reasonable error if a compressed frame is received without compression enabled.
-      if (isCompressed && compressionConfig == kj::none) {
-        return sendCloseDueToError(
-            1002,
-            "Received a WebSocket frame whose compression bit was set, but the compression "
-            "extension was not negotiated for this connection.");
-      }
-
-      switch (opcode) {
-        case OPCODE_CONTINUATION:
-          // Shouldn't get here; handled above.
-          KJ_UNREACHABLE;
-        case OPCODE_TEXT:
-#if KJ_HAS_ZLIB
-          if (isCompressed) {
-            auto& config = KJ_ASSERT_NONNULL(compressionConfig);
-            auto& decompressor = KJ_ASSERT_NONNULL(decompressionContext);
-            KJ_ASSERT(message.size() >= 4);
-            auto tail = message.slice(message.size() - 4, message.size());
-            // Note that we added an additional 4 bytes to `message`s capacity to account for these
-            // extra bytes. See `amountToAllocate` in the if(recvHeader.isCompressed()) block above.
-            const byte tailBytes[] = {0x00, 0x00, 0xFF, 0xFF};
-            memcpy(tail.begin(), tailBytes, sizeof(tailBytes));
-            // We have to append 0x00 0x00 0xFF 0xFF to the message before inflating.
-            // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
-            if (config.inboundNoContextTakeover) {
-              // We must reset context on each message.
-              decompressor.reset();
-            }
-            bool addNullTerminator = true;
-            // We want to add the null terminator when receiving a TEXT message.
-            auto decompressedOrError = decompressor.processMessage(message, originalMaxSize,
-                addNullTerminator);
-            KJ_SWITCH_ONEOF(decompressedOrError) {
-              KJ_CASE_ONEOF(protocolError, ProtocolError) {
-                return sendCloseDueToError(protocolError.statusCode, protocolError.description)
-                    .attach(kj::mv(decompressedOrError));
-              }
-              KJ_CASE_ONEOF(decompressed, kj::Array<byte>) {
-                return Message(kj::String(decompressed.releaseAsChars()));
-              }
-            }
-          }
-#endif // KJ_HAS_ZLIB
-          message.back() = '\0';
-          return Message(kj::String(message.releaseAsChars()));
-        case OPCODE_BINARY:
-#if KJ_HAS_ZLIB
-          if (isCompressed) {
-            auto& config = KJ_ASSERT_NONNULL(compressionConfig);
-            auto& decompressor = KJ_ASSERT_NONNULL(decompressionContext);
-            KJ_ASSERT(message.size() >= 4);
-            auto tail = message.slice(message.size() - 4, message.size());
-            // Note that we added an additional 4 bytes to `message`s capacity to account for these
-            // extra bytes. See `amountToAllocate` in the if(recvHeader.isCompressed()) block above.
-            const byte tailBytes[] = {0x00, 0x00, 0xFF, 0xFF};
-            memcpy(tail.begin(), tailBytes, sizeof(tailBytes));
-            // We have to append 0x00 0x00 0xFF 0xFF to the message before inflating.
-            // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
-            if (config.inboundNoContextTakeover) {
-              // We must reset context on each message.
-              decompressor.reset();
-            }
-
-            auto decompressedOrError = decompressor.processMessage(message, originalMaxSize);
-            KJ_SWITCH_ONEOF(decompressedOrError) {
-              KJ_CASE_ONEOF(protocolError, ProtocolError) {
-                return sendCloseDueToError(protocolError.statusCode, protocolError.description)
-                    .attach(kj::mv(decompressedOrError));
-              }
-              KJ_CASE_ONEOF(decompressed, kj::Array<byte>) {
-                return Message(decompressed.releaseAsBytes());
-              }
-            }
-          }
-#endif // KJ_HAS_ZLIB
-          return Message(message.releaseAsBytes());
-        case OPCODE_CLOSE:
-          if (message.size() < 2) {
-            return Message(Close { 1005, nullptr });
-          } else {
-            uint16_t status = (static_cast<uint16_t>(message[0]) << 8)
-                            | (static_cast<uint16_t>(message[1])     );
-            return Message(Close {
-              status, kj::heapString(message.slice(2, message.size()).asChars())
-            });
-          }
-        case OPCODE_PING:
-          // Send back a pong.
-          queuePong(kj::mv(message));
-          return receive(maxSize);
-        case OPCODE_PONG:
-          // Unsolicited pong. Ignore.
-          return receive(maxSize);
-        default:
-          {
-            auto description = kj::str("Unknown opcode ", opcode);
-            return sendCloseDueToError(1002, description.asPtr()).attach(kj::mv(description));
-          }
-      }
-    };
-
-    if (payloadLen <= recvData.size()) {
-      // All data already received.
-      memcpy(payloadTarget, recvData.begin(), payloadLen);
-      recvData = recvData.slice(payloadLen, recvData.size());
-      return handleMessage();
-    } else {
-      // Need to read more data.
-      memcpy(payloadTarget, recvData.begin(), recvData.size());
-      size_t remaining = payloadLen - recvData.size();
-      auto promise = stream->tryRead(payloadTarget + recvData.size(), remaining, remaining)
-          .then([this, remaining](size_t amount) {
-        receivedBytes += amount;
-        if (amount < remaining) {
-          kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in message"));
+        if (fragments.empty()) {
+          // This is the first fragment, so set the opcode.
+          fragmentOpcode = opcode;
+          fragmentCompressed = recvHeader.isCompressed();
         }
-      });
-      recvData = nullptr;
-      return promise.then(kj::mv(handleMessage));
-    }
+      }
+
+      Mask mask = recvHeader.getMask();
+
+      // When the entire payload is already buffered, handle control frames and
+      // fragment accumulation iteratively to avoid stack overflow from many
+      // buffered frames (e.g. thousands of PING/PONG frames injected in the
+      // HTTP upgrade leftover data).
+      bool payloadAlreadyCopied = false;
+      if (payloadLen <= recvData.size()) {
+        memcpy(payloadTarget, recvData.begin(), payloadLen);
+        recvData = recvData.slice(payloadLen, recvData.size());
+
+        if (!mask.isZero()) {
+          mask.apply(kj::arrayPtr(payloadTarget, payloadLen));
+        }
+
+        if (!isFin) {
+          // Non-final fragment: accumulate and continue to next frame.
+          maxSize -= message.size();
+          fragments.add(kj::mv(message));
+          continue;
+        }
+
+        if (opcode == OPCODE_PING) {
+          queuePong(kj::mv(message));
+          continue;
+        }
+        if (opcode == OPCODE_PONG) {
+          continue;
+        }
+
+        // Data frame or close with payload already buffered and mask already
+        // applied. Zero the mask so handleMessage() won't apply it again.
+        mask = Mask();
+        payloadAlreadyCopied = true;
+      }
+
+      auto handleMessage =
+          [this,opcode,payloadTarget,payloadLen,mask,isFin,maxSize,originalMaxSize,
+           isCompressed,message=kj::mv(message)]() mutable
+          -> kj::Promise<Message> {
+        if (!mask.isZero()) {
+          mask.apply(kj::arrayPtr(payloadTarget, payloadLen));
+        }
+
+        if (!isFin) {
+          // Add fragment to the list and loop.
+          auto newMax = maxSize - message.size();
+          fragments.add(kj::mv(message));
+          return receive(newMax);
+        }
+
+        // Provide a reasonable error if a compressed frame is received without compression enabled.
+        if (isCompressed && compressionConfig == kj::none) {
+          return sendCloseDueToError(
+              1002,
+              "Received a WebSocket frame whose compression bit was set, but the compression "
+              "extension was not negotiated for this connection.");
+        }
+
+        switch (opcode) {
+          case OPCODE_CONTINUATION:
+            // Shouldn't get here; handled above.
+            KJ_UNREACHABLE;
+          case OPCODE_TEXT:
+#if KJ_HAS_ZLIB
+            if (isCompressed) {
+              auto& config = KJ_ASSERT_NONNULL(compressionConfig);
+              auto& decompressor = KJ_ASSERT_NONNULL(decompressionContext);
+              KJ_ASSERT(message.size() >= 4);
+              auto tail = message.slice(message.size() - 4, message.size());
+              // Note that we added an additional 4 bytes to `message`s capacity to account for these
+              // extra bytes. See `amountToAllocate` in the if(recvHeader.isCompressed()) block above.
+              const byte tailBytes[] = {0x00, 0x00, 0xFF, 0xFF};
+              memcpy(tail.begin(), tailBytes, sizeof(tailBytes));
+              // We have to append 0x00 0x00 0xFF 0xFF to the message before inflating.
+              // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
+              if (config.inboundNoContextTakeover) {
+                // We must reset context on each message.
+                decompressor.reset();
+              }
+              bool addNullTerminator = true;
+              // We want to add the null terminator when receiving a TEXT message.
+              auto decompressedOrError = decompressor.processMessage(message, originalMaxSize,
+                  addNullTerminator);
+              KJ_SWITCH_ONEOF(decompressedOrError) {
+                KJ_CASE_ONEOF(protocolError, ProtocolError) {
+                  return sendCloseDueToError(protocolError.statusCode, protocolError.description)
+                      .attach(kj::mv(decompressedOrError));
+                }
+                KJ_CASE_ONEOF(decompressed, kj::Array<byte>) {
+                  return Message(kj::String(decompressed.releaseAsChars()));
+                }
+              }
+            }
+#endif // KJ_HAS_ZLIB
+            message.back() = '\0';
+            return Message(kj::String(message.releaseAsChars()));
+          case OPCODE_BINARY:
+#if KJ_HAS_ZLIB
+            if (isCompressed) {
+              auto& config = KJ_ASSERT_NONNULL(compressionConfig);
+              auto& decompressor = KJ_ASSERT_NONNULL(decompressionContext);
+              KJ_ASSERT(message.size() >= 4);
+              auto tail = message.slice(message.size() - 4, message.size());
+              // Note that we added an additional 4 bytes to `message`s capacity to account for these
+              // extra bytes. See `amountToAllocate` in the if(recvHeader.isCompressed()) block above.
+              const byte tailBytes[] = {0x00, 0x00, 0xFF, 0xFF};
+              memcpy(tail.begin(), tailBytes, sizeof(tailBytes));
+              // We have to append 0x00 0x00 0xFF 0xFF to the message before inflating.
+              // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
+              if (config.inboundNoContextTakeover) {
+                // We must reset context on each message.
+                decompressor.reset();
+              }
+
+              auto decompressedOrError = decompressor.processMessage(message, originalMaxSize);
+              KJ_SWITCH_ONEOF(decompressedOrError) {
+                KJ_CASE_ONEOF(protocolError, ProtocolError) {
+                  return sendCloseDueToError(protocolError.statusCode, protocolError.description)
+                      .attach(kj::mv(decompressedOrError));
+                }
+                KJ_CASE_ONEOF(decompressed, kj::Array<byte>) {
+                  return Message(decompressed.releaseAsBytes());
+                }
+              }
+            }
+#endif // KJ_HAS_ZLIB
+            return Message(message.releaseAsBytes());
+          case OPCODE_CLOSE:
+            if (message.size() < 2) {
+              return Message(Close { 1005, nullptr });
+            } else {
+              uint16_t status = (static_cast<uint16_t>(message[0]) << 8)
+                              | (static_cast<uint16_t>(message[1])     );
+              return Message(Close {
+                status, kj::heapString(message.slice(2, message.size()).asChars())
+              });
+            }
+          case OPCODE_PING:
+            // Send back a pong.
+            queuePong(kj::mv(message));
+            return receive(maxSize);
+          case OPCODE_PONG:
+            // Unsolicited pong. Ignore.
+            return receive(maxSize);
+          default:
+            {
+              auto description = kj::str("Unknown opcode ", opcode);
+              return sendCloseDueToError(1002, description.asPtr()).attach(kj::mv(description));
+            }
+        }
+      };
+
+      if (payloadAlreadyCopied) {
+        // Synchronous data/close frame — payload already copied and unmasked
+        // above. handleMessage won't recurse for these opcodes.
+        return handleMessage();
+      } else if (payloadLen <= recvData.size()) {
+        // All data already received.
+        memcpy(payloadTarget, recvData.begin(), payloadLen);
+        recvData = recvData.slice(payloadLen, recvData.size());
+        return handleMessage();
+      } else {
+        // Need to read more data.
+        memcpy(payloadTarget, recvData.begin(), recvData.size());
+        size_t remaining = payloadLen - recvData.size();
+        auto promise = stream->tryRead(payloadTarget + recvData.size(), remaining, remaining)
+            .then([this, remaining](size_t amount) {
+          receivedBytes += amount;
+          if (amount < remaining) {
+            kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in message"));
+          }
+        });
+        recvData = nullptr;
+        return promise.then(kj::mv(handleMessage));
+      }
+    } // for(;;) to handle ping/pong packets without recursion.
   }
 
   kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
@@ -3187,7 +3416,7 @@ private:
       KJ_IF_SOME(g, generator) {
         g.generate(maskBytes);
       } else {
-        memset(maskBytes, 0, 4);
+        kj::arrayPtr(maskBytes).fill(0);
       }
     }
 
@@ -3246,7 +3475,7 @@ private:
         bytes[2] = static_cast<byte>(payloadLen >> 56);
         bytes[3] = static_cast<byte>(payloadLen >> 48);
         bytes[4] = static_cast<byte>(payloadLen >> 40);
-        bytes[5] = static_cast<byte>(payloadLen >> 42);
+        bytes[5] = static_cast<byte>(payloadLen >> 32);
         bytes[6] = static_cast<byte>(payloadLen >> 24);
         bytes[7] = static_cast<byte>(payloadLen >> 16);
         bytes[8] = static_cast<byte>(payloadLen >>  8);
@@ -4197,7 +4426,7 @@ private:
         return pipe.pumpTo(other);
       }, [this](kj::Exception&& e) -> kj::Promise<void> {
         canceler.release();
-        fulfiller.reject(kj::cp(e));
+        fulfiller.reject(e.clone());
         pipe.endState(*this);
         return kj::mv(e);
       }));
@@ -4271,7 +4500,7 @@ private:
         return kj::mv(message);
       }, [this](kj::Exception&& e) -> Message {
         canceler.release();
-        fulfiller.reject(kj::cp(e));
+        fulfiller.reject(e.clone());
         pipe.endState(*this);
         kj::throwRecoverableException(kj::mv(e));
         return Message(kj::String());
@@ -4286,7 +4515,7 @@ private:
         pipe.endState(*this);
       }, [this](kj::Exception&& e) {
         canceler.release();
-        fulfiller.reject(kj::cp(e));
+        fulfiller.reject(e.clone());
         pipe.endState(*this);
         kj::throwRecoverableException(kj::mv(e));
       }));
@@ -4367,7 +4596,7 @@ private:
         return other.pumpTo(pipe);
       }, [this](kj::Exception&& e) -> kj::Promise<void> {
         canceler.release();
-        fulfiller.reject(kj::cp(e));
+        fulfiller.reject(e.clone());
         pipe.endState(*this);
         return kj::mv(e);
       }));
@@ -4441,7 +4670,7 @@ private:
       }, [this](kj::Exception&& e) {
         canceler.release();
         pipe.endState(*this);
-        fulfiller.reject(kj::cp(e));
+        fulfiller.reject(e.clone());
         kj::throwRecoverableException(kj::mv(e));
       }));
     }
@@ -4462,7 +4691,7 @@ private:
       }, [this](kj::Exception&& e) {
         canceler.release();
         pipe.endState(*this);
-        fulfiller.reject(kj::cp(e));
+        fulfiller.reject(e.clone());
         kj::throwRecoverableException(kj::mv(e));
       }));
     }
@@ -4734,6 +4963,32 @@ public:
     }
   }
 
+  Maybe<size_t> tryReadSync(ArrayPtr<byte> buffer, size_t minBytes) override {
+    KJ_REQUIRE(buffer.size() >= minBytes);
+
+    if (leftover.size() >= minBytes) {
+      // Serve entirely from the leftover buffer.
+      auto bytesToCopy = kj::min(buffer.size(), leftover.size());
+      buffer.write(leftover.first(bytesToCopy));
+      leftover = leftover.slice(bytesToCopy, leftover.size());
+
+      // If we've consumed all of the data in the leftover buffer, go ahead and free it.
+      if (leftover.size() == 0) {
+        leftoverBackingBuffer = nullptr;
+      }
+
+      return bytesToCopy;
+    } else if (leftover.size() == 0) {
+      // No leftover data at all; delegate directly to the underlying stream.
+      return stream->tryReadSync(buffer, minBytes);
+    } else {
+      // There is some leftover data, but not enough to satisfy minBytes. We cannot consume the
+      // leftover and then ask the underlying stream for the rest: if the underlying stream then
+      // declined, we'd have already consumed the leftover, violating the no-side-effects rule.
+      return kj::none;
+    }
+  }
+
   Maybe<uint64_t> tryGetLength() override {
     // For a CONNECT pipe, we have no idea how much data there is going to be.
     return kj::none;
@@ -4756,6 +5011,14 @@ public:
 
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
     return stream->write(pieces);
+  }
+
+  bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+    return stream->tryWriteSync(buffer);
+  }
+
+  bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+    return stream->tryWriteSync(pieces);
   }
 
   Promise<void> whenWriteDisconnected() override {
@@ -4831,6 +5094,13 @@ public:
     });
   }
 
+  Maybe<size_t> tryReadSync(ArrayPtr<byte> buffer, size_t minBytes) override {
+    if (readGuardReleased) {
+      return inner->tryReadSync(buffer, minBytes);
+    }
+    return kj::none;
+  }
+
   Maybe<uint64_t> tryGetLength() override {
     return kj::none;
   }
@@ -4883,6 +5153,20 @@ public:
         return inner->write(pieces);
       });
     }
+  }
+
+  bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+    if (writeGuardReleased) {
+      return inner->tryWriteSync(buffer);
+    }
+    return false;
+  }
+
+  bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+    if (writeGuardReleased) {
+      return inner->tryWriteSync(pieces);
+    }
+    return false;
   }
 
   Promise<void> whenWriteDisconnected() override {
@@ -5221,7 +5505,7 @@ kj::Vector<CompressionParameters> findValidExtensionOffers(StringPtr offers) {
 
   for (const auto& offer : extensions) {
     auto splitOffer = splitParts(offer, ';');
-    if (splitOffer.front() != "permessage-deflate"_kj) {
+    if (splitOffer.empty() || splitOffer.front() != "permessage-deflate"_kj) {
       continue;
     }
     KJ_IF_SOME(validated, tryExtractParameters(splitOffer, false)) {
@@ -5274,7 +5558,7 @@ kj::Maybe<CompressionParameters> tryParseExtensionOffers(StringPtr offers) {
   for (const auto& offer : splitOffers) {
     auto splitOffer = splitParts(offer, ';');
 
-    if (splitOffer.front() != "permessage-deflate"_kj) {
+    if (splitOffer.empty() || splitOffer.front() != "permessage-deflate"_kj) {
       // Extension token was invalid.
       continue;
     }
@@ -5299,7 +5583,7 @@ kj::Maybe<CompressionParameters> tryParseAllExtensionOffers(StringPtr offers,
   for (const auto& offer : splitOffers) {
     auto splitOffer = splitParts(offer, ';');
 
-    if (splitOffer.front() != "permessage-deflate"_kj) {
+    if (splitOffer.empty() || splitOffer.front() != "permessage-deflate"_kj) {
       // Extension token was invalid.
       continue;
     }
@@ -5418,7 +5702,7 @@ kj::OneOf<CompressionParameters, kj::Exception> tryParseExtensionAgreement(
   }
   auto splitOffer = splitParts(offers.front(), ';');
 
-  if (splitOffer.front() != "permessage-deflate"_kj) {
+  if (splitOffer.empty() || splitOffer.front() != "permessage-deflate"_kj) {
     e.setDescription(kj::str(FAILURE, "response included a Sec-WebSocket-Extensions value that was "
                                       "not permessage-deflate."));
     return kj::mv(e);
@@ -5465,6 +5749,10 @@ public:
     // TODO(someday): Maybe this should throw? We should not be trying to read the body of a
     // HEAD response.
     return constPromise<size_t, 0>();
+  }
+
+  kj::Maybe<size_t> tryReadSync(ArrayPtr<byte> buffer, size_t minBytes) override {
+    return size_t(0);
   }
 
   kj::Maybe<uint64_t> tryGetLength() override {
@@ -6005,6 +6293,17 @@ kj::Promise<size_t> PausableReadAsyncIoStream::tryReadImpl(
   });
 }
 
+kj::Maybe<size_t> PausableReadAsyncIoStream::tryReadSync(
+    kj::ArrayPtr<byte> buffer, size_t minBytes) {
+  if (maybePausableRead != kj::none || currentlyReading) {
+    // A read is already pending (possibly paused); can't read synchronously.
+    return kj::none;
+  }
+  // Note: A synchronous read completes immediately, so there is no window during which it could
+  // need to be paused; no PausableRead or trackRead() bookkeeping is needed.
+  return inner->tryReadSync(buffer, minBytes);
+}
+
 kj::Maybe<uint64_t> PausableReadAsyncIoStream::tryGetLength() {
   return inner->tryGetLength();
 }
@@ -6021,6 +6320,24 @@ kj::Promise<void> PausableReadAsyncIoStream::write(ArrayPtr<const byte> buffer) 
 kj::Promise<void> PausableReadAsyncIoStream::write(
     kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) {
   return inner->write(pieces).attach(trackWrite());
+}
+
+bool PausableReadAsyncIoStream::tryWriteSync(kj::ArrayPtr<const byte> buffer) {
+  if (currentlyWriting) {
+    // A write is already in progress; can't write synchronously.
+    return false;
+  }
+  // Note: A synchronous write completes immediately, so no trackWrite() bookkeeping is needed.
+  return inner->tryWriteSync(buffer);
+}
+
+bool PausableReadAsyncIoStream::tryWriteSync(
+    kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) {
+  if (currentlyWriting) {
+    // A write is already in progress; can't write synchronously.
+    return false;
+  }
+  return inner->tryWriteSync(pieces);
 }
 
 kj::Maybe<kj::Promise<uint64_t>> PausableReadAsyncIoStream::tryPumpFrom(
@@ -6112,7 +6429,7 @@ public:
                   kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
     auto refcounted = getClient();
     auto result = refcounted->client->request(method, url, headers, expectedBodySize);
-    result.body = result.body.attach(kj::addRef(*refcounted));
+    result.body = result.body.attach(refcounted.addRef());
     result.response = result.response.then(
         [refcounted=kj::mv(refcounted)](Response&& response) mutable {
       response.body = response.body.attach(kj::mv(refcounted));
@@ -6149,7 +6466,7 @@ public:
     auto refcounted = getClient();
     auto request = refcounted->client->connect(host, headers, settings);
     return ConnectRequest {
-      request.status.attach(kj::addRef(*refcounted)),
+      request.status.attach(refcounted.addRef()),
       request.connection.attach(kj::mv(refcounted))
     };
   }
@@ -6191,17 +6508,17 @@ private:
     kj::Own<HttpClientImpl> client;
   };
 
-  kj::Own<RefcountedClient> getClient() {
+  kj::Rc<RefcountedClient> getClient() {
     for (;;) {
       if (availableClients.empty()) {
         auto stream = newPromisedStream(address->connect());
-        return kj::refcounted<RefcountedClient>(*this,
+        return kj::rc<RefcountedClient>(*this,
           kj::heap<HttpClientImpl>(responseHeaderTable, kj::mv(stream), settings));
       } else {
         auto client = kj::mv(availableClients.back().client);
         availableClients.pop_back();
         if (client->canReuse()) {
-          return kj::refcounted<RefcountedClient>(*this, kj::mv(client));
+          return kj::rc<RefcountedClient>(*this, kj::mv(client));
         }
         // Whoops, this client's connection was closed by the server at some point. Discard.
       }
@@ -6256,6 +6573,10 @@ public:
     return inner->tryRead(buffer, minBytes, maxBytes);
   }
 
+  kj::Maybe<size_t> tryReadSync(kj::ArrayPtr<byte> buffer, size_t minBytes) override {
+    return inner->tryReadSync(buffer, minBytes);
+  }
+
   kj::Maybe<uint64_t> tryGetLength() override {
     return inner->tryGetLength();
   }
@@ -6270,6 +6591,14 @@ public:
 
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
     return inner->write(pieces);
+  }
+
+  bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+    return inner->tryWriteSync(buffer);
+  }
+
+  bool tryWriteSync(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
+    return inner->tryWriteSync(pieces);
   }
 
   kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
@@ -6485,15 +6814,15 @@ public:
     if (!connectSettings.useTls) {
       KJ_IF_SOME(wrapper, settings.tlsContext) {
         KJ_IF_SOME(tlsStarter, connectSettings.tlsStarter) {
-          auto transitConnectionRef = kj::refcountedWrapper(
+          kj::Rc<TransitionaryAsyncIoStream> transitConnectionRef(
               kj::heap<TransitionaryAsyncIoStream>(kj::mv(connection)));
           Function<kj::Promise<void>(kj::StringPtr)> cb =
-              [&wrapper, ref1 = transitConnectionRef->addWrappedRef()](
+              [&wrapper, ref1 = transitConnectionRef.addRef()](
               kj::StringPtr expectedServerHostname) mutable {
             ref1->startTls(&wrapper, expectedServerHostname);
             return kj::READY_NOW;
           };
-          connection = transitConnectionRef->addWrappedRef();
+          connection = transitConnectionRef.addRef().toOwn();
           tlsStarter = kj::mv(cb);
         }
       }
@@ -6751,7 +7080,7 @@ private:
         parent->fireCountChanged();
       }
     }
-    ConnectionCounter(ConnectionCounter&& other) : parent(other.parent) {
+    ConnectionCounter(ConnectionCounter&& other) noexcept : parent(other.parent) {
       other.parent = nullptr;
     }
     ConnectionCounter& operator=(ConnectionCounter&& other) {
@@ -7307,7 +7636,7 @@ private:
         auto ex = KJ_EXCEPTION(FAILED,
             "service's connect() implementation never called accept() nor reject()");
         if (fulfiller->isWaiting()) {
-          fulfiller->reject(kj::cp(ex));
+          fulfiller->reject(ex.clone());
         }
         if (streamAndFulfiller.fulfiller->isWaiting()) {
           streamAndFulfiller.fulfiller->reject(kj::mv(ex));
@@ -7363,7 +7692,7 @@ private:
     void handleException(kj::Exception&& ex, kj::Own<kj::AsyncIoStream> connectStream) {
       // Reject the status promise if it is still pending...
       if (fulfiller->isWaiting()) {
-        fulfiller->reject(kj::cp(ex));
+        fulfiller->reject(ex.clone());
       }
       if (streamAndFulfiller.fulfiller->isWaiting()) {
         // If the guard hasn't yet ben released, we can fail the pending reads by

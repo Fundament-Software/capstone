@@ -24,16 +24,13 @@
 #include "message.h"
 #include "arena.h"
 #include <kj/debug.h>
+#include <kj/atomic.h>
 #include <kj/exception.h>
 #include <kj/arena.h>
 #include <kj/vector.h>
 #include <algorithm>
 #include <kj/map.h>
 #include <capnp/stream.capnp.h>
-
-#if _MSC_VER && !defined(__clang__)
-#include <atomic>
-#endif
 
 namespace capnp {
 
@@ -315,11 +312,10 @@ private:
     auto fields = structNode.getFields();
 
     KJ_STACK_ARRAY(bool, sawCodeOrder, fields.size(), 32, 256);
-    memset(sawCodeOrder.begin(), 0, sawCodeOrder.size() * sizeof(sawCodeOrder[0]));
+    sawCodeOrder.fill(false);
 
     KJ_STACK_ARRAY(bool, sawDiscriminantValue, structNode.getDiscriminantCount(), 32, 256);
-    memset(sawDiscriminantValue.begin(), 0,
-           sawDiscriminantValue.size() * sizeof(sawDiscriminantValue[0]));
+    sawDiscriminantValue.fill(false);
 
     if (structNode.getDiscriminantCount() > 0) {
       VALIDATE_SCHEMA(structNode.getDiscriminantCount() != 1,
@@ -327,8 +323,9 @@ private:
       VALIDATE_SCHEMA(structNode.getDiscriminantCount() <= fields.size(),
                       "struct can't have more union fields than total fields");
 
-      VALIDATE_SCHEMA((structNode.getDiscriminantOffset() + 1) * 16 <= dataSizeInBits,
-                      "union discriminant is out-of-bounds");
+      VALIDATE_SCHEMA(
+          (static_cast<uint64_t>(structNode.getDiscriminantOffset()) + 1) * 16 <= dataSizeInBits,
+          "union discriminant is out-of-bounds");
     }
 
     membersByDiscriminant = loader.arena.allocateArray<uint16_t>(fields.size());
@@ -361,7 +358,7 @@ private:
 
         membersByDiscriminant[discriminantPos++] = index;
       } else {
-        VALIDATE_SCHEMA(nonDiscriminantPos <= fields.size(),
+        VALIDATE_SCHEMA(nonDiscriminantPos < fields.size(),
                         "discriminantCount did not match fields");
         membersByDiscriminant[nonDiscriminantPos++] = index;
       }
@@ -373,10 +370,11 @@ private:
           uint fieldBits = 0;
           bool fieldIsPointer = false;
           validate(slot.getType(), slot.getDefaultValue(), &fieldBits, &fieldIsPointer);
-          VALIDATE_SCHEMA(fieldBits * (slot.getOffset() + 1) <= dataSizeInBits &&
-                          fieldIsPointer * (slot.getOffset() + 1) <= pointerCount,
+          uint64_t offset = slot.getOffset();
+          VALIDATE_SCHEMA(fieldBits * (offset + 1) <= dataSizeInBits &&
+                          fieldIsPointer * (offset + 1) <= pointerCount,
                           "field offset out-of-bounds",
-                          slot.getOffset(), dataSizeInBits, pointerCount);
+                          offset, dataSizeInBits, pointerCount);
 
           break;
         }
@@ -410,7 +408,7 @@ private:
   void validate(const schema::Node::Enum::Reader& enumNode) {
     auto enumerants = enumNode.getEnumerants();
     KJ_STACK_ARRAY(bool, sawCodeOrder, enumerants.size(), 32, 256);
-    memset(sawCodeOrder.begin(), 0, sawCodeOrder.size() * sizeof(sawCodeOrder[0]));
+    sawCodeOrder.fill(false);
 
     uint index = 0;
     for (auto enumerant: enumerants) {
@@ -431,7 +429,7 @@ private:
 
     auto methods = interfaceNode.getMethods();
     KJ_STACK_ARRAY(bool, sawCodeOrder, methods.size(), 32, 256);
-    memset(sawCodeOrder.begin(), 0, sawCodeOrder.size() * sizeof(sawCodeOrder[0]));
+    sawCodeOrder.fill(false);
 
     uint index = 0;
     for (auto method: methods) {
@@ -1029,8 +1027,7 @@ private:
     // guarantees that any incompatibility will be caught either now or when the real version of
     // that struct is loaded.
 
-    word scratch[32];
-    memset(scratch, 0, sizeof(scratch));
+    word scratch[32]{};
     MallocMessageBuilder builder(scratch);
     auto node = builder.initRoot<schema::Node>();
     node.setId(structTypeId);
@@ -1128,8 +1125,8 @@ private:
         case schema::Type::ENUM: value.setEnum(0); break;
         case schema::Type::TEXT: value.adoptText(Orphan<Text>()); break;
         case schema::Type::DATA: value.adoptData(Orphan<Data>()); break;
-        case schema::Type::LIST: value.initList(); break;
-        case schema::Type::STRUCT: value.initStruct(); break;
+        case schema::Type::LIST: value.adoptList(Orphan<AnyList>()); break;
+        case schema::Type::STRUCT: value.adoptStruct(Orphan<AnyStruct>()); break;
         case schema::Type::INTERFACE: value.setInterface(); break;
         case schema::Type::ANY_POINTER: value.initAnyPointer(); break;
       }
@@ -1267,7 +1264,7 @@ _::RawSchema* SchemaLoader::Impl::load(const schema::Node::Reader& reader, bool 
   } else {
     // Nope, allocate a new RawSchema.
     schema = &arena.allocate<_::RawSchema>();
-    memset(&schema->defaultBrand, 0, sizeof(schema->defaultBrand));
+    schema->defaultBrand = {};
     schema->id = validatedReader.getId();
     schema->canCastTo = nullptr;
     schema->defaultBrand.generic = schema;
@@ -1297,17 +1294,8 @@ _::RawSchema* SchemaLoader::Impl::load(const schema::Node::Reader& reader, bool 
     // If this schema is not newly-allocated, it may already be in the wild, specifically in the
     // dependency list of other schemas.  Once the initializer is null, it is live, so we must do
     // a release-store here.
-#if __GNUC__ || defined(__clang__)
-    __atomic_store_n(&schema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
-    __atomic_store_n(&schema->defaultBrand.lazyInitializer, nullptr, __ATOMIC_RELEASE);
-#elif _MSC_VER
-    std::atomic_thread_fence(std::memory_order_release);
-    *static_cast<_::RawSchema::Initializer const* volatile*>(&schema->lazyInitializer) = nullptr;
-    *static_cast<_::RawBrandedSchema::Initializer const* volatile*>(
-        &schema->defaultBrand.lazyInitializer) = nullptr;
-#else
-#error "Platform not supported"
-#endif
+    kj::atomicStore(&schema->lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
+    kj::atomicStore(&schema->defaultBrand.lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
   }
 
   return schema;
@@ -1337,7 +1325,7 @@ _::RawSchema* SchemaLoader::Impl::loadNative(const _::RawSchema* nativeSchema) {
     }
   } else {
     schema = &arena.allocate<_::RawSchema>();
-    memset(&schema->defaultBrand, 0, sizeof(schema->defaultBrand));
+    schema->defaultBrand = {};
     schema->defaultBrand.generic = schema;
     schema->lazyInitializer = nullptr;
     schema->defaultBrand.lazyInitializer = nullptr;
@@ -1394,17 +1382,8 @@ _::RawSchema* SchemaLoader::Impl::loadNative(const _::RawSchema* nativeSchema) {
     // If this schema is not newly-allocated, it may already be in the wild, specifically in the
     // dependency list of other schemas.  Once the initializer is null, it is live, so we must do
     // a release-store here.
-#if __GNUC__ || defined(__clang__)
-    __atomic_store_n(&schema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
-    __atomic_store_n(&schema->defaultBrand.lazyInitializer, nullptr, __ATOMIC_RELEASE);
-#elif _MSC_VER
-    std::atomic_thread_fence(std::memory_order_release);
-    *static_cast<_::RawSchema::Initializer const* volatile*>(&schema->lazyInitializer) = nullptr;
-    *static_cast<_::RawBrandedSchema::Initializer const* volatile*>(
-        &schema->defaultBrand.lazyInitializer) = nullptr;
-#else
-#error "Platform not supported"
-#endif
+    kj::atomicStore(&schema->lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
+    kj::atomicStore(&schema->defaultBrand.lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
   }
 
   return schema;
@@ -1412,8 +1391,7 @@ _::RawSchema* SchemaLoader::Impl::loadNative(const _::RawSchema* nativeSchema) {
 
 _::RawSchema* SchemaLoader::Impl::loadEmpty(
     uint64_t id, kj::StringPtr name, schema::Node::Which kind, bool isPlaceholder) {
-  word scratch[32];
-  memset(scratch, 0, sizeof(scratch));
+  word scratch[32]{};
   MallocMessageBuilder builder(scratch);
   auto node = builder.initRoot<schema::Node>();
   node.setId(id);
@@ -1442,7 +1420,7 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
   auto srcScopes = proto.getScopes();
 
   KJ_STACK_ARRAY(_::RawBrandedSchema::Scope, dstScopes, srcScopes.size(), 16, 32);
-  memset(dstScopes.begin(), 0, dstScopes.size() * sizeof(dstScopes[0]));
+  dstScopes.asBytes().fill(0);
 
   uint dstScopeCount = 0;
   for (auto srcScope: srcScopes) {
@@ -1450,13 +1428,13 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
       case schema::Brand::Scope::BIND: {
         auto srcBindings = srcScope.getBind();
         KJ_STACK_ARRAY(_::RawBrandedSchema::Binding, dstBindings, srcBindings.size(), 16, 32);
-        memset(dstBindings.begin(), 0, dstBindings.size() * sizeof(dstBindings[0]));
+        dstBindings.asBytes().fill(0);
 
         for (auto j: kj::indices(srcBindings)) {
           auto srcBinding = srcBindings[j];
           auto& dstBinding = dstBindings[j];
 
-          memset(&dstBinding, 0, sizeof(dstBinding));
+          dstBinding = {};
           dstBinding.which = schema::Type::ANY_POINTER;
 
           switch (srcBinding.which()) {
@@ -1520,7 +1498,7 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
     return existing;
   } else {
     auto& brand = arena.allocate<_::RawBrandedSchema>();
-    memset(&brand, 0, sizeof(brand));
+    brand = {};
     brands.insert(key, &brand);
 
     brand.generic = schema;
@@ -1545,7 +1523,7 @@ SchemaLoader::Impl::makeBrandedDependencies(
 #define ADD_ENTRY(kind, index, make) \
     if (const _::RawBrandedSchema* dep = make) { \
       auto& slot = deps.add(); \
-      memset(&slot, 0, sizeof(slot)); \
+      slot = {}; \
       slot.location = _::RawBrandedSchema::makeDepLocation( \
         _::RawBrandedSchema::DepKind::kind, index); \
       slot.schema = dep; \
@@ -1743,8 +1721,7 @@ void SchemaLoader::Impl::makeDep(_::RawBrandedSchema::Binding& result,
 const _::RawBrandedSchema* SchemaLoader::Impl::makeDepSchema(
     schema::Type::Reader type, kj::StringPtr scopeName,
     kj::Maybe<kj::ArrayPtr<const _::RawBrandedSchema::Scope>> brandBindings) {
-  _::RawBrandedSchema::Binding binding;
-  memset(&binding, 0, sizeof(binding));
+  _::RawBrandedSchema::Binding binding = {};
   makeDep(binding, type, scopeName, brandBindings);
   return binding.schema;
 }
@@ -1753,8 +1730,7 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeDepSchema(
     uint64_t typeId, schema::Type::Which whichType, schema::Node::Which expectedKind,
     schema::Brand::Reader brand, kj::StringPtr scopeName,
     kj::Maybe<kj::ArrayPtr<const _::RawBrandedSchema::Scope>> brandBindings) {
-  _::RawBrandedSchema::Binding binding;
-  memset(&binding, 0, sizeof(binding));
+  _::RawBrandedSchema::Binding binding = {};
   makeDep(binding, typeId, whichType, expectedKind, brand, scopeName, brandBindings);
   return binding.schema;
 }
@@ -1773,7 +1749,7 @@ kj::ArrayPtr<const T> SchemaLoader::Impl::copyDeduped(kj::ArrayPtr<const T> valu
 
   // Need to make a new copy.
   auto copy = arena.allocateArray<T>(values.size());
-  memcpy(copy.begin(), values.begin(), values.size() * sizeof(T));
+  copy.asBytes().copyFrom(values.asBytes());
 
   dedupTable.insert(copy.asBytes());
 
@@ -1803,7 +1779,7 @@ const _::RawBrandedSchema* SchemaLoader::Impl::getUnbound(const _::RawSchema* sc
     return existing;
   } else {
     auto slot = &arena.allocate<_::RawBrandedSchema>();
-    memset(slot, 0, sizeof(*slot));
+    *slot = {};
     slot->generic = schema;
     auto deps = makeBrandedDependencies(schema, kj::none);
     slot->dependencies = deps.begin();
@@ -2013,7 +1989,7 @@ void SchemaLoader::Impl::requireStructSize(uint64_t id, uint dataWordCount, uint
 kj::ArrayPtr<word> SchemaLoader::Impl::makeUncheckedNode(schema::Node::Reader node) {
   size_t size = node.totalSize().wordCount + 1;
   kj::ArrayPtr<word> result = arena.allocateArray<word>(size);
-  memset(result.begin(), 0, size * sizeof(word));
+  result.asBytes().fill(0);
   copyToUnchecked(node, result);
   return result;
 }
@@ -2083,18 +2059,8 @@ void SchemaLoader::InitializerImpl::init(const _::RawSchema* schema) const {
               "A schema not belonging to this loader used its initializer.");
 
     // Disable the initializer.
-#if __GNUC__ || defined(__clang__)
-    __atomic_store_n(&mutableSchema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
-    __atomic_store_n(&mutableSchema->defaultBrand.lazyInitializer, nullptr, __ATOMIC_RELEASE);
-#elif _MSC_VER
-    std::atomic_thread_fence(std::memory_order_release);
-    *static_cast<_::RawSchema::Initializer const* volatile*>(
-        &mutableSchema->lazyInitializer) = nullptr;
-    *static_cast<_::RawBrandedSchema::Initializer const* volatile*>(
-        &mutableSchema->defaultBrand.lazyInitializer) = nullptr;
-#else
-#error "Platform not supported"
-#endif
+    kj::atomicStore(&mutableSchema->lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
+    kj::atomicStore(&mutableSchema->defaultBrand.lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
   }
 }
 
@@ -2120,15 +2086,7 @@ void SchemaLoader::BrandedInitializerImpl::init(const _::RawBrandedSchema* schem
   mutableSchema->dependencyCount = deps.size();
 
   // It's initialized now, so disable the initializer.
-#if __GNUC__ || defined(__clang__)
-  __atomic_store_n(&mutableSchema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
-#elif _MSC_VER
-  std::atomic_thread_fence(std::memory_order_release);
-  *static_cast<_::RawBrandedSchema::Initializer const* volatile*>(
-      &mutableSchema->lazyInitializer) = nullptr;
-#else
-#error "Platform not supported"
-#endif
+  kj::atomicStore(&mutableSchema->lazyInitializer, nullptr, kj::AtomicMemoryOrder::RELEASE);
 }
 
 // =======================================================================================
