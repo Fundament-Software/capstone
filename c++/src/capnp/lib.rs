@@ -29,7 +29,7 @@ pub fn call(
     let import_list: Vec<String> = imports.map(|e| e.as_ref().to_string()).collect();
     let prefix_list: Vec<String> = prefixes.map(|e| e.as_ref().to_string()).collect();
 
-    let memoryFilePaths: Vec<String> = [
+    let memory_file_paths: Vec<String> = [
         "capnp/c++.capnp",
         "capnp/persistent.capnp",
         "capnp/rpc.capnp",
@@ -40,13 +40,14 @@ pub fn call(
     .iter()
     .map(|e| e.to_string())
     .collect();
-    let memoryFileData: Vec<String> = [
+    let memory_file_data: Vec<String> = [
         include_str!("c++.capnp"),
         include_str!("persistent.capnp"),
         include_str!("rpc.capnp"),
         include_str!("rpc-twoparty.capnp"),
         include_str!("schema.capnp"),
         include_str!("stream.capnp"),
+        include_str!("introspect.capnp"),
     ]
     .iter()
     .map(|e| e.to_string())
@@ -56,8 +57,8 @@ pub fn call(
         file_list.as_slice(),
         import_list.as_slice(),
         prefix_list.as_slice(),
-        memoryFileData.as_slice(),
-        memoryFilePaths.as_slice(),
+        memory_file_data.as_slice(),
+        memory_file_paths.as_slice(),
         standard_import,
     )
 }
