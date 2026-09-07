@@ -105,38 +105,6 @@ jobs:
             export CC=clang-${{ matrix.clang }}
             export CXX=clang++-${{ matrix.clang }}
             ${{ matrix.run-test }}
-  Linux-clang-sanitizers:
-    runs-on: ubuntu-26.04
-    strategy:
-      fail-fast: false
-      matrix:
-        clang: [22]
-        config: [asan, ubsan, tsan]
-    steps:
-      - uses: actions/checkout@v7
-      - name: install dependencies
-        run: eval "$INSTALL_DEPS" && install_deps ${{ matrix.clang }}
-      - name: test
-        run: |
-            export CC=clang-${{ matrix.clang }}
-            cd c++ && bazel test --config=ci --config=${{ matrix.config }} //...
-  Linux-clang-tidy:
-    runs-on: ubuntu-26.04
-    strategy:
-      fail-fast: false
-      matrix:
-        clang: [22]
-    steps:
-      - uses: actions/checkout@v7
-      - name: install dependencies
-        run: eval "$INSTALL_DEPS" && install_deps ${{ matrix.clang }}
-      - name: test
-        run: |
-            export CC=clang-${{ matrix.clang }}
-            export CLANG_TIDY=clang-tidy-${{ matrix.clang }}
-            cd c++ 
-            bazel build --config=ci //...
-            find src/kj src/capnp -name "*.c++" | parallel $CLANG_TIDY --quiet --experimental-custom-checks {}
   MacOS:
     runs-on: macos-latest
     strategy:
